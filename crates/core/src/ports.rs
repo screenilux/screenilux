@@ -91,13 +91,29 @@ pub trait PointerSource: Send {
     fn drain(&mut self, out: &mut Vec<PointerEvent>);
 }
 
+/// A webcam frame at the device's own resolution.
+///
+/// Shared behind an `Arc` because every screen's compositor reads the same
+/// frame, and the camera delivers far slower than the screens do.
+#[derive(Debug)]
+pub struct CameraFrame {
+    /// Tightly packed BGRA8, matching the screen frame format so the
+    /// compositor only ever deals in one layout.
+    pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    /// Increments per captured frame, so a consumer can cache derived work
+    /// (a scaled tile, say) and reuse it until the camera moves on.
+    pub seq: u64,
+}
+
 /// The latest webcam frame, if any.
 pub trait CameraSource: Send + Sync {
-    /// Most recent frame as tightly packed BGRA8 at the given size, or `None`
-    /// before the first frame arrives.
-    fn tile(&self, width: u32, height: u32) -> Option<Vec<u8>>;
+    /// Most recent frame, or `None` before the first one arrives.
+    fn latest(&self) -> Option<std::sync::Arc<CameraFrame>>;
     /// Where the bubble currently sits on the virtual desktop.
     fn rect(&self) -> Rect;
+    /// Why the camera is not producing frames, if it is not.
     fn error(&self) -> Option<String>;
 }
 
