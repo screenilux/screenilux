@@ -8,14 +8,23 @@ use crate::geometry::{Monitor, Point, Rect};
 use std::time::Duration;
 
 /// A captured frame, borrowed from whatever buffer the adapter owns.
+///
+/// Immutable on purpose. The buffer behind it is the source's cache of the
+/// most recent *pristine* capture, which it hands out again whenever the
+/// screen has not changed. Compositing overlays into it would bake them in and
+/// they would reappear, smeared, on every later unchanged frame.
 pub struct Frame<'a> {
     /// Tightly packed BGRA8, `width * height * 4` bytes.
-    pub pixels: &'a mut [u8],
+    pub pixels: &'a [u8],
     pub width: u32,
     pub height: u32,
-    /// False when the source knows nothing changed since the previous frame.
-    /// The recorder re-emits the last encoded frame instead of recompositing,
-    /// which is what makes an idle screen nearly free.
+    /// False when this is the previous frame handed out again because the
+    /// screen has not changed.
+    ///
+    /// Windows only delivers a frame when something actually changes, so an
+    /// idle screen costs nothing to capture. The overlays may still need
+    /// redrawing — the pointer moves over a static screen — so this says the
+    /// *capture* can be skipped, not necessarily the composite.
     pub changed: bool,
 }
 
