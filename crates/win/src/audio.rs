@@ -75,6 +75,15 @@ impl AudioCapture {
         self.pcm.try_iter().collect()
     }
 
+    /// Throw away whatever has queued, such as audio captured while paused.
+    ///
+    /// The encoder places audio by counting samples rather than by timestamp,
+    /// so stale audio cannot simply be skipped later: once written, it plays
+    /// and shifts every later sample out of sync with the picture.
+    pub fn discard(&self) {
+        while self.pcm.try_recv().is_ok() {}
+    }
+
     pub fn error(&self) -> Option<String> {
         self.error.lock().ok().and_then(|e| e.clone())
     }

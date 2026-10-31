@@ -234,6 +234,83 @@ fn records_every_screen_in_sync_with_a_manifest() {
     );
 }
 
+/// Duration of the first audio stream, or `None` if the file has none.
+fn audio_duration_of(ffmpeg: &Path, file: &Path) -> Option<f64> {
+    let out = Command::new(ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(file)
+        .output()
+        .expect("ffprobe should run");
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+fn video_duration_of(ffmpeg: &Path, file: &Path) -> f64 {
+    let out = Command::new(ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(file)
+        .output()
+        .expect("ffprobe should run");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0.0)
+}
+
+/// The encoder places audio by counting samples, not by timestamp. So any
+/// microphone audio captured while paused that reaches the encoder both plays
+/// in the output and pushes every later sample out of sync with the picture.
+#[test]
+#[ignore = "records the real screen and microphone for several seconds"]
+fn a_pause_does_not_leak_microphone_audio() {
+    let Some(f) = fixture() else { return };
+    if !screenilux_win::has_microphone() {
+        eprintln!("no microphone; skipping the audio check");
+        return;
+    }
+    let Ok(all) = display::monitors() else { return };
+    let primary: Vec<_> = all.into_iter().filter(|m| m.is_primary).collect();
+
+    let mut cfg = config(&f, primary);
+    cfg.microphone = true;
+    let session = Session::start(cfg).expect("session should start");
+    std::thread::sleep(Duration::from_millis(1500));
+    session.pause();
+    // Long enough for the capture queue to fill completely.
+    std::thread::sleep(Duration::from_millis(3000));
+    session.resume();
+    std::thread::sleep(Duration::from_millis(1500));
+    let path = session.finish(f.dir.path()).expect("should save");
+
+    let video = video_duration_of(&f.ffmpeg, &path);
+    let Some(audio) = audio_duration_of(&f.ffmpeg, &path) else {
+        // A microphone blocked by privacy settings yields no stream at all.
+        eprintln!("no audio stream was written; skipping");
+        return;
+    };
+    assert!(
+        (audio - video).abs() < 0.15,
+        "audio is {audio:.3}s against {video:.3}s of video; paused audio leaked in"
+    );
+}
+
 #[test]
 #[ignore = "records the real screen for several seconds"]
 fn two_recordings_in_the_same_second_do_not_overwrite_each_other() {

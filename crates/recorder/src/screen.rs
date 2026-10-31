@@ -94,6 +94,11 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
 
     job.sink.open_segment()?;
     let (mut seg_start, _) = job.sync.wait(BARRIER_TIMEOUT);
+    // Audio heard while the other screens were still opening predates frame
+    // zero, so it would play early.
+    if let Some(mic) = &job.audio {
+        mic.discard();
+    }
     let mut banked = Duration::ZERO;
     // Effect animation advances on real elapsed time between composites,
     // which is the capture rate, not the output frame rate.
@@ -111,6 +116,7 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
                 // is not recorded footage.
                 let in_segment = seg_start.elapsed();
                 let owed = pacer.due(in_segment);
+                forward_audio(job);
                 job.sink.close_segment(owed)?;
                 banked += in_segment;
                 job.elapsed.set(banked);
@@ -123,6 +129,12 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
                 pacer.restart();
                 let (t0, _) = job.sync.wait(BARRIER_TIMEOUT);
                 seg_start = t0;
+                // The microphone kept capturing through the pause. That audio
+                // is not part of the recording, just as the paused frames
+                // are not.
+                if let Some(mic) = &job.audio {
+                    mic.discard();
+                }
                 continue;
             }
             RunState::Running => {}
@@ -130,13 +142,7 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
 
         // Drain the microphone before pacing, so audio keeps flowing even on
         // a still screen where no video frame is due.
-        if let Some(mic) = &job.audio {
-            for chunk in mic.drain() {
-                if let Err(e) = job.sink.write_audio(&chunk) {
-                    tracing::warn!(error = %e, "dropping audio");
-                }
-            }
-        }
+        forward_audio(job);
 
         let in_segment = seg_start.elapsed();
         job.elapsed.set(banked + in_segment);
@@ -213,10 +219,22 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
 
     let in_segment = seg_start.elapsed();
     let owed = pacer.due(in_segment);
+    forward_audio(job);
     job.sink.close_segment(owed)?;
     banked += in_segment;
     job.elapsed.set(banked);
     Ok(job.sink.encoder_label())
+}
+
+/// Hand whatever the microphone has captured to the encoder.
+fn forward_audio(job: &mut ScreenJob) {
+    if let Some(mic) = &job.audio {
+        for chunk in mic.drain() {
+            if let Err(e) = job.sink.write_audio(&chunk) {
+                tracing::warn!(error = %e, "dropping audio");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
