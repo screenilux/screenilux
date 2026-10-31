@@ -59,6 +59,24 @@ registration too. It is all per user, so no administrator rights are needed.
 `ffprobe` is used by the opt-in end-to-end tests to verify output files. That
 is a development tool; the application never shells out to anything.
 
+## Releases
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on Windows:
+
+- **Every pull request into `main`** is checked: formatting, clippy with
+  warnings as errors, the tests that need no screen or GPU (`core`,
+  `recorder` and the app), and a build of every other test. Hosted runners
+  have no GPU, display or microphone, so the capture, encoder, decoder and
+  player tests run locally with `cargo test --workspace`.
+- **Every merge into `main`** is checked the same way, then built and
+  published as a GitHub Release tagged `v<version>-build.<run>`, with the
+  executable zipped alongside this README and the licence, a SHA-256
+  checksum, and notes listing the merged pull requests.
+
+The executable is not code-signed, so Windows SmartScreen warns the first
+time it runs. The Rust version is pinned in the workflow; raise it there
+when the code needs a newer one.
+
 ## Output
 
 One screen gives a single H.264 MP4, which plays anywhere. Several give one
