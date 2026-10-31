@@ -8,12 +8,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod compositor;
 pub mod focus;
 pub mod geometry;
 pub mod ports;
 pub mod session;
 pub mod timing;
 
+pub use compositor::{CameraView, Compositor, EffectOptions};
 pub use focus::{DEFAULT_DWELL, FocusTracker, Switch};
 pub use geometry::{Monitor, Point, Rect, monitor_at, virtual_bounds};
 pub use session::{Focus, FocusEntry, Manifest, Role, SESSION_VERSION, Screen};

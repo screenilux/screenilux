@@ -11,15 +11,18 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use screenilux_core::compositor::{Compositor, EffectOptions};
 use screenilux_core::focus::{DEFAULT_DWELL, FocusTracker};
 use screenilux_core::geometry::Monitor;
 use screenilux_core::ports::VideoSink;
+use screenilux_core::ports::{CameraSource, PointerEvent, PointerSource};
 use screenilux_core::session::{Focus, FocusEntry, Manifest, Role, Screen};
 use screenilux_core::timing::SyncClock;
 use screenilux_media::command::{EncoderSpec, SegmentParams};
 use screenilux_media::segment::FfmpegSink;
 use screenilux_media::util::unique_path;
 use screenilux_win::capture::ScreenCapture;
+use screenilux_win::input::InputHook;
 
 use crate::control::Control;
 use crate::screen::{Elapsed, ScreenJob, run};
@@ -42,7 +45,7 @@ pub enum SessionError {
 }
 
 /// What to record.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionConfig {
     pub monitors: Vec<Monitor>,
     pub fps: u32,
@@ -51,7 +54,28 @@ pub struct SessionConfig {
     pub audio_device: Option<String>,
     pub encoder: EncoderSpec,
     pub ffmpeg: PathBuf,
-    pub camera: bool,
+    pub effects: EffectOptions,
+    /// The live camera, if the bubble is enabled.
+    pub camera: Option<Arc<dyn CameraSource>>,
+}
+
+impl std::fmt::Debug for SessionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionConfig")
+            .field("monitors", &self.monitors.len())
+            .field("fps", &self.fps)
+            .field("audio_device", &self.audio_device)
+            .field("encoder", &self.encoder.label)
+            .field("effects", &self.effects)
+            .field("camera", &self.camera.is_some())
+            .finish()
+    }
+}
+
+impl SessionConfig {
+    fn camera_enabled(&self) -> bool {
+        self.camera.is_some() && self.effects.camera
+    }
 }
 
 struct ScreenSlot {
@@ -76,8 +100,28 @@ pub struct Session {
     sync: Arc<SyncClock>,
     screens: Vec<ScreenSlot>,
     focus: Option<FocusWorker>,
+    router: Option<RouterWorker>,
     notices_rx: Receiver<String>,
     started: std::time::SystemTime,
+}
+
+/// Fans one global hook out to the screen each event belongs to.
+///
+/// There is a single hook for the whole process, but zoom is per-screen: a
+/// wheel gesture should magnify the screen under the pointer and leave the
+/// others alone.
+struct RouterWorker {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RouterWorker {
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 struct FocusWorker {
@@ -100,6 +144,8 @@ impl Session {
         let (notices, notices_rx) = unbounded();
 
         let mut screens = Vec::new();
+        let mut event_senders: Vec<(screenilux_core::geometry::Rect, Sender<PointerEvent>)> =
+            Vec::new();
         for (i, monitor) in config.monitors.iter().enumerate() {
             let mut capture = ScreenCapture::start(monitor.bounds)
                 .map_err(|e| SessionError::Capture(format!("{}: {e}", monitor.label)))?;
@@ -125,6 +171,13 @@ impl Session {
             let elapsed = Arc::new(Elapsed::default());
             let (give_back, take_back) = crossbeam_channel::bounded(1);
 
+            let compositor = config
+                .effects
+                .any()
+                .then(|| Compositor::new(monitor.bounds, config.effects));
+            let (event_tx, event_rx) = unbounded();
+            event_senders.push((monitor.bounds, event_tx));
+
             let job = ScreenJob {
                 source: Box::new(capture),
                 sink: Box::new(SinkCarrier {
@@ -137,6 +190,14 @@ impl Session {
                 elapsed: Arc::clone(&elapsed),
                 label: monitor.label.clone(),
                 notices: notices.clone(),
+                compositor,
+                events: Some(event_rx),
+                pointer: Arc::new(screenilux_win::cursor_pos),
+                camera: if config.camera_enabled() {
+                    config.camera.clone()
+                } else {
+                    None
+                },
             };
 
             let label = monitor.label.clone();
@@ -159,6 +220,17 @@ impl Session {
             });
         }
 
+        // The hook is only worth installing if something consumes it.
+        let router = (config.effects.zoom || config.effects.clicks).then(|| {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let handle = std::thread::Builder::new()
+                .name("screenilux-router".into())
+                .spawn(move || route_events(event_senders, flag))
+                .ok();
+            RouterWorker { stop, handle }
+        });
+
         // Focus is only meaningful across several screens.
         let focus = (config.monitors.len() > 1).then(|| {
             let monitors = config.monitors.clone();
@@ -179,6 +251,7 @@ impl Session {
             sync,
             screens,
             focus,
+            router,
             notices_rx,
             started: std::time::SystemTime::now(),
         })
@@ -212,6 +285,12 @@ impl Session {
 
     /// Stop every screen and join its thread.
     fn halt(&mut self) -> Vec<String> {
+        // Stop routing first so the global mouse hook comes down with the
+        // recording rather than outliving it.
+        if let Some(r) = self.router.take() {
+            r.stop();
+        }
+
         self.control.stop();
         // Release anyone parked at a segment boundary so stop cannot hang on a
         // peer that will never arrive.
@@ -268,7 +347,7 @@ impl Session {
             round3(self.duration().as_secs_f64()),
             self.config.fps,
             self.config.encoder.label.to_string(),
-            self.config.camera,
+            self.config.camera_enabled(),
         );
 
         let mut saved_files = Vec::new();
@@ -382,6 +461,43 @@ impl Drop for SinkCarrier {
             let _ = tx.send(sink);
         }
     }
+}
+
+/// Drain the global hook and hand each event to the screen it belongs to.
+fn route_events(
+    screens: Vec<(screenilux_core::geometry::Rect, Sender<PointerEvent>)>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut hook = InputHook::start();
+    let mut batch = Vec::new();
+    while !stop.load(Ordering::Relaxed) {
+        batch.clear();
+        hook.drain(&mut batch);
+        for event in batch.drain(..) {
+            match event {
+                // A reset clears every screen: middle-clicking to escape a
+                // zoom should not leave another screen magnified.
+                PointerEvent::Reset => {
+                    for (_, tx) in &screens {
+                        let _ = tx.send(PointerEvent::Reset);
+                    }
+                }
+                PointerEvent::Click { at } => {
+                    if let Some((_, tx)) = screens.iter().find(|(b, _)| b.contains(at)) {
+                        let _ = tx.send(event);
+                    }
+                }
+                PointerEvent::Wheel { .. } => {
+                    let at = screenilux_win::cursor_pos();
+                    if let Some((_, tx)) = screens.iter().find(|(b, _)| b.contains(at)) {
+                        let _ = tx.send(event);
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    hook.stop();
 }
 
 fn track_focus(

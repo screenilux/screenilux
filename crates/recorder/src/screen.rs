@@ -8,8 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
-use screenilux_core::ports::{CaptureError, ScreenSource, SinkError, VideoSink, WriteStatus};
+use crossbeam_channel::{Receiver, Sender};
+use screenilux_core::compositor::{CameraView, Compositor};
+use screenilux_core::geometry::Point;
+use screenilux_core::ports::{
+    CameraSource, CaptureError, PointerEvent, ScreenSource, SinkError, VideoSink, WriteStatus,
+};
 use screenilux_core::timing::{FramePacer, SyncClock};
 
 use crate::control::{Control, RunState};
@@ -61,6 +65,14 @@ pub struct ScreenJob {
     pub elapsed: Arc<Elapsed>,
     pub label: String,
     pub notices: Sender<String>,
+    /// Overlay compositing. `None` means frames go to the encoder untouched,
+    /// which skips a full-frame copy per frame.
+    pub compositor: Option<Compositor>,
+    /// Pointer events already routed to this screen.
+    pub events: Option<Receiver<PointerEvent>>,
+    /// Where the pointer is, sampled per frame for the overlays.
+    pub pointer: Arc<dyn Fn() -> Point + Send + Sync>,
+    pub camera: Option<Arc<dyn CameraSource>>,
 }
 
 /// Run one screen to completion. Returns the encoder label actually used,
@@ -81,6 +93,9 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
     job.sink.open_segment()?;
     let (mut seg_start, _) = job.sync.wait(BARRIER_TIMEOUT);
     let mut banked = Duration::ZERO;
+    // Effect animation advances on real elapsed time between composites,
+    // which is the capture rate, not the output frame rate.
+    let mut last_draw = Instant::now();
 
     loop {
         match job.control.state() {
@@ -128,12 +143,39 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
             Err(e) => return Err(e.into()),
         };
 
+        let encoded: &[u8] = match job.compositor.as_mut() {
+            None => frame.pixels,
+            Some(c) => {
+                if let Some(rx) = &job.events {
+                    for event in rx.try_iter() {
+                        match event {
+                            PointerEvent::Wheel { steps } => c.on_wheel(steps),
+                            PointerEvent::Reset => c.on_reset(),
+                            PointerEvent::Click { at } => c.on_click(at),
+                        }
+                    }
+                }
+                let dt = last_draw.elapsed().as_secs_f64();
+                last_draw = Instant::now();
+                // Hold the camera frame alive for the borrow the view takes.
+                let cam_frame = job.camera.as_ref().and_then(|c| c.latest());
+                let cam = match (&cam_frame, &job.camera) {
+                    (Some(f), Some(src)) => Some(CameraView {
+                        frame: f,
+                        rect: src.rect(),
+                    }),
+                    _ => None,
+                };
+                c.render(frame.pixels, (job.pointer)(), dt, cam)
+            }
+        };
+
         // Written `due` times rather than once: when capture falls behind,
         // repeating the last frame keeps playback at real-time speed instead
         // of letting it run fast.
         let mut restarted = false;
         for _ in 0..due {
-            match job.sink.write(frame.pixels)? {
+            match job.sink.write(encoded)? {
                 WriteStatus::Ok => {}
                 WriteStatus::SegmentRestarted { encoder } => {
                     let _ = job.notices.send(format!(
@@ -290,6 +332,10 @@ mod tests {
                 elapsed: Arc::clone(&elapsed),
                 label: "Screen 1".into(),
                 notices,
+                compositor: None,
+                events: None,
+                pointer: Arc::new(|| Point::new(0, 0)),
+                camera: None,
             },
             elapsed,
         )

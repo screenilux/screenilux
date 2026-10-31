@@ -85,6 +85,18 @@ fn fixture() -> Option<Fixture> {
     })
 }
 
+/// Cursor and zoom on, matching the shipping defaults, so the end-to-end runs
+/// exercise the compositing path rather than the raw passthrough.
+fn effects() -> screenilux_core::EffectOptions {
+    screenilux_core::EffectOptions {
+        cursor: true,
+        zoom: true,
+        trail: false,
+        clicks: false,
+        camera: false,
+    }
+}
+
 fn config(f: &Fixture, monitors: Vec<screenilux_core::Monitor>) -> SessionConfig {
     SessionConfig {
         monitors,
@@ -92,7 +104,8 @@ fn config(f: &Fixture, monitors: Vec<screenilux_core::Monitor>) -> SessionConfig
         audio_device: None,
         encoder: detect(&f.ffmpeg),
         ffmpeg: f.ffmpeg.clone(),
-        camera: false,
+        effects: effects(),
+        camera: None,
     }
 }
 
