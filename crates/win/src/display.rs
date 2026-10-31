@@ -2,8 +2,10 @@
 
 use screenilux_core::geometry::{Monitor, Rect};
 use screenilux_core::ports::{CaptureError, DisplayEnumerator};
-use windows::Win32::Foundation::RECT;
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
+use windows::Win32::Foundation::{POINT, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
@@ -71,6 +73,36 @@ pub fn monitors() -> Result<Vec<Monitor>, CaptureError> {
     Ok(out)
 }
 
+/// The usable part of the display nearest `(x, y)`: its bounds less the
+/// taskbar and any docked toolbars, in physical pixels.
+pub fn work_area_at(x: i32, y: i32) -> Option<Rect> {
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: MonitorFromPoint takes a value and always returns a monitor
+    // with the "nearest" flag; `info.cbSize` is set as the API requires.
+    let ok = unsafe {
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(monitor, &mut info)
+    };
+    if !ok.as_bool() {
+        return None;
+    }
+    let RECT {
+        left,
+        top,
+        right,
+        bottom,
+    } = info.rcWork;
+    Some(Rect::new(
+        left,
+        top,
+        (right - left) as u32,
+        (bottom - top) as u32,
+    ))
+}
+
 /// The handle `windows-capture` needs for a given monitor, matched by bounds.
 ///
 /// Re-enumerating and matching on geometry rather than caching a handle keeps
@@ -128,6 +160,18 @@ mod tests {
             (0, 0),
             "Windows anchors the virtual desktop at the primary"
         );
+    }
+
+    #[test]
+    fn the_work_area_lies_within_its_display() {
+        set_dpi_awareness();
+        let Ok(found) = monitors() else { return };
+        for m in &found {
+            let work = work_area_at(m.bounds.left + 1, m.bounds.top + 1).unwrap();
+            assert!(work.width > 0 && work.height > 0);
+            assert!(work.left >= m.bounds.left && work.top >= m.bounds.top);
+            assert!(work.right() <= m.bounds.right() && work.bottom() <= m.bounds.bottom());
+        }
     }
 
     #[test]

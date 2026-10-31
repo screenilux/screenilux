@@ -102,6 +102,7 @@ fn config(_f: &Fixture, monitors: Vec<screenilux_core::Monitor>) -> SessionConfi
         monitors,
         fps: 30,
         microphone: false,
+        click_sound: false,
         effects: effects(),
         camera: None,
         // No hook here: these runs verify capture and timing, not overlays

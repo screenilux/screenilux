@@ -7,12 +7,9 @@ use std::sync::mpsc::{Receiver, channel};
 use screenilux_core::EffectOptions;
 use screenilux_core::geometry::Monitor;
 
-/// Camera bubble sizes, matching the Python build.
-pub const CAMERA_SIZES: [(&str, u32, u32); 3] = [
-    ("Small", 240, 180),
-    ("Medium", 320, 240),
-    ("Large", 440, 330),
-];
+/// The camera bubble, in pixels: big enough to read a face, small enough to
+/// leave the screen readable.
+pub const CAMERA_SIZE: (u32, u32) = (320, 240);
 pub const CAMERA_MARGIN: i32 = 28;
 pub const FPS_CHOICES: [u32; 5] = [10, 15, 24, 30, 60];
 
@@ -74,10 +71,6 @@ impl Probes {
             self.rx = None;
         }
     }
-
-    pub fn encoder_label(&self) -> &'static str {
-        screenilux_win::ENCODER_LABEL
-    }
 }
 
 /// Everything the user can choose.
@@ -87,11 +80,13 @@ pub struct Settings {
     pub selected: Vec<bool>,
     pub whole_desktop: bool,
     pub fps: u32,
-    pub minimize: bool,
+    /// Shrink the window to the recording bar while recording.
+    pub shrink: bool,
     pub effects: EffectOptions,
     pub microphone: bool,
+    /// A quiet click in the recording for each mouse click.
+    pub click_sound: bool,
     pub camera_device: usize,
-    pub camera_size: usize,
     pub out_dir: PathBuf,
 }
 
@@ -103,12 +98,12 @@ impl Settings {
             monitors,
             selected,
             whole_desktop: false,
-            fps: 30,
-            minimize: true,
+            fps: 60,
+            shrink: true,
             effects: EffectOptions::default(),
             microphone: false,
+            click_sound: true,
             camera_device: 0,
-            camera_size: 1,
             out_dir: default_output_dir(),
         }
     }
@@ -158,8 +153,7 @@ impl Settings {
     }
 
     pub fn camera_dimensions(&self) -> (u32, u32) {
-        let (_, w, h) = CAMERA_SIZES[self.camera_size.min(CAMERA_SIZES.len() - 1)];
-        (w, h)
+        CAMERA_SIZE
     }
 
     /// Bottom-right of the primary screen, inset by a margin.
@@ -230,19 +224,14 @@ mod tests {
     }
 
     #[test]
-    fn camera_sizes_are_ordered_and_sane() {
-        let mut last = 0;
-        for (name, w, h) in CAMERA_SIZES {
-            assert!(!name.is_empty());
-            assert!(w > last, "sizes should increase");
-            assert!(w > h, "a camera bubble is landscape");
-            last = w;
-        }
+    fn the_camera_bubble_is_landscape() {
+        let (w, h) = CAMERA_SIZE;
+        assert!(w > h);
     }
 
     #[test]
     fn fps_choices_include_the_default() {
-        assert!(FPS_CHOICES.contains(&30));
+        assert!(FPS_CHOICES.contains(&Settings::new().fps));
     }
 
     #[test]

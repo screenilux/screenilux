@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
+use screenilux_core::click::ClickMixer;
 use screenilux_core::compositor::{CameraView, Compositor};
 use screenilux_core::geometry::Point;
 use screenilux_core::ports::{
@@ -73,8 +74,77 @@ pub struct ScreenJob {
     /// Where the pointer is, sampled per frame for the overlays.
     pub pointer: Arc<dyn Fn() -> Point + Send + Sync>,
     pub camera: Option<Arc<dyn CameraSource>>,
-    /// The microphone, on the one screen that carries sound.
-    pub audio: Option<screenilux_win::AudioCapture>,
+    /// The sound track, on the one screen that carries it.
+    pub sound: Option<Sound>,
+}
+
+/// Bytes per sample frame of the PCM the encoder takes.
+const BLOCK: usize = screenilux_win::audio::CHANNELS as usize * 2;
+
+/// What goes into the sound track: the microphone, clicks, or both.
+///
+/// With no microphone the track is silence written at the pace of the
+/// recording, so clicks have somewhere to go and land at the right time.
+pub struct Sound {
+    mic: Option<screenilux_win::AudioCapture>,
+    /// One message per mouse click, anywhere on the desktop.
+    clicks: Option<Receiver<()>>,
+    mixer: ClickMixer,
+    /// Sample frames written so far.
+    written: u64,
+}
+
+impl Sound {
+    pub fn new(mic: Option<screenilux_win::AudioCapture>, clicks: Option<Receiver<()>>) -> Self {
+        Self {
+            mic,
+            clicks,
+            mixer: ClickMixer::new(
+                screenilux_win::audio::SAMPLE_RATE,
+                screenilux_win::audio::CHANNELS,
+            ),
+            written: 0,
+        }
+    }
+
+    /// Drop what was heard while nothing was being recorded: before frame
+    /// zero, or during a pause.
+    fn discard(&mut self) {
+        if let Some(mic) = &self.mic {
+            mic.discard();
+        }
+        if let Some(clicks) = &self.clicks {
+            while clicks.try_recv().is_ok() {}
+        }
+        self.mixer.silence();
+    }
+
+    /// The audio since the last call, clicks mixed in. `recorded` is how
+    /// much has been recorded, which paces the silence when there is no
+    /// microphone.
+    fn take(&mut self, recorded: Duration) -> Vec<Vec<u8>> {
+        if let Some(clicks) = &self.clicks {
+            for () in clicks.try_iter() {
+                self.mixer.trigger();
+            }
+        }
+        let mut chunks = match &self.mic {
+            Some(mic) => mic.drain(),
+            None => {
+                let due =
+                    (recorded.as_secs_f64() * screenilux_win::audio::SAMPLE_RATE as f64) as u64;
+                match due.saturating_sub(self.written) {
+                    0 => Vec::new(),
+                    n => vec![vec![0u8; n as usize * BLOCK]],
+                }
+            }
+        };
+        for chunk in &mut chunks {
+            self.mixer.mix(chunk);
+            self.written += (chunk.len() / BLOCK) as u64;
+        }
+        chunks
+    }
 }
 
 /// Run one screen to completion. Returns the encoder label actually used,
@@ -96,8 +166,8 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
     let (mut seg_start, _) = job.sync.wait(BARRIER_TIMEOUT);
     // Audio heard while the other screens were still opening predates frame
     // zero, so it would play early.
-    if let Some(mic) = &job.audio {
-        mic.discard();
+    if let Some(sound) = &mut job.sound {
+        sound.discard();
     }
     let mut banked = Duration::ZERO;
     // Effect animation advances on real elapsed time between composites,
@@ -116,7 +186,7 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
                 // is not recorded footage.
                 let in_segment = seg_start.elapsed();
                 let owed = pacer.due(in_segment);
-                forward_audio(job);
+                forward_audio(job, banked + in_segment);
                 job.sink.close_segment(owed)?;
                 banked += in_segment;
                 job.elapsed.set(banked);
@@ -132,8 +202,8 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
                 // The microphone kept capturing through the pause. That audio
                 // is not part of the recording, just as the paused frames
                 // are not.
-                if let Some(mic) = &job.audio {
-                    mic.discard();
+                if let Some(sound) = &mut job.sound {
+                    sound.discard();
                 }
                 continue;
             }
@@ -142,9 +212,9 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
 
         // Drain the microphone before pacing, so audio keeps flowing even on
         // a still screen where no video frame is due.
-        forward_audio(job);
-
         let in_segment = seg_start.elapsed();
+        forward_audio(job, banked + in_segment);
+
         job.elapsed.set(banked + in_segment);
 
         let due = pacer.due(in_segment);
@@ -219,20 +289,21 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
 
     let in_segment = seg_start.elapsed();
     let owed = pacer.due(in_segment);
-    forward_audio(job);
+    forward_audio(job, banked + in_segment);
     job.sink.close_segment(owed)?;
     banked += in_segment;
     job.elapsed.set(banked);
     Ok(job.sink.encoder_label())
 }
 
-/// Hand whatever the microphone has captured to the encoder.
-fn forward_audio(job: &mut ScreenJob) {
-    if let Some(mic) = &job.audio {
-        for chunk in mic.drain() {
-            if let Err(e) = job.sink.write_audio(&chunk) {
-                tracing::warn!(error = %e, "dropping audio");
-            }
+/// Hand the sound since the last call to the encoder.
+fn forward_audio(job: &mut ScreenJob, recorded: Duration) {
+    let Some(sound) = job.sound.as_mut() else {
+        return;
+    };
+    for chunk in sound.take(recorded) {
+        if let Err(e) = job.sink.write_audio(&chunk) {
+            tracing::warn!(error = %e, "dropping audio");
         }
     }
 }
@@ -366,7 +437,7 @@ mod tests {
                 events: None,
                 pointer: Arc::new(|| Point::new(0, 0)),
                 camera: None,
-                audio: None,
+                sound: None,
             },
             elapsed,
         )

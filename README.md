@@ -1,7 +1,7 @@
 # Screenilux
 
 A screen recorder and player for Windows. Record one screen or several at
-once, with a draggable camera bubble, pointer zoom and click effects, then play
+once, with a draggable camera bubble, pointer zoom and click sounds, then play
 them back in step and copy or search the text on screen.
 
 ![The Screenilux window](screenshot.png)
@@ -12,18 +12,24 @@ them back in step and copy or search the text on screen.
   parallel and numbered from a shared clock, so frame *N* of one screen is the
   same instant as frame *N* of the others. Measured at 0–2 frames of skew.
 - **Start / pause / resume / stop.** Paused time is excluded; the video cuts
-  straight from pause to resume.
+  straight from pause to resume. 60 fps by default.
+- **A recording bar.** While recording, the window shrinks to a small,
+  see-through bar at the bottom of the screen with the clock, pause and stop.
+  It is solid while the pointer is over it, can be dragged anywhere, and like
+  the rest of the window it is hidden from capture, so it never appears in the
+  recording.
+- **Screens are found as they come and go.** Plug in or unplug a display, or
+  rearrange them, and the Record tab updates by itself.
 - **Mouse effects:** a cursor marker (Windows capture omits the pointer),
   `Ctrl+Alt+wheel` zoom up to 5× with `Ctrl+Alt+middle-click` to reset, a
-  fading trail, and expanding rings on click.
+  fading trail, and a quiet click sound in the recording for each mouse click,
+  the press and the softer release, as a click sounds through headphones.
 - **Camera bubble**, draggable anywhere — including mid-recording — and burned
   into that screen's recording. The preview window is hidden from capture, so
   the recording gets exactly one copy.
 - **Hardware encoding with no external dependencies.** H.264 comes from
   Windows' own Media Foundation encoder, so there is nothing to install and
   nothing to bundle — the whole application is one executable.
-- **Global hotkeys**: `Ctrl+Alt+R` start/stop, `Ctrl+Alt+P` pause/resume.
-  If another application already owns one, the window says so.
 - **A player for multi-screen recordings.** The Play tab plays every screen in
   step, either *auto switch* (one screen at a time, following where the
   pointer was) or *side by side* / *stacked*. Open a recording with the Open
@@ -43,6 +49,12 @@ toolchain, no runtime to install.
 ```
 cargo run --release -p screenilux
 ```
+
+The program is `target\release\screenilux.exe`: one file, nothing beside it,
+and nothing to install. Each time it starts it registers itself for
+`.screenilux` files and in Explorer's **Open with** list, pointing at wherever
+it was started from, so moving the file and running it once moves the
+registration too. It is all per user, so no administrator rights are needed.
 
 `ffprobe` is used by the opt-in end-to-end tests to verify output files. That
 is a development tool; the application never shells out to anything.
@@ -97,7 +109,8 @@ crates/win       Windows adapters - capture, encoder, decoder, audio in and
 crates/recorder  recording - per-screen threads, shared clock, manifest
 crates/player    playback - per-screen decode threads on one clock, sound,
                  reading and indexing text
-crates/app       the egui window, the camera overlay and the Play tab
+crates/app       the egui window, the camera overlay, the Play tab, the theme
+                 and the app icon (drawn in code and embedded by build.rs)
 ```
 
 `core` depends on neither Windows nor any UI toolkit, so everything worth
@@ -120,7 +133,7 @@ A few decisions that are load-bearing and look removable:
 - **Frames are written bottom-to-top.** Media Foundation's raw-buffer path
   wants BGRA in reverse row order; feeding it top-to-bottom produces a
   vertically mirrored video, which is easy to miss until someone plays it back.
-- **Overlays are composited after the zoom**, so the cursor, trail and rings
+- **Overlays are composited after the zoom**, so the cursor and trail
   keep a constant pixel size. The camera deliberately does not move or scale
   with zoom — it is a picture-in-picture pinned to the frame.
 
@@ -171,7 +184,7 @@ multi-screen saving and playback on a machine with one monitor.
 
 - **Microphone only, no system audio.** Capturing what your speakers play means
   a WASAPI loopback client, which is separate work from the microphone path.
-- **Hotkeys and the pointer hook do not see events over an elevated window**
+- **The pointer hook does not see events over an elevated window**
   unless Screenilux is elevated too.
 - **Zoom is a crop scaled back up**, so zooming in softens the image; it does
   not re-capture at higher detail.
@@ -181,6 +194,10 @@ multi-screen saving and playback on a machine with one monitor.
   so playing directly from inside the archive is possible later.
 - **OCR needs a Windows language with text recognition installed.** If none
   is, the player says so and explains where to add it.
+- **On some GPUs the first frame of a video repeats the second.** Windows'
+  transcoder, which the encoder runs in, drops the first picture on NVIDIA
+  hardware and fills its 1/30 s with the next one. Every later frame keeps its
+  exact time, so sync between screens and with sound is unaffected.
 - **Text that is on screen for under two seconds may be missing from search.**
   Pausing on it and selecting still works, because that reads the exact frame.
 

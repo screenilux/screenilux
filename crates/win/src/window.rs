@@ -1,8 +1,14 @@
-//! Keeping our own windows out of the recording.
+//! Keeping our own windows out of the recording, and the look of the
+//! recording bar.
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{COLORREF, HWND};
+use windows::Win32::Graphics::Dwm::{
+    DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_ROUND,
+    DwmSetWindowAttribute,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GetAncestor, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+    GA_ROOT, GWL_EXSTYLE, GetAncestor, GetWindowLongPtrW, LWA_ALPHA, SetLayeredWindowAttributes,
+    SetWindowDisplayAffinity, SetWindowLongPtrW, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_LAYERED,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +70,62 @@ unsafe fn set_affinity(hwnd: isize, exclude: bool) -> Result<(), AffinityError> 
     // SAFETY: a live top-level handle and a valid affinity constant.
     unsafe { SetWindowDisplayAffinity(target, affinity) }
         .map_err(|e| AffinityError::Unsupported(e.to_string()))
+}
+
+/// Draw the whole window at `alpha` (255 is opaque), letting what is behind
+/// it show through. Opaque removes the layering entirely, since a layered
+/// window costs the compositor an extra copy.
+///
+/// # Safety
+///
+/// `hwnd` must be a live top-level window handle.
+pub unsafe fn set_opacity(hwnd: isize, alpha: u8) {
+    if hwnd == 0 {
+        return;
+    }
+    let handle = HWND(hwnd as *mut std::ffi::c_void);
+    // SAFETY: the caller guarantees a live handle; reading and writing its
+    // extended style and layering attributes are plain calls.
+    unsafe {
+        let style = GetWindowLongPtrW(handle, GWL_EXSTYLE);
+        let layered = WS_EX_LAYERED.0 as isize;
+        if alpha == 255 {
+            if style & layered != 0 {
+                SetWindowLongPtrW(handle, GWL_EXSTYLE, style & !layered);
+            }
+            return;
+        }
+        if style & layered == 0 {
+            SetWindowLongPtrW(handle, GWL_EXSTYLE, style | layered);
+        }
+        let _ = SetLayeredWindowAttributes(handle, COLORREF(0), alpha, LWA_ALPHA);
+    }
+}
+
+/// Ask Windows 11 to round a borderless window's corners, or to go back to
+/// its default. Earlier versions ignore it.
+///
+/// # Safety
+///
+/// `hwnd` must be a live top-level window handle.
+pub unsafe fn set_rounded(hwnd: isize, rounded: bool) {
+    if hwnd == 0 {
+        return;
+    }
+    let preference: DWM_WINDOW_CORNER_PREFERENCE = if rounded {
+        DWMWCP_ROUND
+    } else {
+        DWMWCP_DEFAULT
+    };
+    // SAFETY: a live handle and a correctly sized value for the attribute.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            HWND(hwnd as *mut std::ffi::c_void),
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&preference as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+    }
 }
 
 /// Whether this Windows build can exclude a window from capture at all.

@@ -30,6 +30,7 @@ fn main() {
         monitors,
         fps: 30,
         microphone: false,
+        click_sound: false,
         effects: screenilux_core::EffectOptions::default(),
         camera: None,
         pointer_events: None,

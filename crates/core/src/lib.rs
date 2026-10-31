@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod click;
 pub mod compositor;
 pub mod focus;
 pub mod geometry;
