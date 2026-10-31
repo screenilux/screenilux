@@ -1,0 +1,132 @@
+//! The seams between pure logic and the outside world.
+//!
+//! Everything here is a trait so `core` stays free of Windows, ffmpeg and the
+//! UI. The adapters live in the `win` and `media` crates; the tests in this
+//! crate use fakes.
+
+use crate::geometry::{Monitor, Point, Rect};
+use std::time::Duration;
+
+/// A captured frame, borrowed from whatever buffer the adapter owns.
+pub struct Frame<'a> {
+    /// Tightly packed BGRA8, `width * height * 4` bytes.
+    pub pixels: &'a mut [u8],
+    pub width: u32,
+    pub height: u32,
+    /// False when the source knows nothing changed since the previous frame.
+    /// The recorder re-emits the last encoded frame instead of recompositing,
+    /// which is what makes an idle screen nearly free.
+    pub changed: bool,
+}
+
+impl Frame<'_> {
+    pub fn stride(&self) -> usize {
+        self.width as usize * 4
+    }
+
+    pub fn bounds(&self) -> Rect {
+        Rect::new(0, 0, self.width, self.height)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CaptureError {
+    #[error("no displays were found")]
+    NoDisplays,
+    #[error("the display went away (resolution change, undock, or session lock)")]
+    DisplayLost,
+    #[error("timed out waiting for a frame")]
+    Timeout,
+    #[error("{0}")]
+    Backend(String),
+}
+
+/// A source of screen frames for one monitor.
+pub trait ScreenSource: Send {
+    /// Block until the next frame, or `Timeout` if nothing arrives. A source
+    /// with change detection should report `changed: false` rather than
+    /// blocking forever on a static screen.
+    fn next_frame(&mut self, timeout: Duration) -> Result<Frame<'_>, CaptureError>;
+
+    fn bounds(&self) -> Rect;
+}
+
+/// Enumerates displays. Separate from `ScreenSource` so the UI can list
+/// monitors without opening a capture session.
+pub trait DisplayEnumerator {
+    fn monitors(&self) -> Result<Vec<Monitor>, CaptureError>;
+}
+
+/// Something the pointer did, as seen by the global hook.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PointerEvent {
+    /// Wheel notches; positive is away from the user. Already filtered to the
+    /// zoom modifier, so the recorder does not re-check keyboard state.
+    Wheel {
+        steps: f64,
+    },
+    Click {
+        at: Point,
+    },
+    /// Reset zoom to 1x.
+    Reset,
+}
+
+/// The global pointer hook.
+pub trait PointerSource: Send {
+    /// Current pointer position on the virtual desktop.
+    fn position(&self) -> Point;
+    /// Drain whatever has arrived since the last call. Never blocks: the hook
+    /// callback must return promptly or Windows silently drops the hook, so it
+    /// only enqueues and this drains.
+    fn drain(&mut self, out: &mut Vec<PointerEvent>);
+}
+
+/// The latest webcam frame, if any.
+pub trait CameraSource: Send + Sync {
+    /// Most recent frame as tightly packed BGRA8 at the given size, or `None`
+    /// before the first frame arrives.
+    fn tile(&self, width: u32, height: u32) -> Option<Vec<u8>>;
+    /// Where the bubble currently sits on the virtual desktop.
+    fn rect(&self) -> Rect;
+    fn error(&self) -> Option<String>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SinkError {
+    #[error("the encoder exited: {0}")]
+    EncoderDied(String),
+    #[error("could not start the encoder: {0}")]
+    StartFailed(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Where composited frames go. One segment per pause interval; the sink joins
+/// them when finished.
+pub trait VideoSink: Send {
+    /// Open a new segment. Called at start and on every resume.
+    fn open_segment(&mut self) -> Result<(), SinkError>;
+    /// Write one frame of BGRA8. Called `due` times with the same buffer when
+    /// capture has fallen behind.
+    fn write(&mut self, frame: &[u8]) -> Result<(), SinkError>;
+    /// Close the current segment cleanly.
+    fn close_segment(&mut self) -> Result<(), SinkError>;
+    /// Join every segment into `dest`.
+    fn finish(&mut self, dest: &std::path::Path) -> Result<(), SinkError>;
+}
+
+/// Time source, injected so pacing tests are deterministic.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> std::time::Instant;
+}
+
+/// The real clock.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+}
