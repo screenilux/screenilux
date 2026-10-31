@@ -15,14 +15,13 @@ use screenilux_core::compositor::{Compositor, EffectOptions};
 use screenilux_core::focus::{DEFAULT_DWELL, FocusTracker};
 use screenilux_core::geometry::Monitor;
 use screenilux_core::ports::VideoSink;
-use screenilux_core::ports::{CameraSource, PointerEvent, PointerSource};
+use screenilux_core::ports::{CameraSource, PointerEvent};
 use screenilux_core::session::{Focus, FocusEntry, Manifest, Role, Screen};
 use screenilux_core::timing::SyncClock;
 use screenilux_media::command::{EncoderSpec, SegmentParams};
 use screenilux_media::segment::FfmpegSink;
 use screenilux_media::util::unique_path;
 use screenilux_win::capture::ScreenCapture;
-use screenilux_win::input::InputHook;
 
 use crate::control::Control;
 use crate::screen::{Elapsed, ScreenJob, run};
@@ -57,6 +56,9 @@ pub struct SessionConfig {
     pub effects: EffectOptions,
     /// The live camera, if the bubble is enabled.
     pub camera: Option<Arc<dyn CameraSource>>,
+    /// Pointer events from the app's hook. Without this, zoom and click
+    /// effects simply do not fire.
+    pub pointer_events: Option<Receiver<PointerEvent>>,
 }
 
 impl std::fmt::Debug for SessionConfig {
@@ -221,14 +223,17 @@ impl Session {
         }
 
         // The hook is only worth installing if something consumes it.
-        let router = (config.effects.zoom || config.effects.clicks).then(|| {
+        let router = config.pointer_events.clone().and_then(|events| {
+            if !(config.effects.zoom || config.effects.clicks) {
+                return None;
+            }
             let stop = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&stop);
             let handle = std::thread::Builder::new()
                 .name("screenilux-router".into())
-                .spawn(move || route_events(event_senders, flag))
+                .spawn(move || route_events(events, event_senders, flag))
                 .ok();
-            RouterWorker { stop, handle }
+            Some(RouterWorker { stop, handle })
         });
 
         // Focus is only meaningful across several screens.
@@ -465,15 +470,16 @@ impl Drop for SinkCarrier {
 
 /// Drain the global hook and hand each event to the screen it belongs to.
 fn route_events(
+    events: Receiver<PointerEvent>,
     screens: Vec<(screenilux_core::geometry::Rect, Sender<PointerEvent>)>,
     stop: Arc<AtomicBool>,
 ) {
-    let mut hook = InputHook::start();
-    let mut batch = Vec::new();
     while !stop.load(Ordering::Relaxed) {
-        batch.clear();
-        hook.drain(&mut batch);
-        for event in batch.drain(..) {
+        // A short block keeps the thread responsive to stop without spinning.
+        let Ok(event) = events.recv_timeout(Duration::from_millis(50)) else {
+            continue;
+        };
+        {
             match event {
                 // A reset clears every screen: middle-clicking to escape a
                 // zoom should not leave another screen magnified.
@@ -495,9 +501,7 @@ fn route_events(
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(8));
     }
-    hook.stop();
 }
 
 fn track_focus(

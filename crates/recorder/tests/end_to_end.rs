@@ -106,6 +106,9 @@ fn config(f: &Fixture, monitors: Vec<screenilux_core::Monitor>) -> SessionConfig
         ffmpeg: f.ffmpeg.clone(),
         effects: effects(),
         camera: None,
+        // No hook here: these runs verify capture and timing, not overlays
+        // driven by the pointer.
+        pointer_events: None,
     }
 }
 

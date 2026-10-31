@@ -8,8 +8,8 @@
 //! removes a low-level hook whose callback is too slow to return, which would
 //! disable zoom and click effects mid-recording with no error anywhere.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -107,6 +107,10 @@ pub struct InputHook {
     tid: ThreadId,
     pointer_rx: Receiver<PointerEvent>,
     hotkey_rx: Receiver<Hotkey>,
+    /// Hotkeys another application already owns. Surfaced rather than only
+    /// logged: losing a global hotkey silently is the kind of thing a user
+    /// discovers mid-recording.
+    unavailable: Arc<Mutex<Vec<String>>>,
 }
 
 impl InputHook {
@@ -120,10 +124,12 @@ impl InputHook {
         let signal = std::sync::Arc::clone(&ready);
         let tid: ThreadId = std::sync::Arc::new(AtomicU32::new(0));
         let tid_for_pump = std::sync::Arc::clone(&tid);
+        let unavailable: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let taken = Arc::clone(&unavailable);
 
         let thread = std::thread::Builder::new()
             .name("screenilux-input".into())
-            .spawn(move || pump(htx, signal, tid_for_pump))
+            .spawn(move || pump(htx, signal, tid_for_pump, taken))
             .expect("failed to spawn the input thread");
 
         // Wait for the pump to publish its thread id, so an immediate stop
@@ -145,11 +151,31 @@ impl InputHook {
             tid,
             pointer_rx,
             hotkey_rx,
+            unavailable,
         }
+    }
+
+    /// Hotkeys that could not be registered because something else owns them.
+    pub fn unavailable_hotkeys(&self) -> Vec<String> {
+        self.unavailable
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default()
     }
 
     pub fn hotkeys(&self) -> &Receiver<Hotkey> {
         &self.hotkey_rx
+    }
+
+    /// A handle on the pointer stream.
+    ///
+    /// The app owns one hook for its whole life - hotkeys must work while
+    /// idle, and while the window is minimised during a recording - and hands
+    /// this to each recording session. Crossbeam receivers are multi-consumer,
+    /// so events are split rather than duplicated; only one consumer should
+    /// drain pointer events at a time.
+    pub fn pointer_events(&self) -> Receiver<PointerEvent> {
+        self.pointer_rx.clone()
     }
 
     pub fn stop(&mut self) {
@@ -199,6 +225,7 @@ fn pump(
     hotkeys: Sender<Hotkey>,
     ready: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>,
     tid_out: ThreadId,
+    unavailable: Arc<Mutex<Vec<String>>>,
 ) {
     // SAFETY: installing a thread-local-scoped global hook with a 'static fn.
     let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) };
@@ -219,11 +246,16 @@ fn pump(
     let modifiers: HOT_KEY_MODIFIERS = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
     // SAFETY: registering against the calling thread (no window handle).
     unsafe {
-        if RegisterHotKey(None, HOTKEY_START_STOP, modifiers, VK_R.0 as u32).is_err() {
-            tracing::warn!("Ctrl+Alt+R is taken by another application");
-        }
-        if RegisterHotKey(None, HOTKEY_PAUSE_RESUME, modifiers, VK_P.0 as u32).is_err() {
-            tracing::warn!("Ctrl+Alt+P is taken by another application");
+        for (id, vk, name) in [
+            (HOTKEY_START_STOP, VK_R.0 as u32, "Ctrl+Alt+R"),
+            (HOTKEY_PAUSE_RESUME, VK_P.0 as u32, "Ctrl+Alt+P"),
+        ] {
+            if RegisterHotKey(None, id, modifiers, vk).is_err() {
+                tracing::warn!(hotkey = name, "already claimed by another application");
+                if let Ok(mut v) = unavailable.lock() {
+                    v.push(name.to_string());
+                }
+            }
         }
     }
 
