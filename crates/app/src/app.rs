@@ -30,7 +30,7 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         let runtime = Runtime::new();
-        let probes = Probes::start(runtime.ffmpeg.clone());
+        let probes = Probes::start();
         let unavailable_hotkeys = runtime.hook.unavailable_hotkeys();
         Self {
             settings: Settings::new(),
@@ -65,14 +65,6 @@ impl App {
         if self.busy() {
             return;
         }
-        let Some(ffmpeg) = self.runtime.ffmpeg.clone() else {
-            self.status = "ffmpeg was not found next to the app or on PATH".into();
-            return;
-        };
-        let Some(encoder) = self.probes.encoder else {
-            self.status = "still choosing an encoder, try again in a moment".into();
-            return;
-        };
         let targets = self.settings.targets();
         if targets.is_empty() {
             self.status = "Tick at least one screen to record".into();
@@ -91,12 +83,7 @@ impl App {
         let config = SessionConfig {
             monitors: targets,
             fps: self.settings.fps,
-            audio_device: self
-                .settings
-                .microphone
-                .and_then(|i| self.probes.microphones.get(i).cloned()),
-            encoder,
-            ffmpeg,
+            microphone: self.settings.microphone && self.probes.has_microphone,
             effects: self.settings.effects,
             camera,
             pointer_events: Some(self.runtime.hook.pointer_events()),
@@ -264,23 +251,14 @@ impl App {
         let busy = self.busy();
 
         ui.horizontal(|ui| {
-            ui.label("Microphone");
-            let current = self
-                .settings
-                .microphone
-                .and_then(|i| self.probes.microphones.get(i).cloned())
-                .unwrap_or_else(|| "None".into());
-            ui.add_enabled_ui(!busy, |ui| {
-                egui::ComboBox::from_id_salt("mic")
-                    .selected_text(current)
-                    .width(260.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.settings.microphone, None, "None");
-                        for (i, name) in self.probes.microphones.iter().enumerate() {
-                            ui.selectable_value(&mut self.settings.microphone, Some(i), name);
-                        }
-                    });
-            });
+            let available = self.probes.has_microphone;
+            ui.add_enabled(
+                !busy && available,
+                egui::Checkbox::new(&mut self.settings.microphone, "Record microphone"),
+            );
+            if self.probes.ready && !available {
+                ui.label(egui::RichText::new("no microphone found").weak().small());
+            }
         });
 
         ui.horizontal(|ui| {

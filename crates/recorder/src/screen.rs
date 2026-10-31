@@ -1,8 +1,8 @@
 //! One screen's capture-and-encode loop.
 //!
 //! Everything here is expressed against the `core` ports, so the whole loop —
-//! pacing, pause handling, encoder fallback — is testable with fakes, without
-//! a display or ffmpeg.
+//! pacing, pause handling, audio forwarding — is testable with fakes, without
+//! a display or an encoder.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,6 +73,8 @@ pub struct ScreenJob {
     /// Where the pointer is, sampled per frame for the overlays.
     pub pointer: Arc<dyn Fn() -> Point + Send + Sync>,
     pub camera: Option<Arc<dyn CameraSource>>,
+    /// The microphone, on the one screen that carries sound.
+    pub audio: Option<screenilux_win::AudioCapture>,
 }
 
 /// Run one screen to completion. Returns the encoder label actually used,
@@ -124,6 +126,16 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
                 continue;
             }
             RunState::Running => {}
+        }
+
+        // Drain the microphone before pacing, so audio keeps flowing even on
+        // a still screen where no video frame is due.
+        if let Some(mic) = &job.audio {
+            for chunk in mic.drain() {
+                if let Err(e) = job.sink.write_audio(&chunk) {
+                    tracing::warn!(error = %e, "dropping audio");
+                }
+            }
         }
 
         let in_segment = seg_start.elapsed();
@@ -336,6 +348,7 @@ mod tests {
                 events: None,
                 pointer: Arc::new(|| Point::new(0, 0)),
                 camera: None,
+                audio: None,
             },
             elapsed,
         )

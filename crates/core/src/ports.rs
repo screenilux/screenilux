@@ -1,8 +1,7 @@
 //! The seams between pure logic and the outside world.
 //!
-//! Everything here is a trait so `core` stays free of Windows, ffmpeg and the
-//! UI. The adapters live in the `win` and `media` crates; the tests in this
-//! crate use fakes.
+//! Everything here is a trait so `core` stays free of Windows and the UI. The
+//! adapters live in the `win` crate; the tests in this crate use fakes.
 
 use crate::geometry::{Monitor, Point, Rect};
 use std::time::Duration;
@@ -153,6 +152,15 @@ pub trait VideoSink: Send {
     fn close_segment(&mut self, pad: u64) -> Result<(), SinkError>;
     /// Join every segment into `dest`.
     fn finish(&mut self, dest: &std::path::Path) -> Result<(), SinkError>;
+    /// Feed one chunk of PCM audio.
+    ///
+    /// Defaulted to a no-op: only one screen in a session carries sound, so
+    /// the rest never see this.
+    fn write_audio(&mut self, pcm: &[u8]) -> Result<(), SinkError> {
+        let _ = pcm;
+        Ok(())
+    }
+
     /// Label of the encoder actually in use, which may differ from the one
     /// chosen at start if a fallback happened.
     fn encoder_label(&self) -> &'static str;

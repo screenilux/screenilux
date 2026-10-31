@@ -18,10 +18,10 @@ use screenilux_core::ports::VideoSink;
 use screenilux_core::ports::{CameraSource, PointerEvent};
 use screenilux_core::session::{Focus, FocusEntry, Manifest, Role, Screen};
 use screenilux_core::timing::SyncClock;
-use screenilux_media::command::{EncoderSpec, SegmentParams};
-use screenilux_media::segment::FfmpegSink;
-use screenilux_media::util::unique_path;
 use screenilux_win::capture::ScreenCapture;
+use screenilux_win::encoder::{ENCODER_LABEL, NativeSink};
+
+use crate::paths::{TempDir, unique_path};
 
 use crate::control::Control;
 use crate::screen::{Elapsed, ScreenJob, run};
@@ -48,11 +48,8 @@ pub enum SessionError {
 pub struct SessionConfig {
     pub monitors: Vec<Monitor>,
     pub fps: u32,
-    /// Rides on the first screen only: Windows gives a capture device a
-    /// single consumer.
-    pub audio_device: Option<String>,
-    pub encoder: EncoderSpec,
-    pub ffmpeg: PathBuf,
+    /// Record the default microphone alongside the first screen.
+    pub microphone: bool,
     pub effects: EffectOptions,
     /// The live camera, if the bubble is enabled.
     pub camera: Option<Arc<dyn CameraSource>>,
@@ -66,8 +63,7 @@ impl std::fmt::Debug for SessionConfig {
         f.debug_struct("SessionConfig")
             .field("monitors", &self.monitors.len())
             .field("fps", &self.fps)
-            .field("audio_device", &self.audio_device)
-            .field("encoder", &self.encoder.label)
+            .field("microphone", &self.microphone)
             .field("effects", &self.effects)
             .field("camera", &self.camera.is_some())
             .finish()
@@ -89,10 +85,10 @@ struct ScreenSlot {
 }
 
 /// The sink is handed to the capture thread, so finishing needs a second
-/// reference. `FfmpegSink` is not clonable, so the thread gives it back.
+/// reference. `NativeSink` is not clonable, so the thread gives it back.
 enum SinkHandle {
-    Pending(Receiver<Box<FfmpegSink>>),
-    Ready(Box<FfmpegSink>),
+    Pending(Receiver<Box<NativeSink>>),
+    Ready(Box<NativeSink>),
 }
 
 /// A live recording.
@@ -101,6 +97,9 @@ pub struct Session {
     control: Arc<Control>,
     sync: Arc<SyncClock>,
     screens: Vec<ScreenSlot>,
+    /// Kept alive for the session; removes the scratch files when dropped.
+    #[allow(dead_code)]
+    workspace: TempDir,
     focus: Option<FocusWorker>,
     router: Option<RouterWorker>,
     notices_rx: Receiver<String>,
@@ -141,6 +140,9 @@ impl Session {
             return Err(SessionError::NoScreens);
         }
 
+        // One scratch directory for the whole session; encoders write here
+        // and the finished files are moved out.
+        let workspace = TempDir::new("screenilux-session")?;
         let control = Arc::new(Control::new());
         let sync = Arc::new(SyncClock::new(config.monitors.len()));
         let (notices, notices_rx) = unbounded();
@@ -156,19 +158,18 @@ impl Session {
                 .wait_for_first_frame(Duration::from_secs(5))
                 .map_err(|e| SessionError::Capture(format!("{}: {e}", monitor.label)))?;
 
-            let audio = i == 0 && config.audio_device.is_some();
-            let params = SegmentParams {
-                width: monitor.bounds.width,
-                height: monitor.bounds.height,
-                fps: config.fps,
-                audio_device: if audio {
-                    config.audio_device.clone()
-                } else {
-                    None
-                },
-            };
-            let sink = FfmpegSink::new(&config.ffmpeg, params, config.encoder)
-                .map_err(|e| SessionError::Capture(format!("{}: {e}", monitor.label)))?;
+            // Only the first screen carries sound; a single file with audio
+            // is what the manifest records and what a player expects.
+            let audio = i == 0 && config.microphone;
+            let scratch = workspace.path().join(format!("screen{}.mp4", i + 1));
+            let sink = NativeSink::new(
+                monitor.bounds.width,
+                monitor.bounds.height,
+                config.fps,
+                audio,
+                scratch,
+            )
+            .map_err(|e| SessionError::Capture(format!("{}: {e}", monitor.label)))?;
 
             let elapsed = Arc::new(Elapsed::default());
             let (give_back, take_back) = crossbeam_channel::bounded(1);
@@ -200,6 +201,7 @@ impl Session {
                 } else {
                     None
                 },
+                audio: audio.then(screenilux_win::AudioCapture::start),
             };
 
             let label = monitor.label.clone();
@@ -255,6 +257,7 @@ impl Session {
             control,
             sync,
             screens,
+            workspace,
             focus,
             router,
             notices_rx,
@@ -351,7 +354,7 @@ impl Session {
             iso_timestamp(self.started),
             round3(self.duration().as_secs_f64()),
             self.config.fps,
-            self.config.encoder.label.to_string(),
+            ENCODER_LABEL.to_string(),
             self.config.camera_enabled(),
         );
 
@@ -435,8 +438,8 @@ fn finish_sink(slot: &mut ScreenSlot, dest: &Path) -> Result<(), String> {
 
 /// Wraps the sink so the capture thread can return it for finishing.
 struct SinkCarrier {
-    inner: Option<Box<FfmpegSink>>,
-    give_back: Option<Sender<Box<FfmpegSink>>>,
+    inner: Option<Box<NativeSink>>,
+    give_back: Option<Sender<Box<NativeSink>>>,
 }
 
 impl screenilux_core::ports::VideoSink for SinkCarrier {
@@ -454,6 +457,9 @@ impl screenilux_core::ports::VideoSink for SinkCarrier {
     }
     fn finish(&mut self, dest: &Path) -> Result<(), screenilux_core::ports::SinkError> {
         self.inner.as_mut().expect("sink taken").finish(dest)
+    }
+    fn write_audio(&mut self, pcm: &[u8]) -> Result<(), screenilux_core::ports::SinkError> {
+        self.inner.as_mut().expect("sink taken").write_audio(pcm)
     }
     fn encoder_label(&self) -> &'static str {
         self.inner.as_ref().expect("sink taken").encoder_label()

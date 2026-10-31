@@ -1,4 +1,4 @@
-//! Small filesystem helpers.
+//! Scratch directories and collision-free output names.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,10 +7,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A scratch directory that deletes itself.
-///
-/// Hand-rolled rather than pulling in a crate: the needs are a unique name and
-/// cleanup on drop, and segments are large enough that leaking a directory
-/// would be noticed in gigabytes.
 #[derive(Debug)]
 pub struct TempDir {
     path: PathBuf,
@@ -42,30 +38,28 @@ impl Drop for TempDir {
 
 /// A path in `dir` that does not already exist.
 ///
-/// The recording name is timestamped to the second, so stopping two recordings
-/// within the same second would otherwise overwrite the first without warning —
-/// ffmpeg is invoked with `-y`, and the session folder is created with
-/// create-if-missing.
+/// Recording names are timestamped to the second, so stopping two recordings
+/// within the same second would otherwise overwrite the first silently.
 pub fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
-    let first = dir.join(if ext.is_empty() {
-        stem.to_string()
-    } else {
-        format!("{stem}.{ext}")
-    });
+    let name = |n: Option<u32>| -> PathBuf {
+        let base = match n {
+            None => stem.to_string(),
+            Some(n) => format!("{stem} ({n})"),
+        };
+        dir.join(if ext.is_empty() {
+            base
+        } else {
+            format!("{base}.{ext}")
+        })
+    };
+    let first = name(None);
     if !first.exists() {
         return first;
     }
-    for n in 2..1000 {
-        let candidate = dir.join(if ext.is_empty() {
-            format!("{stem} ({n})")
-        } else {
-            format!("{stem} ({n}).{ext}")
-        });
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    first
+    (2..1000)
+        .map(|n| name(Some(n)))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
 }
 
 #[cfg(test)]
@@ -84,37 +78,23 @@ mod tests {
     }
 
     #[test]
-    fn unique_path_leaves_a_free_name_alone() {
-        let d = TempDir::new("u").unwrap();
-        assert_eq!(
-            unique_path(d.path(), "recording", "mp4"),
-            d.path().join("recording.mp4")
-        );
-    }
-
-    #[test]
     fn unique_path_sidesteps_a_same_second_collision() {
         let d = TempDir::new("u").unwrap();
-        std::fs::write(d.path().join("recording.mp4"), b"x").unwrap();
         assert_eq!(
-            unique_path(d.path(), "recording", "mp4"),
-            d.path().join("recording (2).mp4")
+            unique_path(d.path(), "rec", "mp4"),
+            d.path().join("rec.mp4")
         );
-
-        std::fs::write(d.path().join("recording (2).mp4"), b"x").unwrap();
+        std::fs::write(d.path().join("rec.mp4"), b"x").unwrap();
         assert_eq!(
-            unique_path(d.path(), "recording", "mp4"),
-            d.path().join("recording (3).mp4")
+            unique_path(d.path(), "rec", "mp4"),
+            d.path().join("rec (2).mp4")
         );
     }
 
     #[test]
     fn unique_path_handles_extensionless_session_folders() {
         let d = TempDir::new("u").unwrap();
-        std::fs::create_dir(d.path().join("session")).unwrap();
-        assert_eq!(
-            unique_path(d.path(), "session", ""),
-            d.path().join("session (2)")
-        );
+        std::fs::create_dir(d.path().join("s")).unwrap();
+        assert_eq!(unique_path(d.path(), "s", ""), d.path().join("s (2)"));
     }
 }

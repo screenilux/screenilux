@@ -6,7 +6,6 @@ use std::sync::mpsc::{Receiver, channel};
 
 use screenilux_core::EffectOptions;
 use screenilux_core::geometry::Monitor;
-use screenilux_media::{EncoderSpec, locate_ffmpeg};
 
 /// Camera bubble sizes, matching the Python build.
 pub const CAMERA_SIZES: [(&str, u32, u32); 3] = [
@@ -29,42 +28,36 @@ pub enum Phase {
 
 /// Results of the slow startup probes, which run off the UI thread.
 ///
-/// Enumerating DirectShow devices shells out to ffmpeg twice and probing
-/// encoders runs short real encodes. Doing either inline would hold the window
-/// back for seconds before it appeared.
+/// Enumerating a camera through Media Foundation takes a moment. Doing it
+/// inline would hold the window back before it appeared.
 pub struct Probes {
-    pub encoder: Option<EncoderSpec>,
-    pub microphones: Vec<String>,
+    pub has_microphone: bool,
     pub cameras: Vec<String>,
     pub ready: bool,
     rx: Option<Receiver<ProbeResult>>,
 }
 
 struct ProbeResult {
-    encoder: EncoderSpec,
-    microphones: Vec<String>,
+    has_microphone: bool,
     cameras: Vec<String>,
 }
 
 impl Probes {
-    pub fn start(ffmpeg: Option<PathBuf>) -> Self {
+    pub fn start() -> Self {
         let (tx, rx) = channel();
         std::thread::Builder::new()
             .name("screenilux-probe".into())
             .spawn(move || {
-                let Some(ffmpeg) = ffmpeg else { return };
-                let encoder = screenilux_media::detect(&ffmpeg);
-                let devices = screenilux_media::list_devices(&ffmpeg);
+                // Both come from Media Foundation. Enumerating a camera takes
+                // a moment, which is why this is off the UI thread at all.
                 let _ = tx.send(ProbeResult {
-                    encoder,
-                    microphones: devices.audio,
+                    has_microphone: screenilux_win::has_microphone(),
                     cameras: screenilux_win::cameras(),
                 });
             })
             .ok();
         Self {
-            encoder: None,
-            microphones: Vec::new(),
+            has_microphone: false,
             cameras: Vec::new(),
             ready: false,
             rx: Some(rx),
@@ -75,19 +68,15 @@ impl Probes {
     pub fn poll(&mut self) {
         let Some(rx) = &self.rx else { return };
         if let Ok(r) = rx.try_recv() {
-            self.encoder = Some(r.encoder);
-            self.microphones = r.microphones;
+            self.has_microphone = r.has_microphone;
             self.cameras = r.cameras;
             self.ready = true;
             self.rx = None;
         }
     }
 
-    pub fn encoder_label(&self) -> String {
-        match &self.encoder {
-            Some(e) => e.label.to_string(),
-            None => "detecting…".to_string(),
-        }
+    pub fn encoder_label(&self) -> &'static str {
+        screenilux_win::ENCODER_LABEL
     }
 }
 
@@ -100,7 +89,7 @@ pub struct Settings {
     pub fps: u32,
     pub minimize: bool,
     pub effects: EffectOptions,
-    pub microphone: Option<usize>,
+    pub microphone: bool,
     pub camera_device: usize,
     pub camera_size: usize,
     pub out_dir: PathBuf,
@@ -117,7 +106,7 @@ impl Settings {
             fps: 30,
             minimize: true,
             effects: EffectOptions::default(),
-            microphone: None,
+            microphone: false,
             camera_device: 0,
             camera_size: 1,
             out_dir: default_output_dir(),
@@ -203,7 +192,6 @@ fn default_output_dir() -> PathBuf {
 
 /// Shared runtime handles the UI needs.
 pub struct Runtime {
-    pub ffmpeg: Option<PathBuf>,
     pub hook: screenilux_win::InputHook,
     pub camera: Option<screenilux_win::CameraHandle>,
     pub camera_feed: Option<Arc<screenilux_win::CameraFeed>>,
@@ -212,7 +200,6 @@ pub struct Runtime {
 impl Runtime {
     pub fn new() -> Self {
         Self {
-            ffmpeg: locate_ffmpeg(),
             hook: screenilux_win::InputHook::start(),
             camera: None,
             camera_feed: None,

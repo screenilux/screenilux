@@ -16,18 +16,13 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use screenilux_core::session::Manifest;
-use screenilux_media::{detect, locate_ffmpeg};
+use screenilux_recorder::paths::TempDir;
 use screenilux_recorder::{Session, SessionConfig};
 use screenilux_win::{display, set_dpi_awareness};
 
 /// Duration of a finished file, straight from ffprobe.
 fn duration_of(ffmpeg: &Path, file: &Path) -> f64 {
-    let probe = ffmpeg.with_file_name(if cfg!(windows) {
-        "ffprobe.exe"
-    } else {
-        "ffprobe"
-    });
-    let out = Command::new(probe)
+    let out = Command::new(ffmpeg)
         .args([
             "-v",
             "error",
@@ -46,12 +41,7 @@ fn duration_of(ffmpeg: &Path, file: &Path) -> f64 {
 }
 
 fn frame_count(ffmpeg: &Path, file: &Path) -> u64 {
-    let probe = ffmpeg.with_file_name(if cfg!(windows) {
-        "ffprobe.exe"
-    } else {
-        "ffprobe"
-    });
-    let out = Command::new(probe)
+    let out = Command::new(ffmpeg)
         .args([
             "-v",
             "error",
@@ -73,16 +63,26 @@ fn frame_count(ffmpeg: &Path, file: &Path) -> u64 {
 }
 
 struct Fixture {
-    dir: screenilux_media::TempDir,
+    dir: TempDir,
+    /// ffprobe is a *development* tool here: the application itself no longer
+    /// depends on ffmpeg in any form.
     ffmpeg: std::path::PathBuf,
 }
 
 fn fixture() -> Option<Fixture> {
     set_dpi_awareness();
     Some(Fixture {
-        dir: screenilux_media::TempDir::new("screenilux-e2e").ok()?,
-        ffmpeg: locate_ffmpeg()?,
+        dir: TempDir::new("screenilux-e2e").ok()?,
+        ffmpeg: which_ffprobe()?,
     })
+}
+
+fn which_ffprobe() -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH")?
+        .to_string_lossy()
+        .split(';')
+        .map(|d| std::path::PathBuf::from(d).join("ffprobe.exe"))
+        .find(|p| p.is_file())
 }
 
 /// Cursor and zoom on, matching the shipping defaults, so the end-to-end runs
@@ -97,13 +97,11 @@ fn effects() -> screenilux_core::EffectOptions {
     }
 }
 
-fn config(f: &Fixture, monitors: Vec<screenilux_core::Monitor>) -> SessionConfig {
+fn config(_f: &Fixture, monitors: Vec<screenilux_core::Monitor>) -> SessionConfig {
     SessionConfig {
         monitors,
         fps: 30,
-        audio_device: None,
-        encoder: detect(&f.ffmpeg),
-        ffmpeg: f.ffmpeg.clone(),
+        microphone: false,
         effects: effects(),
         camera: None,
         // No hook here: these runs verify capture and timing, not overlays

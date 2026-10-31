@@ -1,7 +1,6 @@
 //! Pure domain logic for Screenilux.
 //!
-//! This crate deliberately depends on neither Windows, nor ffmpeg, nor any UI
-//! toolkit. Everything here runs — and is tested — without a screen, a camera
+//! This crate deliberately depends on neither Windows nor any UI toolkit. Everything here runs — and is tested — without a screen, a camera
 //! or an encoder, and the future session player can reuse it as-is.
 //!
 //! The platform-specific pieces plug in through [`ports`].

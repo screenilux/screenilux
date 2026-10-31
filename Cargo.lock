@@ -2987,7 +2987,6 @@ dependencies = [
  "egui",
  "raw-window-handle",
  "screenilux-core",
- "screenilux-media",
  "screenilux-recorder",
  "screenilux-win",
  "tracing",
@@ -3006,21 +3005,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "screenilux-media"
-version = "0.1.0"
-dependencies = [
- "screenilux-core",
- "thiserror 2.0.21",
- "tracing",
-]
-
-[[package]]
 name = "screenilux-recorder"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "screenilux-core",
- "screenilux-media",
  "screenilux-win",
  "thiserror 2.0.21",
  "tracing",

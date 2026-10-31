@@ -9,7 +9,6 @@ description = "Recording orchestration for Screenilux: per-screen threads, share
 
 [dependencies]
 screenilux-core = { path = "../core" }
-screenilux-media = { path = "../media" }
 screenilux-win = { path = "../win" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
