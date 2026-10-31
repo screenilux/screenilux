@@ -1,0 +1,23 @@
+[package]
+name = "screenilux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Screen recorder for Windows."
+
+[[bin]]
+name = "screenilux"
+path = "src/main.rs"
+
+[dependencies]
+screenilux-core = { path = "../core" }
+screenilux-media = { path = "../media" }
+screenilux-recorder = { path = "../recorder" }
+screenilux-win = { path = "../win" }
+eframe = "0.37"
+egui = "0.37"
+raw-window-handle = "0.6"
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
