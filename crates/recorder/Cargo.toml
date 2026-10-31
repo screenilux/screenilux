@@ -1,0 +1,19 @@
+[package]
+name = "screenilux-recorder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Recording orchestration for Screenilux: per-screen threads, shared clock, session manifest."
+
+[dependencies]
+screenilux-core = { path = "../core" }
+screenilux-media = { path = "../media" }
+screenilux-win = { path = "../win" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
