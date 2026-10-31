@@ -1138,6 +1138,7 @@ class App(ttk.Frame):
         self.errors = queue.Queue()
         self.camera = None
         self.camera_overlay = None
+        self.devices_ready = False
         self.encoder = None
         self._encoder_ready = threading.Event()
         self.grid(sticky="nsew")
@@ -1149,6 +1150,7 @@ class App(ttk.Frame):
         self._sync_ui()
         # probing costs a second or two; do not hold up the window
         threading.Thread(target=self._detect_encoder, daemon=True).start()
+        threading.Thread(target=self._probe_devices, daemon=True).start()
         self.after(200, self._tick)
         self.after(120, self._poll_hotkeys)
 
@@ -1171,8 +1173,7 @@ class App(ttk.Frame):
         ttk.Label(self, text="Microphone").grid(row=r, column=0, sticky="w", pady=4)
         self.audio_var = tk.StringVar(value="None")
         self.audio_box = ttk.Combobox(self, textvariable=self.audio_var,
-                                      state="readonly", width=42,
-                                      values=["None"] + list_audio_devices(self.ffmpeg))
+                                      state="readonly", width=42, values=["None"])
         self.audio_box.grid(row=r, column=1, sticky="ew", pady=4)
 
         r += 1
@@ -1221,9 +1222,8 @@ class App(ttk.Frame):
                                          command=self.toggle_camera)
         self.cam_check.grid(row=0, column=0, sticky="w")
         self.cam_device_var = tk.StringVar()
-        cams = list_video_devices(self.ffmpeg)
         self.cam_box = ttk.Combobox(cam, textvariable=self.cam_device_var, width=26,
-                                    state="readonly", values=cams or ["(no camera found)"])
+                                    state="readonly", values=["(looking...)"])
         self.cam_box.current(0)
         self.cam_box.grid(row=0, column=1, sticky="ew", padx=(10, 6))
         self.cam_size_var = tk.StringVar(value=CAMERA_SIZES[1][0])
@@ -1347,7 +1347,9 @@ class App(ttk.Frame):
             return
         names = list(self.cam_box["values"])
         if not names or names[0].startswith("("):
-            messagebox.showerror(APP_NAME, "No camera was found.")
+            messagebox.showerror(APP_NAME, "Still looking for cameras, try again "
+                                 "in a moment." if not self.devices_ready
+                                 else "No camera was found.")
             self.camera_var.set(False)
             return
         _, w, h = next(s for s in CAMERA_SIZES if s[0] == self.cam_size_var.get())
@@ -1370,6 +1372,21 @@ class App(ttk.Frame):
         if self.camera_var.get():
             self.stop_camera()
             self.toggle_camera()
+
+    def _probe_devices(self):
+        """Enumerating dshow devices shells out to ffmpeg twice; keep it off
+        the startup path so the window appears immediately."""
+        mics = list_audio_devices(self.ffmpeg)
+        cams = list_video_devices(self.ffmpeg)
+        self.after(0, lambda: self._apply_devices(mics, cams))
+
+    def _apply_devices(self, mics, cams):
+        self.audio_box["values"] = ["None"] + mics
+        if self.audio_var.get() not in (["None"] + mics):
+            self.audio_box.current(0)
+        self.cam_box["values"] = cams or ["(no camera found)"]
+        self.cam_box.current(0)
+        self.devices_ready = True
 
     def _detect_encoder(self):
         enc = detect_encoder(self.ffmpeg)
