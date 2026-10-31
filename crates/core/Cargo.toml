@@ -13,3 +13,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tiny-skia = "0.12"
+zip = { version = "9.2", default-features = false }

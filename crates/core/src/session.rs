@@ -1,7 +1,8 @@
 //! The `screenrec-session` manifest.
 //!
-//! A multi-screen recording is a folder of per-screen MP4s plus this manifest.
-//! It is the contract between the recorder, the future player and the importer,
+//! A multi-screen recording is per-screen MP4s plus this manifest, packed into
+//! one `.screenilux` file (see [`package`](crate::package)) or unpacked as a
+//! folder. It is the contract between the recorder, the player and the importer,
 //! so the field names and shapes here are load-bearing: they must stay
 //! byte-compatible with what the Python build emits.
 

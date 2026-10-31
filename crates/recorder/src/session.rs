@@ -98,7 +98,6 @@ pub struct Session {
     sync: Arc<SyncClock>,
     screens: Vec<ScreenSlot>,
     /// Kept alive for the session; removes the scratch files when dropped.
-    #[allow(dead_code)]
     workspace: TempDir,
     focus: Option<FocusWorker>,
     router: Option<RouterWorker>,
@@ -326,8 +325,9 @@ impl Session {
 
     /// Stop recording and write the result into `outdir`.
     ///
-    /// One screen yields a single MP4; several yield a session folder with a
-    /// manifest. Returns the path written.
+    /// One screen yields a single MP4, which plays anywhere. Several yield a
+    /// `.screenilux` package: the per-screen MP4s and their manifest in one
+    /// file. Returns the path written.
     pub fn finish(mut self, outdir: &Path) -> Result<PathBuf, SessionError> {
         let failures = self.halt();
         let focus_timeline = self
@@ -347,7 +347,10 @@ impl Session {
             return Ok(dest);
         }
 
-        let folder = unique_path(outdir, &format!("recording_{stamp}"), "");
+        // Assembled as a session folder in scratch space, then packed. The
+        // finished videos are moved, not copied, into the folder, so the
+        // only full copy is the one into the package.
+        let folder = self.workspace.path().join("session");
         std::fs::create_dir_all(&folder)?;
 
         let mut manifest = Manifest::new(
@@ -417,7 +420,14 @@ impl Session {
         if !lost.is_empty() {
             tracing::warn!(lost = lost.join("; "), "some screens did not save");
         }
-        Ok(folder)
+        let dest = unique_path(
+            outdir,
+            &format!("recording_{stamp}"),
+            screenilux_core::package::PACKAGE_EXT,
+        );
+        screenilux_core::package::pack(&folder, &dest)
+            .map_err(|e| SessionError::Manifest(e.to_string()))?;
+        Ok(dest)
     }
 }
 

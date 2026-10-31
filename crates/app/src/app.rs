@@ -9,9 +9,18 @@ use screenilux_recorder::{Session, SessionConfig};
 use screenilux_win::Hotkey;
 
 use crate::overlay::Overlay;
+use crate::player_view::{PlayerView, dropped_path, playable};
 use crate::state::{CAMERA_SIZES, FPS_CHOICES, Phase, Probes, Runtime, Settings};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Record,
+    Play,
+}
+
 pub struct App {
+    tab: Tab,
+    player: PlayerView,
     settings: Settings,
     probes: Probes,
     runtime: Runtime,
@@ -33,6 +42,8 @@ impl App {
         let probes = Probes::start();
         let unavailable_hotkeys = runtime.hook.unavailable_hotkeys();
         Self {
+            tab: Tab::Record,
+            player: PlayerView::new(),
             settings: Settings::new(),
             probes,
             runtime,
@@ -46,6 +57,12 @@ impl App {
             started_at: None,
             unavailable_hotkeys,
         }
+    }
+
+    /// Switch to the Play tab and open `path`.
+    pub fn play(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.tab = Tab::Play;
+        self.player.open(path, ctx);
     }
 
     fn busy(&self) -> bool {
@@ -385,6 +402,14 @@ impl App {
                     .unwrap_or_else(|| self.settings.out_dir.clone());
                 reveal(&target);
             }
+            if let Some(saved) = self.last_save.clone()
+                && ui
+                    .add_enabled(!busy, egui::Button::new("Play it"))
+                    .on_hover_text("Watch the last recording")
+                    .clicked()
+            {
+                self.play(saved, ui.ctx());
+            }
         });
     }
 
@@ -475,10 +500,29 @@ impl eframe::App for App {
             }
         }
 
+        // A recording dropped onto the window opens in the player.
+        if let Some(path) = dropped_path(&ctx)
+            && playable(&path)
+        {
+            self.play(path, &ctx);
+        }
+
         // The root Ui from eframe 0.37 carries no margin or background of its
         // own; its docs point at this helper, which supplies both. Applied
         // outside the scroll area, or the first row is clipped at the top.
         egui::Frame::central_panel(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Record, "Record");
+                ui.selectable_value(&mut self.tab, Tab::Play, "Play");
+                if self.busy() && self.tab == Tab::Play {
+                    ui.colored_label(egui::Color32::from_rgb(200, 64, 56), "● Recording");
+                }
+            });
+            ui.separator();
+            if self.tab == Tab::Play {
+                self.player.ui(ui, &ctx);
+                return;
+            }
             egui::ScrollArea::vertical()
                 // Fill the window rather than shrinking to the content, or the
                 // area below the controls is left unpainted.
@@ -525,7 +569,14 @@ impl eframe::App for App {
 
         // Repaint steadily so the timer ticks and hotkeys are serviced even
         // when nothing is being interacted with.
-        ctx.request_repaint_after(Duration::from_millis(if self.busy() { 100 } else { 250 }));
+        // While playing, each new frame asks for its own repaint; this only
+        // keeps the position readout moving between them.
+        let tick = if self.busy() || self.player.is_playing() {
+            100
+        } else {
+            250
+        };
+        ctx.request_repaint_after(Duration::from_millis(tick));
     }
 }
 

@@ -180,15 +180,21 @@ fn records_every_screen_in_sync_with_a_manifest() {
     let session = Session::start(config(&f, all)).expect("session should start");
     std::thread::sleep(Duration::from_secs(4));
     let recorded = session.duration().as_secs_f64();
-    let folder = session.finish(f.dir.path()).expect("should save");
+    let package = session.finish(f.dir.path()).expect("should save");
 
     assert!(
-        folder.is_dir(),
-        "several screens should give a session folder"
+        package.is_file() && screenilux_core::package::is_package(&package),
+        "several screens should give one .screenilux file, got {}",
+        package.display()
     );
-    let manifest_path = folder.join("recording.json");
-    let text = std::fs::read_to_string(&manifest_path).expect("manifest should exist");
-    let manifest = Manifest::from_json(&text).expect("manifest should parse");
+    // Unpacked, it is the session folder the player and older tools read.
+    let folder = f.dir.path().join("unpacked");
+    let manifest = screenilux_core::package::unpack(&package, &folder).expect("should unpack");
+    assert_eq!(
+        Manifest::from_json(&std::fs::read_to_string(folder.join("recording.json")).unwrap())
+            .unwrap(),
+        manifest
+    );
 
     assert_eq!(manifest.screens.len(), count);
     assert_eq!(manifest.fps, 30);

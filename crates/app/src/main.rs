@@ -5,6 +5,7 @@
 
 mod app;
 mod overlay;
+mod player_view;
 mod state;
 
 use eframe::egui;
@@ -29,6 +30,14 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Screenilux",
         options,
-        Box::new(|_cc| Ok(Box::new(app::App::new()) as Box<dyn eframe::App>)),
+        Box::new(|cc| {
+            let mut app = app::App::new();
+            // `screenilux path\to\recording.screenilux` opens it for playing,
+            // which is what double-clicking a recording passes.
+            if let Some(path) = std::env::args_os().nth(1) {
+                app.play(std::path::PathBuf::from(path), &cc.egui_ctx);
+            }
+            Ok(Box::new(app) as Box<dyn eframe::App>)
+        }),
     )
 }

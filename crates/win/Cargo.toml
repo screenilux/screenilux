@@ -28,5 +28,11 @@ windows = { version = "0.62", features = [
     "Win32_Media_Audio",
     "Win32_Media_KernelStreaming",
     "Win32_Media_Multimedia",
+    "Win32_Media_MediaFoundation",
+    "Foundation_Collections",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Security_Cryptography",
+    "Storage_Streams",
 ] }
 nokhwa = { version = "0.10.11", features = ["input-msmf"] }

@@ -1,0 +1,16 @@
+[package]
+name = "screenilux-player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Playback for Screenilux: per-screen decode threads on one clock, sound, and video text."
+
+[dependencies]
+screenilux-core = { path = "../core" }
+screenilux-recorder = { path = "../recorder" }
+screenilux-win = { path = "../win" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+crossbeam-channel = { workspace = true }

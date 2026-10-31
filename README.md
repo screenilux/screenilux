@@ -1,7 +1,8 @@
 # Screenilux
 
-A screen recorder for Windows. Record one screen or several at once, with a
-draggable camera bubble, pointer zoom and click effects.
+A screen recorder and player for Windows. Record one screen or several at
+once, with a draggable camera bubble, pointer zoom and click effects, then play
+them back in step and copy or search the text on screen.
 
 ![The Screenilux window](screenshot.png)
 
@@ -23,6 +24,16 @@ draggable camera bubble, pointer zoom and click effects.
   nothing to bundle — the whole application is one executable.
 - **Global hotkeys**: `Ctrl+Alt+R` start/stop, `Ctrl+Alt+P` pause/resume.
   If another application already owns one, the window says so.
+- **A player for multi-screen recordings.** The Play tab plays every screen in
+  step, either *auto switch* (one screen at a time, following where the
+  pointer was) or *side by side* / *stacked*. Open a recording with the Open
+  button, by dropping it on the window, or with *Play it* after saving.
+- **Copyable text.** Pause and the text on screen becomes selectable: drag
+  across it and `Ctrl+C`, or *Copy all text*. It is read by the OCR engine
+  built into Windows, so it works offline and costs nothing.
+- **Searchable recordings.** *Make text searchable* reads every screen every
+  two seconds and saves the result with the recording; search then lists each
+  place a phrase appeared, and clicking one jumps there.
 
 ## Building
 
@@ -38,14 +49,21 @@ is a development tool; the application never shells out to anything.
 
 ## Output
 
-One screen gives a single H.264 MP4. Several give a session folder:
+One screen gives a single H.264 MP4, which plays anywhere. Several give one
+`.screenilux` file:
 
 ```
-recording_2026-10-31_12-12-49/
-  recording.json
+recording_2026-10-31_12-12-49.screenilux
+  recording.json     the manifest, first so it can be read without seeking
   screen1.mp4
   screen2.mp4
+  text.json          the search index, once the text has been read
 ```
+
+A `.screenilux` file is a ZIP archive, so renaming it to `.zip` shows the files
+inside. Entries are stored rather than compressed, since H.264 does not shrink
+further, and ZIP64 is always on, so recordings over 4 GB are fine. The player
+also opens an unpacked session folder (pick its `recording.json`) and any MP4.
 
 `recording.json` is the `screenrec-session` format. It records each screen's
 size, its virtual-desktop position (so a player can rebuild the real monitor
@@ -72,16 +90,19 @@ expired, so playback cuts at the real moment.
 ## How it works
 
 ```
-crates/core      pure logic - geometry, pacing, focus, compositor, manifest
-crates/win       Windows adapters - capture, encoder, audio, hook, camera
-crates/recorder  orchestration - per-screen threads, shared clock, manifest
-crates/app       the egui window and the camera overlay
+crates/core      pure logic - geometry, pacing, focus, compositor, manifest,
+                 package format, layouts, playback clock, text index
+crates/win       Windows adapters - capture, encoder, decoder, audio in and
+                 out, OCR, hook, camera
+crates/recorder  recording - per-screen threads, shared clock, manifest
+crates/player    playback - per-screen decode threads on one clock, sound,
+                 reading and indexing text
+crates/app       the egui window, the camera overlay and the Play tab
 ```
 
 `core` depends on neither Windows nor any UI toolkit, so everything worth
-testing is testable without a screen, a camera or an encoder — and a future
-session player can reuse it. All `unsafe` is confined to `crates/win`; the
-other three are `#![forbid(unsafe_code)]`.
+testing is testable without a screen, a camera or an encoder. All `unsafe` is
+confined to `crates/win`; the others are `#![forbid(unsafe_code)]`.
 
 **Encoding is native.** Frames go to Media Foundation through
 `VideoSink::write`, and because the recorder owns the timestamps, **a pause is
@@ -107,6 +128,23 @@ Capture uses Windows Graphics Capture, which only delivers a frame when the
 screen actually changes — an idle screen costs almost nothing, and unlike the
 old GDI path it sees fullscreen games and hardware-overlay video.
 
+**Decoding is native too.** The player reads video from Media Foundation as
+NV12 and converts it itself, because Media Foundation's own RGB output decodes
+1080p at about 100 fps against about 540 for NV12. Two 60 fps screens need
+120. Seeking lands on the requested frame, not the keyframe before it.
+
+**Playback mirrors recording.** Each screen has its own decode thread, and all
+of them follow one clock rather than signalling each other, the way the
+recorder's capture threads all number frames from one start instant. Sound has
+its own thread, and every pause or seek restarts it from the clock's position.
+
+**Text is read with Windows' OCR engine**, chosen because it gives each word's
+position (which is what makes drag-to-select on the video possible), works
+offline, and is already installed. It reads a 1080p screen in about 80 ms. The
+indexer decodes each screen once from start to end, converts only the frames
+it samples, and skips OCR when a sample looks the same as the previous one, so
+a screen that does not change costs little more than decoding it.
+
 ## Testing
 
 ```
@@ -115,9 +153,19 @@ cargo test -p screenilux-recorder -- --ignored --test-threads=1
 ```
 
 The second set records real hardware for several seconds each, so it is opt-in.
-It covers a single-screen recording, a pause being excluded, every screen
-recorded in sync with a valid manifest, and two recordings in the same second
-not overwriting each other.
+It covers a single-screen recording, a pause excluding both picture and
+microphone, every screen recorded in sync into a valid package, and two
+recordings in the same second not overwriting each other.
+
+Two examples cover the same paths without driving the window:
+
+```
+cargo run --release -p screenilux-recorder --example record -- 6 out --twice
+cargo run --release -p screenilux-player --example read_text -- out/<file> "search words"
+```
+
+`--twice` records the primary display as two screens, which exercises
+multi-screen saving and playback on a machine with one monitor.
 
 ## Known limitations
 
@@ -128,6 +176,13 @@ not overwriting each other.
 - **Zoom is a crop scaled back up**, so zooming in softens the image; it does
   not re-capture at higher detail.
 - Stopping takes up to ~120 ms, bounded by the capture frame timeout.
+- **Opening a `.screenilux` file unpacks it to a temporary folder first**, so a
+  long recording takes a moment to open. The entries are stored uncompressed,
+  so playing directly from inside the archive is possible later.
+- **OCR needs a Windows language with text recognition installed.** If none
+  is, the player says so and explains where to add it.
+- **Text that is on screen for under two seconds may be missing from search.**
+  Pausing on it and selecting still works, because that reads the exact frame.
 
 ## Licence
 
