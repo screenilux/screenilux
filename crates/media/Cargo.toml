@@ -1,0 +1,13 @@
+[package]
+name = "screenilux-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ffmpeg process management for Screenilux: encoder probing, segment encoding, concat."
+
+[dependencies]
+screenilux-core = { path = "../core" }
+thiserror = { workspace = true }
+tracing = { workspace = true }

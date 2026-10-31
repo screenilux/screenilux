@@ -102,6 +102,18 @@ pub enum SinkError {
     Io(#[from] std::io::Error),
 }
 
+/// What a write did, beyond writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteStatus {
+    /// The frame went to the current segment.
+    Ok,
+    /// The encoder died and the sink recovered by dropping to a software
+    /// encoder and opening a fresh segment. The frames written to the dead
+    /// segment are gone, so the caller must restart its pacing and must not
+    /// count the abandoned interval as recorded time.
+    SegmentRestarted { encoder: &'static str },
+}
+
 /// Where composited frames go. One segment per pause interval; the sink joins
 /// them when finished.
 pub trait VideoSink: Send {
@@ -109,11 +121,16 @@ pub trait VideoSink: Send {
     fn open_segment(&mut self) -> Result<(), SinkError>;
     /// Write one frame of BGRA8. Called `due` times with the same buffer when
     /// capture has fallen behind.
-    fn write(&mut self, frame: &[u8]) -> Result<(), SinkError>;
-    /// Close the current segment cleanly.
-    fn close_segment(&mut self) -> Result<(), SinkError>;
+    fn write(&mut self, frame: &[u8]) -> Result<WriteStatus, SinkError>;
+    /// Close the current segment cleanly, first topping it up with `pad`
+    /// copies of the last frame so a stall before a pause or stop cannot
+    /// silently shorten it.
+    fn close_segment(&mut self, pad: u64) -> Result<(), SinkError>;
     /// Join every segment into `dest`.
     fn finish(&mut self, dest: &std::path::Path) -> Result<(), SinkError>;
+    /// Label of the encoder actually in use, which may differ from the one
+    /// chosen at start if a fallback happened.
+    fn encoder_label(&self) -> &'static str;
 }
 
 /// Time source, injected so pacing tests are deterministic.
