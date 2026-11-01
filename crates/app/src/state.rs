@@ -79,6 +79,39 @@ impl Probes {
 }
 
 /// Everything the user can choose.
+/// What is kept between runs besides sharing (see `sharing`): where
+/// recordings are saved, and whether one stays here once it is shared.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Prefs {
+    /// Where recordings are saved, if not the usual Videos folder.
+    pub out_dir: Option<PathBuf>,
+    /// Keep a recording on this computer once it is shared. Without sharing,
+    /// recordings always stay.
+    pub keep_local: bool,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            out_dir: None,
+            keep_local: true,
+        }
+    }
+}
+
+impl Prefs {
+    const FILE: &str = "settings.json";
+
+    pub fn load() -> Self {
+        crate::sharing::read_json(Self::FILE).unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        crate::sharing::write_json(Self::FILE, self);
+    }
+}
+
 pub struct Settings {
     pub monitors: Vec<Monitor>,
     /// Parallel to `monitors`.

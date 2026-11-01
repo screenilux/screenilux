@@ -93,7 +93,7 @@ fn config_dir() -> Option<PathBuf> {
     })
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(name: &str) -> Option<T> {
+pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(name: &str) -> Option<T> {
     let path = config_dir()?.join(name);
     let json = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&json)
@@ -103,7 +103,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(name: &str) -> Option<T> {
         .ok()
 }
 
-fn write_json(name: &str, value: &impl Serialize) {
+pub(crate) fn write_json(name: &str, value: &impl Serialize) {
     let Some(dir) = config_dir() else { return };
     let path = dir.join(name);
     let written = std::fs::create_dir_all(&dir)
@@ -162,7 +162,9 @@ pub enum Link {
 }
 
 enum Live {
-    Uploading(Upload),
+    /// The upload, and whether the file goes once it has finished: the
+    /// recording is kept in the cloud only.
+    Uploading(Upload, bool),
     Refused(String),
 }
 
@@ -199,15 +201,17 @@ impl Shares {
     }
 
     /// Share `path` to `destination`, unless it is being shared already.
-    pub fn start(&mut self, path: &Path, destination: Destination) {
+    /// With `remove_after`, the file is deleted from this computer once its
+    /// upload has finished, never before.
+    pub fn start(&mut self, path: &Path, destination: Destination, remove_after: bool) {
         let key = key(path);
-        if matches!(self.live.get(&key), Some(Live::Uploading(u)) if !matches!(u.progress().state, State::Failed(_)))
+        if matches!(self.live.get(&key), Some(Live::Uploading(u, _)) if !matches!(u.progress().state, State::Failed(_)))
         {
             return;
         }
         self.kept.remove(&key);
         let live = match contents(path) {
-            Ok(contents) => Live::Uploading(Upload::start(destination, contents)),
+            Ok(contents) => Live::Uploading(Upload::start(destination, contents), remove_after),
             Err(e) => Live::Refused(e),
         };
         self.live.insert(key, live);
@@ -217,7 +221,7 @@ impl Shares {
         let key = key(path);
         match self.live.get(&key) {
             Some(Live::Refused(e)) => return Link::Failed(e.clone()),
-            Some(Live::Uploading(upload)) => {
+            Some(Live::Uploading(upload, _)) => {
                 let p = upload.progress();
                 return match (p.state, p.link) {
                     (State::Failed(e), _) => Link::Failed(e),
@@ -253,7 +257,7 @@ impl Shares {
         let mut fresh = None;
         let mut finished = Vec::new();
         for (path, live) in &self.live {
-            let Live::Uploading(upload) = live else {
+            let Live::Uploading(upload, remove_after) = live else {
                 continue;
             };
             let p = upload.progress();
@@ -266,6 +270,9 @@ impl Shares {
             }
             if let (State::Ready, Some(link)) = (&p.state, &p.link) {
                 finished.push((path.clone(), link.clone(), p.expires));
+                if *remove_after && let Err(e) = std::fs::remove_file(path) {
+                    tracing::warn!(path = %path.display(), error = %e, "could not remove the uploaded recording");
+                }
             }
         }
         if !finished.is_empty() {

@@ -13,7 +13,7 @@ use crate::player_view::{PlayerView, dropped_path, friendly_name, playable};
 use crate::previews::Previews;
 use crate::sharing::{self, Asked, Link, Mode, Shares, Sharing};
 use crate::sizing::{Fit, Sizer};
-use crate::state::{FPS_CHOICES, Phase, Probes, Runtime, Settings};
+use crate::state::{FPS_CHOICES, Phase, Prefs, Probes, Runtime, Settings};
 use crate::theme::{self, ON_DARK, icon};
 
 /// Space between the window's edge and the Record tab's content.
@@ -22,7 +22,8 @@ const MARGIN: i8 = 24;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Record,
-    Play,
+    Recordings,
+    Settings,
 }
 
 pub struct App {
@@ -42,6 +43,11 @@ pub struct App {
     sharing: Sharing,
     /// Every shared recording and its link.
     shares: Shares,
+    /// What is kept between runs besides sharing: where recordings go and
+    /// whether a copy stays here once shared.
+    prefs: Prefs,
+    /// The player window's icon, made once.
+    player_icon: Arc<egui::IconData>,
     started_at: Option<Instant>,
     /// "More options" is open.
     more: bool,
@@ -79,7 +85,7 @@ impl App {
         });
         let runtime = Runtime::new();
         let probes = Probes::start();
-        Self {
+        let mut app = Self {
             tab: Tab::Record,
             sizer: Sizer::new(),
             player: PlayerView::new(),
@@ -94,6 +100,12 @@ impl App {
             last_save: None,
             sharing: Sharing::load(),
             shares: Shares::load(),
+            prefs: Prefs::default(),
+            player_icon: Arc::new(egui::IconData {
+                rgba: crate::icon::rgba(64),
+                width: 64,
+                height: 64,
+            }),
             started_at: None,
             more: false,
             hwnd,
@@ -103,13 +115,22 @@ impl App {
             _displays: displays,
             display_rx,
             displays_changed: None,
-        }
+        };
+        app.apply_prefs();
+        app
     }
 
-    /// Switch to the Play tab and open `path`.
+    /// Open `path` in the player window.
     pub fn play(&mut self, path: PathBuf, ctx: &egui::Context) {
-        self.tab = Tab::Play;
         self.player.open(path, ctx);
+    }
+
+    /// Where recordings go and whether a copy stays here, as last chosen.
+    fn apply_prefs(&mut self) {
+        self.prefs = Prefs::load();
+        if let Some(dir) = self.prefs.out_dir.clone() {
+            self.settings.out_dir = dir;
+        }
     }
 
     fn busy(&self) -> bool {
@@ -204,7 +225,7 @@ impl App {
         match session.finish(&outdir) {
             Ok(path) => {
                 self.status.clear();
-                self.share(&path);
+                self.share_new(&path);
                 self.last_save = Some(path);
                 self.player.recordings_changed();
             }
@@ -219,7 +240,15 @@ impl App {
     /// the rest.
     fn share(&mut self, path: &Path) {
         if let Some(destination) = self.sharing.destination() {
-            self.shares.start(path, destination);
+            self.shares.start(path, destination, false);
+        }
+    }
+
+    /// Share a recording just made: like [`share`](Self::share), but if no
+    /// copy is to stay here, the file goes once its upload has finished.
+    fn share_new(&mut self, path: &Path) {
+        if let Some(destination) = self.sharing.destination() {
+            self.shares.start(path, destination, !self.prefs.keep_local);
         }
     }
 
@@ -452,6 +481,13 @@ impl App {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 10.0;
                         self.warnings(ui);
+                        if self.phase == Phase::Idle
+                            && let Some(saved) =
+                                self.last_save.clone().filter(|_| self.status.is_empty())
+                        {
+                            self.saved_card(ui, ctx, saved);
+                            ui.add_space(4.0);
+                        }
                         self.screens(ui);
                         ui.add_space(6.0);
                         self.sources(ui);
@@ -743,35 +779,6 @@ impl App {
                 });
             });
         }
-
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.label("Save to");
-                ui.label(
-                    egui::RichText::new(self.settings.out_dir.display().to_string())
-                        .size(12.0)
-                        .color(p.weak),
-                );
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Open").clicked() {
-                    let _ = std::fs::create_dir_all(&self.settings.out_dir);
-                    screenilux_platform::reveal(&self.settings.out_dir);
-                }
-                if ui.add_enabled(!busy, egui::Button::new("Change")).clicked()
-                    && let Some(dir) = rfd::FileDialog::new()
-                        .set_title("Save recordings to")
-                        .set_directory(&self.settings.out_dir)
-                        .pick_folder()
-                {
-                    self.settings.out_dir = dir;
-                    self.player.recordings_changed();
-                }
-            });
-        });
-        ui.add_enabled_ui(!self.busy(), |ui| self.sharing_options(ui));
     }
 
     /// After a recording: what was saved, playing it, and its link.
@@ -785,6 +792,7 @@ impl App {
         let can_share = self.can_share();
         let mut asked = None;
         let mut set_up = false;
+        let mut dismissed = false;
         egui::Frame::new()
             .fill(p.surface)
             .stroke(egui::Stroke::new(1.0, p.stroke))
@@ -796,7 +804,7 @@ impl App {
                     ui.label(egui::RichText::new(icon::CHECK).size(16.0).color(p.signal));
                     // The buttons take their room first, so a long name is
                     // cut short instead of running under them.
-                    let name_width = (ui.available_width() - 130.0).max(60.0);
+                    let name_width = (ui.available_width() - 150.0).max(60.0);
                     ui.vertical(|ui| {
                         ui.set_max_width(name_width);
                         ui.spacing_mut().item_spacing.y = 1.0;
@@ -810,6 +818,21 @@ impl App {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let close = egui::Button::new(
+                            egui::RichText::new("\u{2715}").size(11.0).color(p.weak),
+                        )
+                        .frame(false);
+                        if ui.add(close).on_hover_text("Put this away").clicked() {
+                            dismissed = true;
+                        }
+                        if !saved.exists() {
+                            ui.label(
+                                egui::RichText::new("Kept in the cloud only")
+                                    .size(12.0)
+                                    .color(p.weak),
+                            );
+                            return;
+                        }
                         let folder =
                             egui::Button::new(egui::RichText::new(icon::FOLDER).color(p.text))
                                 .fill(p.base)
@@ -858,18 +881,70 @@ impl App {
                 }
             });
         if set_up {
-            self.more = true;
+            self.tab = Tab::Settings;
+        }
+        if dismissed {
+            self.last_save = None;
         }
         if let Some(Asked::Share) = asked {
             self.share(&saved);
         }
     }
 
-    /// Where finished recordings are shared, in More options.
+    /// The player, in a window of its own while a recording is open. Closing
+    /// the window closes the recording.
+    fn player_window(&mut self, ctx: &egui::Context) {
+        if !self.player.has_window() {
+            return;
+        }
+        let title = self
+            .player
+            .title()
+            .map_or_else(|| "Screenilux".to_string(), |t| format!("{t} - Screenilux"));
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_icon(Arc::clone(&self.player_icon))
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size(crate::sizing::MIN_SIZE)
+            .with_maximized(true);
+        let out_dir = self.settings.out_dir.clone();
+        let mut closed = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("player"),
+            builder,
+            |ui, _| {
+                let ctx = ui.ctx().clone();
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    closed = true;
+                }
+                // A recording dropped onto the player opens in it.
+                if let Some(path) = dropped_path(&ctx)
+                    && playable(&path)
+                {
+                    self.player.open(path, &ctx);
+                }
+                let open = self.player.shareable();
+                let link = open
+                    .as_deref()
+                    .map_or(Link::None, |path| self.shares.of(path));
+                self.player
+                    .set_link(link, open.is_some() && self.can_share());
+                self.player.ui(ui, &ctx, &out_dir);
+                if let (Some(Asked::Share), Some(path)) = (self.player.take_asked(), open) {
+                    self.share(&path);
+                }
+            },
+        );
+        if closed {
+            self.player.close();
+        }
+    }
+
+    /// Where finished recordings are shared, in Settings.
     fn sharing_options(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui);
         let before = self.sharing.clone();
-        ui.add_space(10.0);
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("Share a link when you stop");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -948,10 +1023,7 @@ impl App {
                     self.start(ctx);
                 }
                 ui.add_space(2.0);
-                if let Some(saved) = self.last_save.clone().filter(|_| self.status.is_empty()) {
-                    ui.add_space(8.0);
-                    self.saved_card(ui, ctx, saved);
-                } else {
+                {
                     let line = if self.status.is_empty() {
                         "Saved to Videos\\ScreenRec when you stop".to_string()
                     } else {
@@ -1008,59 +1080,165 @@ impl App {
         }
     }
 
-    /// The mark and the tabs. On Play there is room for the open button too,
-    /// and a way back to a recording in progress.
-    fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// The mark, the tabs, and the way to Settings.
+    fn header(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui);
         ui.horizontal(|ui| {
             theme::logo(ui, 26.0);
             ui.label(
                 egui::RichText::new("Screenilux").font(egui::FontId::new(18.0, theme::bold())),
             );
-            let tabs = |ui: &mut egui::Ui, tab: &mut Tab| {
-                let chosen = if *tab == Tab::Record { 0 } else { 1 };
-                match theme::segmented(ui, &["Record", "Play"], chosen) {
-                    Some(0) => *tab = Tab::Record,
-                    Some(_) => *tab = Tab::Play,
-                    None => {}
-                }
-            };
-            if self.tab == Tab::Play {
-                ui.add_space(16.0);
-                tabs(ui, &mut self.tab);
-            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.tab == Tab::Record {
-                    tabs(ui, &mut self.tab);
-                    return;
-                }
-                if ui
-                    .add(theme::outline(format!("{}  Open recording", icon::FOLDER)))
-                    .clicked()
-                {
-                    self.player.pick_file(ctx);
-                }
-                if self.busy() {
-                    let paused = self.phase == Phase::Paused;
-                    let text = if paused {
-                        "Recording paused"
+                let on = self.tab == Tab::Settings;
+                let gear = egui::Button::new(
+                    egui::RichText::new(icon::SETTINGS).size(15.0).color(if on {
+                        p.signal
                     } else {
-                        "Recording"
-                    };
-                    let button = egui::Button::new(
-                        egui::RichText::new(format!("●  {text}")).color(p.action),
-                    )
-                    .frame(false);
-                    if ui
-                        .add(button)
-                        .on_hover_text("Go to the recording")
-                        .clicked()
-                    {
-                        self.tab = Tab::Record;
-                    }
+                        p.text
+                    }),
+                )
+                .fill(if on { p.surface } else { p.base })
+                .stroke(egui::Stroke::new(1.0, if on { p.signal } else { p.stroke }))
+                .corner_radius(10)
+                .min_size(egui::vec2(34.0, 34.0));
+                if ui.add(gear).on_hover_text("Settings").clicked() {
+                    self.tab = if on { Tab::Record } else { Tab::Settings };
+                }
+                ui.add_space(4.0);
+                let chosen = match self.tab {
+                    Tab::Record => 0,
+                    Tab::Recordings => 1,
+                    Tab::Settings => 2,
+                };
+                match theme::segmented(ui, &["Record", "Recordings"], chosen) {
+                    Some(0) => self.tab = Tab::Record,
+                    Some(1) => self.tab = Tab::Recordings,
+                    _ => {}
                 }
             });
         });
+    }
+
+    /// The Recordings tab: open a file, or one saved here. Either plays in
+    /// the player window.
+    fn recordings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> f32 {
+        let p = theme::palette(ui);
+        let out_dir = self.settings.out_dir.clone();
+        let top = 4.0;
+        let bottom = 20.0;
+        let column = egui::CentralPanel::default_margins()
+            .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
+                left: MARGIN,
+                right: MARGIN,
+                top: top as i8,
+                bottom: bottom as i8,
+            }))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| self.player.library(ui, ctx, &out_dir))
+                    .content_size
+                    .y
+            })
+            .inner;
+        top + column + bottom
+    }
+
+    /// Settings: only what is set once and left. Recording options stay on
+    /// the Record tab, by the button they change.
+    fn settings_tab(&mut self, ui: &mut egui::Ui) -> f32 {
+        let p = theme::palette(ui);
+        let top = 4.0;
+        let bottom = 20.0;
+        let column = egui::CentralPanel::default_margins()
+            .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
+                left: MARGIN,
+                right: MARGIN,
+                top: top as i8,
+                bottom: bottom as i8,
+            }))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        ui.add_enabled_ui(!self.busy(), |ui| self.settings_page(ui));
+                    })
+                    .content_size
+                    .y
+            })
+            .inner;
+        top + column + bottom
+    }
+
+    fn settings_page(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        let heading = |ui: &mut egui::Ui, text: &str| {
+            ui.label(egui::RichText::new(text).font(egui::FontId::new(15.0, theme::strong())));
+        };
+        let before = self.prefs.clone();
+
+        heading(ui, "Recordings");
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.set_max_width((ui.available_width() - 150.0).max(80.0));
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label("Save to");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(self.settings.out_dir.display().to_string())
+                            .size(12.0)
+                            .color(p.weak),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(self.settings.out_dir.display().to_string());
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Open").clicked() {
+                    let _ = std::fs::create_dir_all(&self.settings.out_dir);
+                    screenilux_platform::reveal(&self.settings.out_dir);
+                }
+                if ui.button("Change").clicked()
+                    && let Some(dir) = rfd::FileDialog::new()
+                        .set_title("Save recordings to")
+                        .set_directory(&self.settings.out_dir)
+                        .pick_folder()
+                {
+                    self.settings.out_dir = dir.clone();
+                    self.prefs.out_dir = Some(dir);
+                    self.player.recordings_changed();
+                }
+            });
+        });
+        ui.add_space(6.0);
+        let sharing_on = self.can_share();
+        ui.add_enabled_ui(sharing_on, |ui| {
+            let mut keep = self.prefs.keep_local || !sharing_on;
+            theme::setting(ui, &mut keep, "Keep a copy on this computer");
+            if sharing_on {
+                self.prefs.keep_local = keep;
+            }
+        });
+        theme::hint(
+            ui,
+            if !sharing_on {
+                "Recordings stay on this computer while sharing is off."
+            } else if self.prefs.keep_local {
+                "Each recording stays here, and is uploaded too."
+            } else {
+                "Each recording is removed from this computer once its upload has \
+                 finished. Recordings shared on Screenilux are deleted there after 7 days."
+            },
+        );
+
+        ui.add_space(18.0);
+        heading(ui, "Sharing");
+        self.sharing_options(ui);
+
+        if self.prefs != before {
+            self.prefs.save();
+        }
     }
 }
 
@@ -1307,11 +1485,9 @@ impl eframe::App for App {
             return;
         }
 
-        let full = self.tab == Tab::Play && self.player.is_full();
-        let mut header = 0.0;
-        if !full {
+        let header = {
             let p = theme::palette(ui);
-            header = egui::Panel::top("header")
+            egui::Panel::top("header")
                 .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
                     left: MARGIN,
                     right: MARGIN,
@@ -1319,37 +1495,20 @@ impl eframe::App for App {
                     bottom: 14,
                 }))
                 .show_separator_line(false)
-                .show(ui, |ui| self.header(ui, &ctx))
+                .show(ui, |ui| self.header(ui))
                 .response
                 .rect
-                .height();
-        }
-
-        let fit = match self.tab {
-            Tab::Record => Fit::Settings,
-            Tab::Play => Fit::Stage,
+                .height()
         };
-        self.sizer.update(&ctx, fit);
 
-        match self.tab {
-            Tab::Record => {
-                let column = self.record_tab(ui, &ctx);
-                self.sizer.fit_height(&ctx, header + column);
-            }
-            Tab::Play => {
-                let out_dir = self.settings.out_dir.clone();
-                let open = self.player.shareable();
-                let link = open
-                    .as_deref()
-                    .map_or(Link::None, |path| self.shares.of(path));
-                self.player
-                    .set_link(link, open.is_some() && self.can_share());
-                self.player.ui(ui, &ctx, &out_dir);
-                if let (Some(Asked::Share), Some(path)) = (self.player.take_asked(), open) {
-                    self.share(&path);
-                }
-            }
-        }
+        self.sizer.update(&ctx, Fit::Settings);
+        let column = match self.tab {
+            Tab::Record => self.record_tab(ui, &ctx),
+            Tab::Recordings => self.recordings_tab(ui, &ctx),
+            Tab::Settings => self.settings_tab(ui),
+        };
+        self.sizer.fit_height(&ctx, header + column);
+        self.player_window(&ctx);
 
         self.show_overlay(&ctx);
 

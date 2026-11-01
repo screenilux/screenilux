@@ -40,6 +40,7 @@ pub mod icon {
     pub const LINK: &str = "\u{E71B}";
     pub const LOCK: &str = "\u{E72E}";
     pub const OPEN: &str = "\u{E8A7}";
+    pub const SETTINGS: &str = "\u{E713}";
 }
 
 /// The same icons as symbols in egui's own fonts, which every system has.
@@ -66,6 +67,7 @@ pub mod icon {
     pub const LINK: &str = "\u{1F517}";
     pub const LOCK: &str = "\u{1F512}";
     pub const OPEN: &str = "\u{2197}";
+    pub const SETTINGS: &str = "\u{2699}";
 }
 
 /// The named colours. Two sets, picked by the system theme.

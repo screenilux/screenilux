@@ -230,7 +230,17 @@ impl PlayerView {
             self.set_full(ctx, false);
             egui::CentralPanel::default_margins()
                 .frame(egui::Frame::new().fill(p.base).inner_margin(24))
-                .show(ui, |ui| self.empty_state(ui, ctx, out_dir));
+                .show(ui, |ui| {
+                    ui.centered_and_justified(|ui| {
+                        if let Some((name, _)) = &self.opening {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(format!("Opening {name}…"));
+                            });
+                        }
+                    });
+                });
+            let _ = out_dir;
             return;
         }
         if let Some(l) = &self.loaded
@@ -571,16 +581,18 @@ impl PlayerView {
 
     /// Nothing open: a drop target, and the recordings already in the save
     /// folder so the common case is one click.
-    fn empty_state(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, out_dir: &Path) {
+    /// The Recordings tab, in the main window: opening a file, and the
+    /// recordings in the save folder. Playing one opens the player window.
+    pub fn library(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, out_dir: &Path) {
         let p = theme::palette(ui);
         let dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
-        let width = ui.available_width().min(620.0);
+        let width = ui.available_width();
 
         ui.vertical_centered(|ui| {
             ui.set_max_width(width);
-            ui.add_space(24.0);
+            ui.add_space(4.0);
 
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 200.0), egui::Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 170.0), egui::Sense::hover());
             let colour = if dragging { p.signal } else { p.stroke };
             let fill = if dragging {
                 theme::blend(p.base, p.signal, 0.10)
@@ -608,7 +620,7 @@ impl PlayerView {
                     .max_rect(rect.shrink(20.0))
                     .layout(egui::Layout::top_down(egui::Align::Center)),
             );
-            inner.add_space(18.0);
+            inner.add_space(6.0);
             inner.label(
                 egui::RichText::new(icon::MONITOR)
                     .size(34.0)
@@ -638,7 +650,9 @@ impl PlayerView {
                 }
                 inner.add_space(2.0);
                 inner.label(
-                    egui::RichText::new("or drop a .screenilux file or an MP4 here").color(p.weak),
+                    egui::RichText::new("or drop a .screenilux file or an MP4 here")
+                        .size(13.0)
+                        .color(p.weak),
                 );
             }
             if let Some((name, _)) = &self.opening {
@@ -667,21 +681,45 @@ impl PlayerView {
                     egui::RichText::new("Recent recordings")
                         .font(egui::FontId::new(14.0, theme::strong())),
                 );
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, true])
-                    .max_height(ui.available_height())
-                    .show(ui, |ui| {
-                        for r in recents.iter() {
-                            if recent_row(ui, r).clicked() {
-                                open = Some(r.path.clone());
-                            }
-                        }
-                    });
+                for r in recents.iter() {
+                    if recent_row(ui, r).clicked() {
+                        open = Some(r.path.clone());
+                    }
+                }
             });
         });
         if let Some(path) = open {
             self.open(path, ctx);
         }
+    }
+
+    /// Whether the player window should be open: a recording is open or
+    /// opening.
+    pub fn has_window(&self) -> bool {
+        self.loaded.is_some() || self.opening.is_some()
+    }
+
+    /// The open recording's name, for the player window's title.
+    pub fn title(&self) -> Option<String> {
+        if let Some((name, _)) = &self.opening {
+            return Some(friendly_name(name));
+        }
+        Some(friendly_name(&self.loaded.as_ref()?.opened.title))
+    }
+
+    /// Close the open recording, as when its window is closed.
+    pub fn close(&mut self) {
+        self.loaded = None;
+        self.opening = None;
+        self.full = false;
+        self.text_open = false;
+        self.pinned = None;
+        self.worker = None;
+        self.requested.clear();
+        self.pages.clear();
+        self.selection = None;
+        self.query.clear();
+        self.hits.clear();
     }
 
     /// Forget the list of recent recordings, so it is read again next time.
@@ -1216,10 +1254,6 @@ impl PlayerView {
                         });
                     });
             });
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.full
     }
 
     fn toggle_play(&mut self) {

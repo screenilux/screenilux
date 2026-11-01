@@ -43,10 +43,8 @@ enum Shape {
 /// What the window is shaped for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fit {
-    /// The Record tab.
+    /// The column: Record, Recordings and Settings.
     Settings,
-    /// The Play tab.
-    Stage,
     /// The recording bar.
     Bar,
 }
@@ -54,7 +52,6 @@ pub enum Fit {
 pub struct Sizer {
     current: Option<Fit>,
     settings: Option<Shape>,
-    stage: Option<Shape>,
     bar: Option<Shape>,
     /// What the window adds around its content, measured once it exists.
     frame: egui::Vec2,
@@ -68,7 +65,6 @@ impl Sizer {
         Self {
             current: None,
             settings: None,
-            stage: None,
             bar: None,
             frame: FRAME_GUESS,
             asked: None,
@@ -120,7 +116,7 @@ impl Sizer {
                     work.bottom() - BAR_SIZE.y - BAR_MARGIN,
                 ),
             ),
-            (_, Some(Shape::Maximised)) | (Fit::Stage, None) => Shape::Maximised,
+            (_, Some(Shape::Maximised)) => Shape::Maximised,
             (_, Some(Shape::Normal { pos, size })) => self.within(reach, pos, size),
             (Fit::Settings, None) => self.column(reach, outer),
         };
@@ -173,7 +169,6 @@ impl Sizer {
     fn slot(&mut self, fit: Fit) -> &mut Option<Shape> {
         match fit {
             Fit::Settings => &mut self.settings,
-            Fit::Stage => &mut self.stage,
             Fit::Bar => &mut self.bar,
         }
     }
