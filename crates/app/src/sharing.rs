@@ -1,9 +1,9 @@
 //! Share links: when a recording stops, upload it and copy a link to it.
 //!
 //! Where it goes is a setting kept between runs, in the user's config folder,
-//! since it holds keys that take a while to find and paste: the Screenilux
-//! upload key, or the access keys of the user's own bucket. The keys stay on
-//! this computer; nothing else reads that file.
+//! since sharing to their own bucket takes keys that take a while to find and
+//! paste. The keys stay on this computer; nothing else reads that file.
+//! Sharing to Screenilux needs no key at all.
 
 use std::path::{Path, PathBuf};
 
@@ -26,8 +26,6 @@ pub enum Mode {
 #[serde(default)]
 pub struct Sharing {
     pub mode: Mode,
-    /// The Screenilux upload key.
-    pub key: String,
     /// The Screenilux storage, if not the usual one; for testing a local copy.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub server: String,
@@ -65,13 +63,11 @@ impl Sharing {
     pub fn destination(&self) -> Option<Destination> {
         match self.mode {
             Mode::Off => None,
-            Mode::Screenilux if self.key.trim().is_empty() => None,
             Mode::Screenilux => Some(Destination::Screenilux {
                 server: match self.server.trim() {
                     "" => screenilux_share::PLAYER.to_string(),
                     s => s.to_string(),
                 },
-                key: self.key.clone(),
             }),
             Mode::Bucket if !self.bucket.is_complete() => None,
             Mode::Bucket => Some(Destination::Bucket(self.bucket.clone())),
@@ -124,8 +120,6 @@ mod tests {
         let mut s = Sharing::default();
         assert!(s.destination().is_none());
         s.mode = Mode::Screenilux;
-        assert!(s.destination().is_none(), "no key yet");
-        s.key = "k".into();
         assert!(
             matches!(s.destination(), Some(Destination::Screenilux { server, .. }) if server == screenilux_share::PLAYER)
         );
@@ -137,7 +131,6 @@ mod tests {
     fn settings_read_back_and_tolerate_missing_fields() {
         let s = Sharing {
             mode: Mode::Bucket,
-            key: "k".into(),
             server: String::new(),
             bucket: Bucket {
                 bucket: "b".into(),

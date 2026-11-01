@@ -2,9 +2,8 @@
 //!
 //! These need somewhere to upload to, so each skips unless told where:
 //!
-//! - SCREENILUX_TEST_SERVER and SCREENILUX_TEST_KEY: a Screenilux storage,
-//!   e.g. the local one `npm run dev` starts in web/ (its key is in
-//!   web/.dev.vars).
+//! - SCREENILUX_TEST_SERVER: a Screenilux storage, e.g. the local one
+//!   `npm run dev` starts in web/.
 //! - SCREENILUX_TEST_S3: the address of an S3-compatible server that takes
 //!   any keys and serves files to anyone, with a bucket called `recordings`,
 //!   e.g. `docker run -p 9090:9090 -e initialBuckets=recordings adobe/s3mock`.
@@ -104,10 +103,7 @@ fn check_files(files: &str, progress: &Progress) {
 
 #[test]
 fn a_package_uploads_to_the_screenilux_storage() {
-    let (Ok(server), Ok(key)) = (
-        std::env::var("SCREENILUX_TEST_SERVER"),
-        std::env::var("SCREENILUX_TEST_KEY"),
-    ) else {
+    let Ok(server) = std::env::var("SCREENILUX_TEST_SERVER") else {
         eprintln!("skipped: no SCREENILUX_TEST_SERVER");
         return;
     };
@@ -116,7 +112,6 @@ fn a_package_uploads_to_the_screenilux_storage() {
     let upload = Upload::start(
         Destination::Screenilux {
             server: server.clone(),
-            key,
         },
         contents,
     );

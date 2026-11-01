@@ -18,7 +18,16 @@
       "bucket_name": "screenilux-recordings"
     }
   ],
-  // UPLOAD_KEY is a secret: set it with `wrangler secret put UPLOAD_KEY`.
+  // Each address can start a few recordings a minute (see worker/index.ts).
+  "ratelimits": [
+    {
+      "name": "CREATES",
+      "namespace_id": "1001",
+      "simple": { "limit": 3, "period": 60 }
+    }
+  ],
+  // Secrets, set with `wrangler secret put`: SIGNING_KEY signs upload tokens,
+  // UPLOAD_KEY is the admin key that can change or delete any recording.
   "observability": {
     "enabled": true,
     "logs": { "enabled": true, "head_sampling_rate": 1 },

@@ -41,6 +41,10 @@ pub(crate) struct Hosted {
 struct Created {
     id: String,
     link: String,
+    /// Lets this upload write to this recording, and nothing else.
+    token: String,
+    /// The most the recording may hold, in bytes.
+    limit: u64,
 }
 
 #[derive(Deserialize)]
@@ -55,20 +59,22 @@ struct Part {
 }
 
 impl Hosted {
-    /// A new, empty recording on the storage, and its link.
+    /// A new, empty recording on the storage for `total` bytes, and its link.
     pub fn create(
         agent: ureq::Agent,
         server: &str,
-        key: &str,
+        total: u64,
     ) -> Result<(Self, String), ShareError> {
         let server = server.trim_end_matches('/');
-        let auth = format!("Bearer {}", key.trim());
         let created: Created = agent
             .post(format!("{server}/api/recordings"))
-            .header("Authorization", &auth)
-            .send_empty()?
+            .send_json(serde_json::json!({ "total": total }))?
             .body_mut()
             .read_json()?;
+        if total > created.limit {
+            return Err(ShareError::TooBig);
+        }
+        let auth = format!("Bearer {}", created.token);
         let files = format!("{server}/api/recordings/{}/", created.id);
         Ok((Self { agent, auth, files }, created.link))
     }

@@ -840,14 +840,12 @@ impl App {
         match self.sharing.mode {
             Mode::Off => {}
             Mode::Screenilux => {
-                field(
+                ui.add_space(4.0);
+                theme::hint(
                     ui,
-                    "Upload key",
-                    &mut self.sharing.key,
-                    "Paste your upload key",
-                    true,
+                    "Links last 7 days, for recordings up to 4GB. Anyone with the link \
+                     can watch.",
                 );
-                theme::hint(ui, "Links last 7 days. Anyone with the link can watch.");
             }
             Mode::Bucket => {
                 let b = &mut self.sharing.bucket;

@@ -3,8 +3,8 @@
 //!
 //! A shared recording is a folder of plain files: `share.json`, then the
 //! manifest, each screen's video and the text index if there is one. That
-//! folder goes either to the Screenilux storage, which needs an upload key,
-//! or to the user's own S3-compatible bucket. Either way the link exists
+//! folder goes either to the Screenilux storage, which hands out an upload
+//! token for each recording, or to the user's own S3-compatible bucket. Either way the link exists
 //! before anything else is uploaded: `share.json` is written first, saying
 //! the upload is still going, so the link can be sent at once and the web
 //! player (`web/`) waits for it to finish.
@@ -41,8 +41,12 @@ pub enum ShareError {
     Network(String),
     #[error("the storage refused the upload ({0})")]
     Refused(u16),
-    #[error("the upload key was not accepted")]
-    WrongKey,
+    #[error("the storage did not accept the upload")]
+    NotAllowed,
+    #[error("it is bigger than Screenilux can share (4GB); share it to your own bucket instead")]
+    TooBig,
+    #[error("too many recordings were shared from this network just now; try again in a minute")]
+    TooMany,
     #[error("the bucket settings are not usable: {0}")]
     Bucket(String),
     #[error("could not read the recording: {0}")]
@@ -52,7 +56,9 @@ pub enum ShareError {
 impl From<ureq::Error> for ShareError {
     fn from(e: ureq::Error) -> Self {
         match e {
-            ureq::Error::StatusCode(401 | 403) => ShareError::WrongKey,
+            ureq::Error::StatusCode(401 | 403) => ShareError::NotAllowed,
+            ureq::Error::StatusCode(413) => ShareError::TooBig,
+            ureq::Error::StatusCode(429) => ShareError::TooMany,
             ureq::Error::StatusCode(code) => ShareError::Refused(code),
             other => ShareError::Network(other.to_string()),
         }
@@ -95,10 +101,9 @@ impl Bucket {
 /// Where a recording is shared to.
 #[derive(Debug, Clone)]
 pub enum Destination {
-    /// The Screenilux storage, behind `server`, with the upload key.
+    /// The Screenilux storage, behind `server`.
     Screenilux {
         server: String,
-        key: String,
     },
     Bucket(Bucket),
 }
@@ -182,8 +187,8 @@ fn run(
 ) -> Result<(), ShareError> {
     let agent = ureq::Agent::new_with_defaults();
     let (store, link, expires): (Box<dyn Store>, String, Option<String>) = match destination {
-        Destination::Screenilux { server, key } => {
-            let (hosted, link) = Hosted::create(agent, server, key)?;
+        Destination::Screenilux { server } => {
+            let (hosted, link) = Hosted::create(agent, server, contents.total())?;
             let expires =
                 humantime::format_rfc3339_seconds(SystemTime::now() + KEPT_FOR).to_string();
             (Box::new(hosted), link, Some(expires))

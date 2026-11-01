@@ -5,19 +5,38 @@
 //
 //   share.json      written first and last by the app: whether the upload is
 //                   still going, and what the recording is (see web/src/share.ts)
-//   recording.json  the manifest, for a multi-screen recording
-//   screen1.mp4 ... one video per screen, or a single video
+//   recording.json  the manifest
+//   screen1.mp4 ... one video per screen
 //   text.json       the text index, if the recording was made searchable
+//   _usage          how many bytes the recording has used; never served
 //
-// Writing needs the upload key. Reading needs only the id, which is random
-// and long enough that links cannot be guessed. R2 deletes everything a week
-// after it was uploaded (a lifecycle rule on the bucket).
+// Anyone with the app can share, so nothing secret is in the app. Instead:
+//
+// - Starting a recording needs nothing, but each address can start only a few
+//   a minute.
+// - Starting one hands back an upload token that works for that recording
+//   only: it cannot read, list or change any other. The token is a signature
+//   of the recording's id, so the server keeps nothing to check it against.
+// - A recording can hold at most MAX_RECORDING bytes.
+// - Reading needs only the id, which is random and long enough that links
+//   cannot be guessed. R2 deletes everything a week after it was uploaded (a
+//   lifecycle rule on the bucket).
+// - The admin key (UPLOAD_KEY) can change or delete any recording, to take
+//   one down.
 
 const ID = /^[A-Za-z0-9_-]{22}$/;
-// A plain file name, as the desktop app's packages allow: no folders, nothing
-// hidden.
+// Any plain file name can be read, but only the files a recording is made of
+// can be written.
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+const WRITABLE = /^(share|recording|text)\.json$|^screen[1-9][0-9]?\.mp4$/;
 const PART = /^[1-9][0-9]{0,4}$/;
+
+/** The most one shared recording can hold: about an hour of two screens. */
+const MAX_RECORDING = 4 * 1024 ** 3;
+/** The most one upload request can carry. The app sends 32MB parts. */
+const MAX_REQUEST = 50 * 1024 ** 2;
+/** share.json is rewritten as the upload goes, so it is not counted, only capped. */
+const MAX_SHARE_DOC = 16 * 1024;
 
 const TYPES: Record<string, string> = {
   json: "application/json",
@@ -29,10 +48,11 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname.startsWith("/api/")) {
-        if (!(await authorised(request, env))) {
-          return problem(401, "The upload key is missing or wrong.");
-        }
-        return await api(request, env, url.pathname.slice("/api/".length).split("/"));
+        const response = await api(request, env, url.pathname.slice("/api/".length).split("/"));
+        // A refused upload is answered without reading it; drop what is left
+        // so the connection is not left waiting on it.
+        if (request.body && !request.bodyUsed) await request.body.cancel();
+        return response;
       }
       if (url.pathname.startsWith("/r/")) {
         return await read(request, env, url.pathname.slice("/r/".length).split("/"));
@@ -45,32 +65,111 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function authorised(request: Request, env: Env): Promise<boolean> {
-  const given = request.headers.get("Authorization")?.replace(/^Bearer /, "") ?? "";
+const encoder = new TextEncoder();
+
+function base64url(bytes: ArrayBuffer | Uint8Array): string {
+  const array = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  return btoa(String.fromCharCode(...array)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function fromBase64url(text: string): Uint8Array | undefined {
+  try {
+    const plain = atob(text.replace(/-/g, "+").replace(/_/g, "/"));
+    return Uint8Array.from(plain, (c) => c.charCodeAt(0));
+  } catch {
+    return undefined;
+  }
+}
+
+function signingKey(env: Env): Promise<CryptoKey> {
+  return crypto.subtle.importKey("raw", encoder.encode(env.SIGNING_KEY), { name: "HMAC", hash: "SHA-256" }, false, [
+    "sign",
+    "verify",
+  ]);
+}
+
+/** The upload token for one recording. */
+async function tokenFor(env: Env, id: string): Promise<string> {
+  return base64url(await crypto.subtle.sign("HMAC", await signingKey(env), encoder.encode(`upload:${id}`)));
+}
+
+function bearer(request: Request): string {
+  return request.headers.get("Authorization")?.replace(/^Bearer /, "") ?? "";
+}
+
+async function isAdmin(request: Request, env: Env): Promise<boolean> {
   if (!env.UPLOAD_KEY) return false;
-  const encoder = new TextEncoder();
   const [a, b] = await Promise.all([
-    crypto.subtle.digest("SHA-256", encoder.encode(given)),
+    crypto.subtle.digest("SHA-256", encoder.encode(bearer(request))),
     crypto.subtle.digest("SHA-256", encoder.encode(env.UPLOAD_KEY)),
   ]);
   return crypto.subtle.timingSafeEqual(a, b);
 }
 
-/** Uploading and deleting, all behind the upload key. */
+/** Whether the request may change recording `id`: its own token, or the admin key. */
+async function mayChange(request: Request, env: Env, id: string): Promise<boolean> {
+  const signature = fromBase64url(bearer(request));
+  // `verify` compares in constant time.
+  if (signature && (await crypto.subtle.verify("HMAC", await signingKey(env), signature, encoder.encode(`upload:${id}`)))) {
+    return true;
+  }
+  return isAdmin(request, env);
+}
+
+/**
+ * Count `bytes` against a recording's allowance before they are stored.
+ * Several requests can arrive at once, so the count is only replaced if no
+ * one else changed it in between.
+ */
+async function reserve(env: Env, id: string, bytes: number): Promise<"ok" | "gone" | "full"> {
+  const key = `rec/${id}/_usage`;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const current = await env.RECORDINGS.get(key);
+    if (!current) return "gone";
+    const used = (await current.json<{ bytes: number }>()).bytes;
+    if (used + bytes > MAX_RECORDING) return "full";
+    const stored = await env.RECORDINGS.put(key, JSON.stringify({ bytes: used + bytes }), {
+      onlyIf: { etagMatches: current.etag },
+    });
+    if (stored) return "ok";
+  }
+  throw new Error("the usage count kept changing");
+}
+
+function length(request: Request): number | undefined {
+  const n = Number(request.headers.get("Content-Length"));
+  return Number.isSafeInteger(n) && n > 0 ? n : undefined;
+}
+
 async function api(request: Request, env: Env, path: string[]): Promise<Response> {
   const [collection, id, name, uploads, uploadId, part] = path;
   if (collection !== "recordings") return problem(404, "Not found.");
+  if (!env.SIGNING_KEY) return problem(503, "Sharing is not set up on this server.");
   const method = request.method;
 
-  // POST /api/recordings: a new, empty recording.
+  // POST /api/recordings, optionally with {"total": bytes}: a new, empty
+  // recording and its upload token.
   if (path.length === 1 && method === "POST") {
-    const bytes = crypto.getRandomValues(new Uint8Array(16));
-    const id = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const from = request.headers.get("CF-Connecting-IP") ?? "unknown";
+    if (!(await env.CREATES.limit({ key: from })).success) {
+      return problem(429, "Too many recordings were shared from here in the last minute. Try again in a minute.");
+    }
+    const asked = await request.json<{ total?: number }>().catch(() => ({ total: undefined }));
+    if (typeof asked.total === "number" && asked.total > MAX_RECORDING) {
+      return problem(413, `This recording is bigger than ${MAX_RECORDING / 1024 ** 3}GB, the most Screenilux can share.`);
+    }
+    const id = base64url(crypto.getRandomValues(new Uint8Array(16)));
+    await env.RECORDINGS.put(`rec/${id}/_usage`, JSON.stringify({ bytes: 0 }));
     const origin = new URL(request.url).origin;
-    return Response.json({ id, link: `${origin}/v/${id}`, files: `${origin}/r/${id}/` }, { status: 201 });
+    console.log(JSON.stringify({ message: "recording started", id }));
+    return Response.json(
+      { id, link: `${origin}/v/${id}`, token: await tokenFor(env, id), limit: MAX_RECORDING },
+      { status: 201 },
+    );
   }
 
-  if (!ID.test(id ?? "")) return problem(404, "No such recording.");
+  if (!id || !ID.test(id)) return problem(404, "No such recording.");
+  if (!(await mayChange(request, env, id))) return problem(401, "This upload token is not for this recording.");
 
   // DELETE /api/recordings/:id: the whole recording.
   if (path.length === 2 && method === "DELETE") {
@@ -83,19 +182,36 @@ async function api(request: Request, env: Env, path: string[]): Promise<Response
     return new Response(null, { status: 204 });
   }
 
-  if (!name || !NAME.test(name)) return problem(400, "That is not a valid file name.");
+  if (!name || !WRITABLE.test(name)) return problem(400, "That file is not part of a recording.");
   const key = `rec/${id}/${name}`;
   const httpMetadata = { contentType: typeOf(name) };
+  const size = length(request);
+  const gone = problem(404, "This recording has been deleted, or it has expired.");
+  const tooBig = problem(413, `The recording is bigger than ${MAX_RECORDING / 1024 ** 3}GB, the most Screenilux can share.`);
 
-  // PUT /api/recordings/:id/:name: a whole file, up to the request size limit.
+  // Writing the body: its size must be stated and small enough, and it
+  // counts against the recording's allowance (share.json aside).
+  const admit = async (): Promise<Response | undefined> => {
+    if (!request.body || !size) return problem(411, "The upload must say how big it is.");
+    if (size > MAX_REQUEST) return problem(413, "That upload is too big for one request.");
+    if (name === "share.json") {
+      if (size > MAX_SHARE_DOC) return problem(413, "share.json is too big.");
+      return (await env.RECORDINGS.head(`rec/${id}/_usage`)) ? undefined : gone;
+    }
+    const reserved = await reserve(env, id, size);
+    return reserved === "ok" ? undefined : reserved === "gone" ? gone : tooBig;
+  };
+
+  // PUT /api/recordings/:id/:name: a whole file, up to MAX_REQUEST.
   if (path.length === 3 && method === "PUT") {
-    if (!request.body) return problem(400, "The file is empty.");
+    const refused = await admit();
+    if (refused) return refused;
     await env.RECORDINGS.put(key, request.body, { httpMetadata });
     return new Response(null, { status: 204 });
   }
 
   // Larger files go up in parts.
-  if (uploads !== "uploads") return problem(404, "Not found.");
+  if (uploads !== "uploads" || name === "share.json") return problem(404, "Not found.");
 
   // POST /api/recordings/:id/:name/uploads: start one.
   if (path.length === 4 && method === "POST") {
@@ -108,8 +224,10 @@ async function api(request: Request, env: Env, path: string[]): Promise<Response
 
   // PUT /api/recordings/:id/:name/uploads/:uploadId/:part: one part.
   if (path.length === 6 && method === "PUT") {
-    if (!PART.test(part ?? "") || !request.body) return problem(400, "That is not a valid part.");
-    const done = await upload.uploadPart(Number(part), request.body);
+    if (!part || !PART.test(part)) return problem(400, "That is not a valid part.");
+    const refused = await admit();
+    if (refused) return refused;
+    const done = await upload.uploadPart(Number(part), request.body!);
     return Response.json(done);
   }
 
@@ -133,7 +251,7 @@ async function api(request: Request, env: Env, path: string[]): Promise<Response
 /** GET or HEAD /r/:id/:name: one file of a shared recording. */
 async function read(request: Request, env: Env, path: string[]): Promise<Response> {
   const [id, name] = path;
-  if (path.length !== 2 || !ID.test(id ?? "") || !NAME.test(name ?? "")) return problem(404, "Not found.");
+  if (path.length !== 2 || !id || !ID.test(id) || !name || !NAME.test(name)) return problem(404, "Not found.");
   if (request.method !== "GET" && request.method !== "HEAD") return problem(405, "That method is not allowed here.");
   const key = `rec/${id}/${name}`;
 
