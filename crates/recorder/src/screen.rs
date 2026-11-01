@@ -12,6 +12,7 @@ use crossbeam_channel::Receiver;
 use screenilux_core::click::ClickMixer;
 use screenilux_core::compositor::{CameraView, Compositor};
 use screenilux_core::geometry::Point;
+use screenilux_core::mix::Mixer;
 use screenilux_core::ports::{
     CameraSource, CaptureError, PointerEvent, ScreenSource, SinkError, VideoSink,
 };
@@ -79,27 +80,49 @@ pub struct ScreenJob {
 /// Bytes per sample frame of the PCM the encoder takes.
 const BLOCK: usize = screenilux_win::audio::CHANNELS as usize * 2;
 
-/// What goes into the sound track: the microphone, clicks, or both.
+/// How far behind the picture the sound is written while recording, so each
+/// source has a little queued and a late packet does not leave a gap. Flushed
+/// at every pause and at the end, so it never shifts anything.
+const CUSHION: Duration = Duration::from_millis(80);
+
+/// The most a sound source may queue before its oldest sound is dropped.
+const MAX_QUEUED: Duration = Duration::from_millis(500);
+
+/// What goes into the sound track: the microphone, the computer's own sound,
+/// clicks, or any mix of them.
 ///
-/// With no microphone the track is silence written at the pace of the
-/// recording, so clicks have somewhere to go and land at the right time.
+/// The microphone alone sets the pace of the track, as it always has. With
+/// the computer's sound, which only arrives while something plays, or with
+/// neither, the track is written at the pace of the recording and every
+/// source is mixed into it, so clicks and sound land at the right time.
 pub struct Sound {
     mic: Option<screenilux_win::AudioCapture>,
+    system: Option<screenilux_win::AudioCapture>,
     /// One message per mouse click, anywhere on the desktop.
     clicks: Option<Receiver<()>>,
     mixer: ClickMixer,
+    /// The microphone and the system sound, queued until written.
+    bus: Mixer,
     /// Sample frames written so far.
     written: u64,
 }
 
 impl Sound {
-    pub fn new(mic: Option<screenilux_win::AudioCapture>, clicks: Option<Receiver<()>>) -> Self {
+    pub fn new(
+        mic: Option<screenilux_win::AudioCapture>,
+        system: Option<screenilux_win::AudioCapture>,
+        clicks: Option<Receiver<()>>,
+    ) -> Self {
+        let rate = screenilux_win::audio::SAMPLE_RATE;
         Self {
             mic,
+            system,
             clicks,
-            mixer: ClickMixer::new(
-                screenilux_win::audio::SAMPLE_RATE,
+            mixer: ClickMixer::new(rate, screenilux_win::audio::CHANNELS),
+            bus: Mixer::new(
+                2,
                 screenilux_win::audio::CHANNELS,
+                (MAX_QUEUED.as_secs_f64() * rate as f64) as usize,
             ),
             written: 0,
         }
@@ -108,32 +131,45 @@ impl Sound {
     /// Drop what was heard while nothing was being recorded: before frame
     /// zero, or during a pause.
     fn discard(&mut self) {
-        if let Some(mic) = &self.mic {
-            mic.discard();
+        for source in [&self.mic, &self.system].into_iter().flatten() {
+            source.discard();
         }
         if let Some(clicks) = &self.clicks {
             while clicks.try_recv().is_ok() {}
         }
         self.mixer.silence();
+        self.bus.clear();
     }
 
     /// The audio since the last call, clicks mixed in. `recorded` is how
-    /// much has been recorded, which paces the silence when there is no
-    /// microphone.
-    fn take(&mut self, recorded: Duration) -> Vec<Vec<u8>> {
+    /// much has been recorded, which paces the track unless the microphone
+    /// is its only source. `flush` writes right up to `recorded`, at the end
+    /// of a stretch of recording.
+    fn take(&mut self, recorded: Duration, flush: bool) -> Vec<Vec<u8>> {
         if let Some(clicks) = &self.clicks {
             for () in clicks.try_iter() {
                 self.mixer.trigger();
             }
         }
-        let mut chunks = match &self.mic {
-            Some(mic) => mic.drain(),
-            None => {
-                let due =
-                    (recorded.as_secs_f64() * screenilux_win::audio::SAMPLE_RATE as f64) as u64;
+        let mut chunks = match (&self.mic, &self.system) {
+            (Some(mic), None) => mic.drain(),
+            (mic, system) => {
+                for (i, source) in [mic, system].into_iter().enumerate() {
+                    if let Some(source) = source {
+                        for chunk in source.drain() {
+                            self.bus.push(i, &chunk);
+                        }
+                    }
+                }
+                let upto = if flush || system.is_none() {
+                    recorded
+                } else {
+                    recorded.saturating_sub(CUSHION)
+                };
+                let due = (upto.as_secs_f64() * screenilux_win::audio::SAMPLE_RATE as f64) as u64;
                 match due.saturating_sub(self.written) {
                     0 => Vec::new(),
-                    n => vec![vec![0u8; n as usize * BLOCK]],
+                    n => vec![self.bus.pull(n as usize)],
                 }
             }
         };
@@ -183,7 +219,7 @@ fn capture_loop(job: &mut ScreenJob) -> Result<(), ScreenError> {
                 // is not recorded footage.
                 let in_segment = seg_start.elapsed();
                 let owed = pacer.due(in_segment);
-                forward_audio(job, banked + in_segment);
+                forward_audio(job, banked + in_segment, true);
                 job.sink.close_segment(owed)?;
                 banked += in_segment;
                 job.elapsed.set(banked);
@@ -210,7 +246,7 @@ fn capture_loop(job: &mut ScreenJob) -> Result<(), ScreenError> {
         // Drain the microphone before pacing, so audio keeps flowing even on
         // a still screen where no video frame is due.
         let in_segment = seg_start.elapsed();
-        forward_audio(job, banked + in_segment);
+        forward_audio(job, banked + in_segment, false);
 
         job.elapsed.set(banked + in_segment);
 
@@ -266,7 +302,7 @@ fn capture_loop(job: &mut ScreenJob) -> Result<(), ScreenError> {
 
     let in_segment = seg_start.elapsed();
     let owed = pacer.due(in_segment);
-    forward_audio(job, banked + in_segment);
+    forward_audio(job, banked + in_segment, true);
     job.sink.close_segment(owed)?;
     banked += in_segment;
     job.elapsed.set(banked);
@@ -274,11 +310,11 @@ fn capture_loop(job: &mut ScreenJob) -> Result<(), ScreenError> {
 }
 
 /// Hand the sound since the last call to the encoder.
-fn forward_audio(job: &mut ScreenJob, recorded: Duration) {
+fn forward_audio(job: &mut ScreenJob, recorded: Duration, flush: bool) {
     let Some(sound) = job.sound.as_mut() else {
         return;
     };
-    for chunk in sound.take(recorded) {
+    for chunk in sound.take(recorded, flush) {
         if let Err(e) = job.sink.write_audio(&chunk) {
             tracing::warn!(error = %e, "dropping audio");
         }

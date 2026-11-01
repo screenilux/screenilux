@@ -7,6 +7,7 @@ mod app;
 mod icon;
 mod overlay;
 mod player_view;
+mod previews;
 mod sizing;
 mod state;
 mod theme;

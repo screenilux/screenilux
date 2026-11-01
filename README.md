@@ -17,8 +17,10 @@ earlier design.*
   the bottom of the screen. The bar never appears in the recording.
 - **Pointer effects.** Show the pointer, zoom in with `Ctrl+Alt` and the mouse
   wheel, and hear a soft click each time you click.
-- **Camera and microphone.** Add your camera as a bubble you can drag
-  anywhere, even while recording.
+- **Your voice and your PC's sound.** Record the microphone, what your PC
+  plays (videos, calls, apps), or both mixed together.
+- **Camera bubble.** Add your camera as a round bubble you can drag anywhere,
+  even while recording.
 - **New screens are found by themselves.** Plug a screen in or unplug one and
   the list updates.
 
@@ -74,8 +76,6 @@ file, which opens in Screenilux.
 
 ## Good to know
 
-- Sound comes from your microphone only. Sounds your computer plays are not
-  recorded.
 - Zooming in makes the picture slightly softer.
 - Copying text needs a Windows language with text recognition installed. The
   app tells you if it is missing and where to add it.

@@ -1,4 +1,8 @@
-//! Microphone capture via WASAPI.
+//! Microphone and system sound capture via WASAPI.
+//!
+//! System sound is what the computer plays, read back from the default
+//! speakers in loopback mode: the same capture path as a microphone, on the
+//! output device instead of the input one.
 //!
 //! The last thing that needed ffmpeg. The encoder takes raw PCM through
 //! `send_audio_buffer`, but `windows-capture` contains no audio *capture* at
@@ -14,9 +18,9 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use windows::Win32::Media::Audio::{
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
-    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioCaptureClient, IAudioClient, IMMDevice,
-    IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eCapture, eConsole,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, EDataFlow, IAudioCaptureClient, IAudioClient,
+    IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eCapture, eConsole, eRender,
 };
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -28,7 +32,32 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
 pub const BITS_PER_SAMPLE: u16 = 16;
 
-/// A running microphone capture.
+/// Where sound is captured from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// The default microphone.
+    Microphone,
+    /// What the default speakers play.
+    System,
+}
+
+impl Source {
+    fn name(self) -> &'static str {
+        match self {
+            Source::Microphone => "the microphone",
+            Source::System => "the system sound",
+        }
+    }
+
+    fn flow(self) -> EDataFlow {
+        match self {
+            Source::Microphone => eCapture,
+            Source::System => eRender,
+        }
+    }
+}
+
+/// A running sound capture.
 pub struct AudioCapture {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -37,11 +66,21 @@ pub struct AudioCapture {
 }
 
 impl AudioCapture {
-    /// Start capturing the default communications/console input device.
+    /// Start capturing the default microphone.
     ///
     /// Failures are reported through [`error`](Self::error) rather than here:
     /// a missing microphone should never stop a screen recording from running.
     pub fn start() -> Self {
+        Self::start_from(Source::Microphone)
+    }
+
+    /// Start capturing what the default speakers play. Nothing arrives while
+    /// nothing is playing; the recorder fills that with silence.
+    pub fn start_system() -> Self {
+        Self::start_from(Source::System)
+    }
+
+    fn start_from(source: Source) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let error = Arc::new(std::sync::Mutex::new(None));
         // Bounded: if the encoder stalls we would rather drop audio than grow
@@ -51,10 +90,10 @@ impl AudioCapture {
         let flag = Arc::clone(&stop);
         let err = Arc::clone(&error);
         let handle = std::thread::Builder::new()
-            .name("screenilux-audio".into())
+            .name(format!("screenilux-audio-{source:?}").to_lowercase())
             .spawn(move || {
-                if let Err(e) = capture_loop(&flag, &tx) {
-                    tracing::warn!(error = %e, "microphone capture stopped");
+                if let Err(e) = capture_loop(source, &flag, &tx) {
+                    tracing::warn!(error = %e, ?source, "sound capture stopped");
                     if let Ok(mut slot) = err.lock() {
                         *slot = Some(e);
                     }
@@ -109,43 +148,61 @@ pub fn has_microphone() -> bool {
         if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
             return false;
         }
-        let found = default_device().is_ok();
+        let found = default_device(Source::Microphone).is_ok();
         CoUninitialize();
         found
     }
 }
 
-/// The default capture device.
-///
-/// # Safety
-/// COM must be initialised on the calling thread.
-unsafe fn default_device() -> windows::core::Result<IMMDevice> {
+/// Is there an output device whose sound could be recorded?
+pub fn has_system_sound() -> bool {
+    // SAFETY: as in `has_microphone`.
     unsafe {
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)
+        if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
+            return false;
+        }
+        let found = default_device(Source::System).is_ok();
+        CoUninitialize();
+        found
     }
 }
 
-fn capture_loop(stop: &AtomicBool, tx: &Sender<Vec<u8>>) -> Result<(), String> {
+/// The default device for `source`.
+///
+/// # Safety
+/// COM must be initialised on the calling thread.
+unsafe fn default_device(source: Source) -> windows::core::Result<IMMDevice> {
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        enumerator.GetDefaultAudioEndpoint(source.flow(), eConsole)
+    }
+}
+
+fn capture_loop(source: Source, stop: &AtomicBool, tx: &Sender<Vec<u8>>) -> Result<(), String> {
     // SAFETY: every call below is a documented WASAPI sequence; COM is
     // initialised for this thread and released on every exit path.
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED)
             .ok()
             .map_err(|e| format!("COM init failed: {e}"))?;
-        let result = capture_inner(stop, tx);
+        let result = capture_inner(source, stop, tx);
         CoUninitialize();
         result
     }
 }
 
-unsafe fn capture_inner(stop: &AtomicBool, tx: &Sender<Vec<u8>>) -> Result<(), String> {
+unsafe fn capture_inner(
+    source: Source,
+    stop: &AtomicBool,
+    tx: &Sender<Vec<u8>>,
+) -> Result<(), String> {
+    let name = source.name();
     unsafe {
-        let device = default_device().map_err(|e| format!("no microphone: {e}"))?;
+        let device = default_device(source).map_err(|e| format!("no device for {name}: {e}"))?;
         let client: IAudioClient = device
             .Activate(CLSCTX_ALL, None)
-            .map_err(|e| format!("could not open the microphone: {e}"))?;
+            .map_err(|e| format!("could not open {name}: {e}"))?;
 
         // Ask WASAPI to convert to the format the encoder wants, rather than
         // resampling by hand: devices vary wildly in native rate and layout.
@@ -160,23 +217,21 @@ unsafe fn capture_inner(stop: &AtomicBool, tx: &Sender<Vec<u8>>) -> Result<(), S
         };
         // 200ms of buffer, in 100-nanosecond units.
         let duration = 2_000_000i64;
+        let mut flags =
+            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        if source == Source::System {
+            flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
+        }
         client
-            .Initialize(
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                duration,
-                0,
-                &format,
-                None,
-            )
-            .map_err(|e| format!("could not configure the microphone: {e}"))?;
+            .Initialize(AUDCLNT_SHAREMODE_SHARED, flags, duration, 0, &format, None)
+            .map_err(|e| format!("could not configure {name}: {e}"))?;
 
         let capture: IAudioCaptureClient = client
             .GetService()
             .map_err(|e| format!("could not start capture: {e}"))?;
         client
             .Start()
-            .map_err(|e| format!("could not start the microphone: {e}"))?;
+            .map_err(|e| format!("could not start {name}: {e}"))?;
 
         let frame_bytes = (CHANNELS * BITS_PER_SAMPLE / 8) as usize;
         while !stop.load(Ordering::Relaxed) {
@@ -275,6 +330,24 @@ mod tests {
             0,
             "PCM should arrive in whole frames"
         );
+    }
+
+    #[test]
+    fn system_sound_starts_and_stops_without_error() {
+        if !has_system_sound() {
+            return;
+        }
+        let mut cap = AudioCapture::start_system();
+        // Nothing may be playing, so no PCM is expected, only that the
+        // device accepted loopback capture in the encoder's format.
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(cap.error(), None, "loopback capture should start");
+        let bytes: usize = cap.drain().iter().map(|c| c.len()).sum();
+        assert_eq!(
+            bytes % (CHANNELS as usize * BITS_PER_SAMPLE as usize / 8),
+            0
+        );
+        cap.stop();
     }
 
     #[test]
