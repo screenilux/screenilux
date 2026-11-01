@@ -14,10 +14,16 @@
 //
 // - Starting a recording needs nothing, but each address can start only a few
 //   a minute.
+// - Storage costs money past Cloudflare's free allowance, so each computer
+//   can keep SHARE_PER_DEVICE bytes shared at a time, counted over the week
+//   a link lasts. There are no accounts: the app makes a random device id
+//   once. Since a new id is easy to make, each network (address) is also held
+//   to SHARE_PER_NETWORK. The counts are in D1 (migrations/).
 // - Starting one hands back an upload token that works for that recording
 //   only: it cannot read, list or change any other. The token is a signature
 //   of the recording's id, so the server keeps nothing to check it against.
-// - A recording can hold at most MAX_RECORDING bytes, counted as they arrive.
+// - A recording can hold at most the bytes it asked for, counted as they
+//   arrive.
 // - The upload's progress is what this server counted, and it is ready when
 //   the app says it has finished. Anyone with the id can ask how it is going.
 // - Reading needs only the id, which is random and long enough that links
@@ -25,6 +31,7 @@
 //   lifecycle rule on the bucket).
 // - The admin key (UPLOAD_KEY) can delete any recording, to take one down.
 
+// Recording and device ids: 128 random bits, base64url.
 const ID = /^[A-Za-z0-9_-]{22}$/;
 // Any plain file name can be read, but only the files a recording is made of
 // can be written.
@@ -32,8 +39,10 @@ const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 const WRITABLE = /^(recording|text)\.json$|^screen[1-9][0-9]?\.mp4$/;
 const PART = /^[1-9][0-9]{0,4}$/;
 
-/** The most one shared recording can hold: about an hour of two screens. */
-const MAX_RECORDING = 4 * 1024 ** 3;
+/** What one computer can have shared at a time, over the week links last. */
+const SHARE_PER_DEVICE = 1024 ** 3;
+/** What one network can have shared at a time, however many computers. */
+const SHARE_PER_NETWORK = 5 * 1024 ** 3;
 /** The most one upload request can carry. The app sends 32MB parts. */
 const MAX_REQUEST = 50 * 1024 ** 2;
 /** How long a recording is kept; the bucket's lifecycle rule does the deleting. */
@@ -149,6 +158,51 @@ async function updateState(
   throw new Error("the upload state kept changing");
 }
 
+/** A keyed hash of the address a request came from, so no address is stored. */
+async function networkOf(request: Request, env: Env): Promise<string> {
+  const address = request.headers.get("CF-Connecting-IP") ?? "unknown";
+  const mac = await crypto.subtle.sign("HMAC", await signingKey(env), encoder.encode(`network:${address}`));
+  return base64url(new Uint8Array(mac).slice(0, 16));
+}
+
+function size(bytes: number): string {
+  return bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)}GB` : `${Math.ceil(bytes / 1024 ** 2)}MB`;
+}
+
+/**
+ * Count a new share of `total` bytes against its device and network, if both
+ * have room. One statement checks and records, so two shares at once cannot
+ * both squeeze into the same space. Returns why not, if not.
+ */
+async function claim(env: Env, id: string, device: string, network: string, total: number): Promise<string | undefined> {
+  const now = Date.now();
+  const since = now - KEPT_FOR_MS;
+  await env.SHARES.prepare("DELETE FROM shares WHERE started <= ?1").bind(since).run();
+  const claimed = await env.SHARES.prepare(
+    `INSERT INTO shares (id, device, network, bytes, started)
+     SELECT ?1, ?2, ?3, ?4, ?5
+     WHERE (SELECT COALESCE(SUM(bytes), 0) FROM shares WHERE device = ?2 AND started > ?6) + ?4 <= ?7
+       AND (SELECT COALESCE(SUM(bytes), 0) FROM shares WHERE network = ?3 AND started > ?6) + ?4 <= ?8`,
+  )
+    .bind(id, device, network, total, now, since, SHARE_PER_DEVICE, SHARE_PER_NETWORK)
+    .run();
+  if (claimed.meta.changes === 1) return undefined;
+
+  const used = async (column: "device" | "network", value: string) =>
+    (
+      await env.SHARES.prepare(`SELECT COALESCE(SUM(bytes), 0) AS used FROM shares WHERE ${column} = ?1 AND started > ?2`)
+        .bind(value, since)
+        .first<{ used: number }>()
+    )?.used ?? 0;
+  const mine = await used("device", device);
+  if (mine + total > SHARE_PER_DEVICE) {
+    return total > SHARE_PER_DEVICE
+      ? `This recording is ${size(total)}, more than the ${size(SHARE_PER_DEVICE)} Screenilux can share for you. Share it to your own storage instead.`
+      : `You have ${size(SHARE_PER_DEVICE - mine)} of your ${size(SHARE_PER_DEVICE)} left this week, and this recording is ${size(total)}. Space frees up as your links expire, 7 days after you shared them.`;
+  }
+  return `Recordings shared from your network have used its ${size(SHARE_PER_NETWORK)} for this week. Space frees up as those links expire, 7 days after they were shared.`;
+}
+
 function length(request: Request): number | undefined {
   const n = Number(request.headers.get("Content-Length"));
   return Number.isSafeInteger(n) && n > 0 ? n : undefined;
@@ -159,27 +213,30 @@ async function api(request: Request, env: Env, path: string[]): Promise<Response
   if (collection !== "recordings") return problem(404, "Not found.");
   if (!env.SIGNING_KEY) return problem(503, "Sharing is not set up on this server.");
   const method = request.method;
-  const tooBig = problem(413, `The recording is bigger than ${MAX_RECORDING / 1024 ** 3}GB, the most Screenilux can share.`);
 
-  // POST /api/recordings with {"total": bytes}: a new, empty recording and
-  // its upload token.
+  // POST /api/recordings with {"total": bytes, "device": id}: a new, empty
+  // recording and its upload token, if the device and network have room.
   if (path.length === 1 && method === "POST") {
     const from = request.headers.get("CF-Connecting-IP") ?? "unknown";
     if (!(await env.CREATES.limit({ key: from })).success) {
       return problem(429, "Too many recordings were shared from here in the last minute. Try again in a minute.");
     }
-    const asked = await request.json<{ total?: unknown }>().catch(() => ({ total: undefined }));
+    const asked = await request
+      .json<{ total?: unknown; device?: unknown }>()
+      .catch(() => ({ total: undefined, device: undefined }));
     const total = Number(asked.total);
     if (!Number.isSafeInteger(total) || total <= 0) return problem(400, "Say how big the recording is.");
-    if (total > MAX_RECORDING) return tooBig;
+    if (typeof asked.device !== "string" || !ID.test(asked.device)) return problem(400, "Say which device is sharing.");
     const id = base64url(crypto.getRandomValues(new Uint8Array(16)));
+    const refused = await claim(env, id, asked.device, await networkOf(request, env), total);
+    if (refused) return problem(413, refused);
     const now = Date.now();
     const state: UploadState = { status: "uploading", total, received: 0, started: now, updated: now };
     await env.RECORDINGS.put(`rec/${id}/_state`, JSON.stringify(state));
     const origin = new URL(request.url).origin;
     console.log(JSON.stringify({ message: "recording started", id, total }));
     return Response.json(
-      { id, link: `${origin}/v/${id}`, token: await tokenFor(env, id), limit: MAX_RECORDING },
+      { id, link: `${origin}/v/${id}`, token: await tokenFor(env, id), limit: total },
       { status: 201 },
     );
   }
@@ -216,6 +273,8 @@ async function api(request: Request, env: Env, path: string[]): Promise<Response
       if (list.objects.length) await env.RECORDINGS.delete(list.objects.map((o) => o.key));
       cursor = list.truncated ? list.cursor : undefined;
     } while (cursor);
+    // Its space is free again.
+    await env.SHARES.prepare("DELETE FROM shares WHERE id = ?1").bind(id).run();
     return new Response(null, { status: 204 });
   }
 
@@ -229,17 +288,18 @@ async function api(request: Request, env: Env, path: string[]): Promise<Response
   const key = `rec/${id}/${name}`;
   // Every file is encrypted; its type says nothing more.
   const httpMetadata = { contentType: "application/octet-stream" };
-  const size = length(request);
+  const bytes = length(request);
 
   // Writing a body: its size must be stated and small enough, and it counts
-  // against the recording's allowance.
+  // against what the recording asked for.
   const admit = async (): Promise<Response | undefined> => {
-    if (!request.body || !size) return problem(411, "The upload must say how big it is.");
-    if (size > MAX_REQUEST) return problem(413, "That upload is too big for one request.");
+    if (!request.body || !bytes) return problem(411, "The upload must say how big it is.");
+    if (bytes > MAX_REQUEST) return problem(413, "That upload is too big for one request.");
     const counted = await updateState(env, id, (s) =>
-      s.received + size > MAX_RECORDING ? "full" : { ...s, received: s.received + size, updated: Date.now() },
+      s.received + bytes > s.total ? "full" : { ...s, received: s.received + bytes, updated: Date.now() },
     );
-    return counted === "ok" ? undefined : counted === "gone" ? gone : tooBig;
+    if (counted === "full") return problem(413, "The recording is bigger than it said it would be.");
+    return counted === "ok" ? undefined : gone;
   };
 
   // PUT /api/recordings/:id/:name: a whole file, up to MAX_REQUEST.

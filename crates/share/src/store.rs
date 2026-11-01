@@ -56,6 +56,11 @@ struct Created {
 }
 
 #[derive(Deserialize)]
+struct Problem {
+    error: String,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Started {
     upload_id: String,
@@ -67,20 +72,38 @@ struct Part {
 }
 
 impl Hosted {
-    /// A new, empty recording on the storage for `total` bytes, and its link.
+    /// A new, empty recording on the storage for `total` bytes, counted
+    /// against `device`'s allowance, and its link.
     pub fn create(
         agent: ureq::Agent,
         server: &str,
+        device: &str,
         total: u64,
     ) -> Result<(Self, String), ShareError> {
         let server = server.trim_end_matches('/');
-        let created: Created = agent
+        let mut response = agent
             .post(format!("{server}/api/recordings"))
-            .send_json(serde_json::json!({ "total": total }))?
-            .body_mut()
-            .read_json()?;
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send_json(serde_json::json!({ "total": total, "device": device }))?;
+        let status = response.status().as_u16();
+        if status == 429 {
+            return Err(ShareError::TooMany);
+        }
+        if !response.status().is_success() {
+            // The storage explains a refusal, such as no room left, in words
+            // to show as they are.
+            return Err(match response.body_mut().read_json::<Problem>() {
+                Ok(p) if status == 413 => ShareError::Declined(p.error),
+                _ => ShareError::Refused(status),
+            });
+        }
+        let created: Created = response.body_mut().read_json()?;
         if total > created.limit {
-            return Err(ShareError::TooBig);
+            return Err(ShareError::Declined(
+                "the storage allowed less than this recording needs".into(),
+            ));
         }
         let auth = format!("Bearer {}", created.token);
         let recording = format!("{server}/api/recordings/{}", created.id);

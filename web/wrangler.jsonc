@@ -18,6 +18,14 @@
       "bucket_name": "screenilux-recordings"
     }
   ],
+  // How much each device and network has shared this week (migrations/).
+  "d1_databases": [
+    {
+      "binding": "SHARES",
+      "database_name": "screenilux",
+      "database_id": "47f925dc-eb6e-4ba7-896a-39043879fe6b"
+    }
+  ],
   // Each address can start a few recordings a minute (see worker/index.ts).
   "ratelimits": [
     {

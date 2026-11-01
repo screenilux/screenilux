@@ -124,6 +124,7 @@ fn a_package_uploads_to_the_screenilux_storage() {
     let upload = Upload::start(
         Destination::Screenilux {
             server: server.clone(),
+            device: screenilux_share::new_device_id(),
         },
         contents,
     );

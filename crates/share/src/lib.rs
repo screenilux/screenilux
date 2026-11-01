@@ -44,10 +44,12 @@ pub enum ShareError {
     Refused(u16),
     #[error("the storage did not accept the upload")]
     NotAllowed,
-    #[error("it is bigger than Screenilux can share (4GB); share it to your own bucket instead")]
-    TooBig,
     #[error("too many recordings were shared from this network just now; try again in a minute")]
     TooMany,
+    /// The storage said why it would not take the recording, in words meant
+    /// for the person sharing: no room left this week, for instance.
+    #[error("{0}")]
+    Declined(String),
     #[error("the bucket settings are not usable: {0}")]
     Bucket(String),
     #[error("could not read the recording: {0}")]
@@ -58,7 +60,6 @@ impl From<ureq::Error> for ShareError {
     fn from(e: ureq::Error) -> Self {
         match e {
             ureq::Error::StatusCode(401 | 403) => ShareError::NotAllowed,
-            ureq::Error::StatusCode(413) => ShareError::TooBig,
             ureq::Error::StatusCode(429) => ShareError::TooMany,
             ureq::Error::StatusCode(code) => ShareError::Refused(code),
             other => ShareError::Network(other.to_string()),
@@ -102,9 +103,12 @@ impl Bucket {
 /// Where a recording is shared to.
 #[derive(Debug, Clone)]
 pub enum Destination {
-    /// The Screenilux storage, behind `server`.
+    /// The Screenilux storage, behind `server`. `device` is this computer's
+    /// id there, which its allowance is counted against (see
+    /// [`new_device_id`]).
     Screenilux {
         server: String,
+        device: String,
     },
     Bucket(Bucket),
 }
@@ -183,8 +187,8 @@ fn run(
     lock(progress).total = total;
 
     let (store, link): (Box<dyn Store>, String) = match destination {
-        Destination::Screenilux { server } => {
-            let (hosted, link) = Hosted::create(agent, server, total)?;
+        Destination::Screenilux { server, device } => {
+            let (hosted, link) = Hosted::create(agent, server, device, total)?;
             (Box::new(hosted), format!("{link}#k={}", key.to_link()))
         }
         Destination::Bucket(bucket) => {
@@ -304,6 +308,12 @@ fn fill(reader: &mut impl Read, buf: &mut [u8]) -> Result<usize, ShareError> {
         }
     }
     Ok(n)
+}
+
+/// A new id for this computer on the Screenilux storage, made once and kept.
+/// It is random, so it says nothing about the computer or who uses it.
+pub fn new_device_id() -> String {
+    new_id().expect("the system has randomness")
 }
 
 /// A random id that cannot be guessed: 128 bits, as the Screenilux storage

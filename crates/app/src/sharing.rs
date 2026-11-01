@@ -26,6 +26,10 @@ pub enum Mode {
 #[serde(default)]
 pub struct Sharing {
     pub mode: Mode,
+    /// This computer's id on the Screenilux storage, made the first time it
+    /// is needed. What it may share is counted against it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub device: String,
     /// The Screenilux storage, if not the usual one; for testing a local copy.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub server: String,
@@ -59,16 +63,24 @@ impl Sharing {
         }
     }
 
-    /// Where a finished recording goes, if sharing is on and set up.
-    pub fn destination(&self) -> Option<Destination> {
+    /// Where a finished recording goes, if sharing is on and set up. Sharing
+    /// to Screenilux the first time gives this computer its id, and saves it.
+    pub fn destination(&mut self) -> Option<Destination> {
         match self.mode {
             Mode::Off => None,
-            Mode::Screenilux => Some(Destination::Screenilux {
-                server: match self.server.trim() {
-                    "" => screenilux_share::PLAYER.to_string(),
-                    s => s.to_string(),
-                },
-            }),
+            Mode::Screenilux => {
+                if self.device.is_empty() {
+                    self.device = screenilux_share::new_device_id();
+                    self.save();
+                }
+                Some(Destination::Screenilux {
+                    server: match self.server.trim() {
+                        "" => screenilux_share::PLAYER.to_string(),
+                        s => s.to_string(),
+                    },
+                    device: self.device.clone(),
+                })
+            }
             Mode::Bucket if !self.bucket.is_complete() => None,
             Mode::Bucket => Some(Destination::Bucket(self.bucket.clone())),
         }
@@ -120,6 +132,8 @@ mod tests {
         let mut s = Sharing::default();
         assert!(s.destination().is_none());
         s.mode = Mode::Screenilux;
+        // A device id is made here; keep the test from saving it.
+        s.device = "d".repeat(22);
         assert!(
             matches!(s.destination(), Some(Destination::Screenilux { server, .. }) if server == screenilux_share::PLAYER)
         );
@@ -131,6 +145,7 @@ mod tests {
     fn settings_read_back_and_tolerate_missing_fields() {
         let s = Sharing {
             mode: Mode::Bucket,
+            device: String::new(),
             server: String::new(),
             bucket: Bucket {
                 bucket: "b".into(),

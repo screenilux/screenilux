@@ -843,8 +843,8 @@ impl App {
                 ui.add_space(4.0);
                 theme::hint(
                     ui,
-                    "Links last 7 days, for recordings up to 4GB. Anyone with the link \
-                     can watch.",
+                    "Only people with the link can watch. Links last 7 days, and you can \
+                     have up to 1GB shared at a time.",
                 );
             }
             Mode::Bucket => {

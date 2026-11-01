@@ -109,8 +109,8 @@ Screenilux nor your storage provider can watch them.
 
 Choose where recordings go:
 
-- **Screenilux.** Nothing to set up. Links last 7 days, for recordings up
-  to 4 GB.
+- **Screenilux.** Nothing to set up. Links last 7 days, and each computer
+  can have up to 1 GB shared at a time.
 - **My bucket.** Your own storage: Cloudflare R2, Amazon S3, Backblaze B2,
   Wasabi or any other S3-compatible service. Recordings stay until you delete
   them, and your keys never leave your computer.
