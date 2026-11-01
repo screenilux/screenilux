@@ -1,8 +1,9 @@
 //! The window's size and shape: per tab, and as the recording bar.
 //!
 //! The Record tab is a column of settings, so it gets a window just wide
-//! enough for that column and as tall as the screen allows: everything shows
-//! without scrolling and the desktop beside it stays free. Watching wants
+//! enough for that column and just as tall as what it shows: the window
+//! grows when a section opens and shrinks when it closes, and only once the
+//! column is taller than the screen does it stop growing and scroll. Watching wants
 //! every pixel, so the Play tab maximises. While recording, the window can
 //! shrink to a small borderless bar at the bottom of the screen.
 //!
@@ -15,9 +16,10 @@ use eframe::egui;
 /// width of a compact launcher.
 pub const RECORD_WIDTH: f32 = 420.0;
 
-/// The smallest the window can be made, other than as the bar. Below this the
-/// Record tab's rows start to wrap and the Play tab's controls overlap.
-pub const MIN_SIZE: egui::Vec2 = egui::vec2(400.0, 520.0);
+/// The smallest the window can be made, other than as the bar. Narrower and
+/// the column's rows start to wrap; it can be short, for a short page such as
+/// Settings, since it fits itself to what it shows.
+pub const MIN_SIZE: egui::Vec2 = egui::vec2(400.0, 320.0);
 
 /// The recording bar: stop, the clock, pause and expand in a row.
 pub const BAR_SIZE: egui::Vec2 = egui::vec2(268.0, 56.0);
@@ -42,10 +44,8 @@ enum Shape {
 /// What the window is shaped for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fit {
-    /// The Record tab.
+    /// The column: Record, Recordings and Settings.
     Settings,
-    /// The Play tab.
-    Stage,
     /// The recording bar.
     Bar,
 }
@@ -53,10 +53,12 @@ pub enum Fit {
 pub struct Sizer {
     current: Option<Fit>,
     settings: Option<Shape>,
-    stage: Option<Shape>,
     bar: Option<Shape>,
     /// What the window adds around its content, measured once it exists.
     frame: egui::Vec2,
+    /// The Record tab's size last asked for, so a resize still on its way is
+    /// not asked for again every frame.
+    asked: Option<egui::Vec2>,
 }
 
 impl Sizer {
@@ -64,9 +66,9 @@ impl Sizer {
         Self {
             current: None,
             settings: None,
-            stage: None,
             bar: None,
             frame: FRAME_GUESS,
+            asked: None,
         }
     }
 
@@ -115,7 +117,7 @@ impl Sizer {
                     work.bottom() - BAR_SIZE.y - BAR_MARGIN,
                 ),
             ),
-            (_, Some(Shape::Maximised)) | (Fit::Stage, None) => Shape::Maximised,
+            (_, Some(Shape::Maximised)) => Shape::Maximised,
             (_, Some(Shape::Normal { pos, size })) => self.within(reach, pos, size),
             (Fit::Settings, None) => self.column(reach, outer),
         };
@@ -128,10 +130,46 @@ impl Sizer {
         apply(ctx, shape, maximised);
     }
 
+    /// Make the Record tab's window `content` tall, as far as the screen
+    /// allows, keeping its bottom on the screen. It also stays at least as
+    /// wide as the column, which can be lost when the window moves to a
+    /// screen with another scale: narrower, the rows overlap.
+    pub fn fit_height(&mut self, ctx: &egui::Context, content: f32) {
+        if self.current != Some(Fit::Settings) {
+            return;
+        }
+        let vp = ctx.input(|i| i.viewport().clone());
+        let (Some(outer), Some(inner)) = (vp.outer_rect, vp.inner_rect) else {
+            return;
+        };
+        if vp.maximized == Some(true) || vp.minimized == Some(true) || vp.fullscreen == Some(true) {
+            return;
+        }
+        let reach = self.reach(work_area(ctx, outer), ctx.pixels_per_point());
+        let height = content
+            .ceil()
+            .clamp(MIN_SIZE.y, (reach.height() - self.frame.y).max(MIN_SIZE.y));
+        let width = inner.width().max(RECORD_WIDTH);
+        let wanted = egui::vec2(width, height);
+        if (inner.size() - wanted).abs().max_elem() < 1.0 {
+            self.asked = None;
+            return;
+        }
+        if self.asked == Some(wanted) {
+            return;
+        }
+        self.asked = Some(wanted);
+        let outer_size = wanted + self.frame;
+        let pos = clamp_onto(reach, outer.min, outer_size);
+        if pos != outer.min {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+    }
+
     fn slot(&mut self, fit: Fit) -> &mut Option<Shape> {
         match fit {
             Fit::Settings => &mut self.settings,
-            Fit::Stage => &mut self.stage,
             Fit::Bar => &mut self.bar,
         }
     }

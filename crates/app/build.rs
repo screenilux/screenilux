@@ -15,7 +15,7 @@ fn main() {
         res.set_icon(ico.to_str().expect("a UTF-8 OUT_DIR"))
             .set("ProductName", "Screenilux")
             .set("FileDescription", "Screenilux screen recorder")
-            .set("CompanyName", "EagleMind");
+            .set("CompanyName", "Screenilux");
         if let Err(e) = res.compile() {
             // A missing resource compiler costs the icon, not the build.
             println!("cargo:warning=no icon embedded: {e}");

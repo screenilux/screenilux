@@ -1,0 +1,111 @@
+@import "tailwindcss";
+
+/* The desktop app's palette (crates/app/src/theme.rs), light and dark. Depth
+   comes from tone and 1px lines, never shadows. */
+:root {
+  --ground: #f3fffe;
+  --surface: #e1f7f7;
+  --mist: #a5e8e7;
+  --ink: #012625;
+  --weak: #4e6b6a;
+  --action: #04736f;
+  --signal: #069a95;
+  --soft: #07beb8;
+  --stage: #e1f7f7;
+  --on-dark: #f3fffe;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #012625;
+    --surface: #0d3332;
+    --mist: #165452;
+    --ink: #e1f7f7;
+    --weak: #99b4b4;
+    --signal: #2da8a4;
+    --soft: #36cbc9;
+    --stage: #0d3332;
+    color-scheme: dark;
+  }
+}
+
+@theme inline {
+  --color-ground: var(--ground);
+  --color-surface: var(--surface);
+  --color-mist: var(--mist);
+  --color-ink: var(--ink);
+  --color-weak: var(--weak);
+  --color-action: var(--action);
+  --color-signal: var(--signal);
+  --color-soft: var(--soft);
+  --color-stage: var(--stage);
+  --color-on-dark: var(--on-dark);
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Noto Sans", sans-serif;
+}
+
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
+}
+
+/* Words laid over a paused frame: invisible, but selectable and copyable. */
+.word {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  line-height: 1;
+  cursor: text;
+}
+.word::selection {
+  color: transparent;
+  background: color-mix(in srgb, var(--soft) 45%, transparent);
+}
+
+/* The time scrubber. */
+input[type="range"].scrub {
+  appearance: none;
+  height: 18px;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="range"].scrub::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(to right, var(--soft) var(--done, 0%), var(--mist) var(--done, 0%));
+}
+input[type="range"].scrub::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(to right, var(--soft) var(--done, 0%), var(--mist) var(--done, 0%));
+}
+input[type="range"].scrub::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: var(--soft);
+  border: 2px solid var(--ground);
+}
+input[type="range"].scrub::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--soft);
+  border: 2px solid var(--ground);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

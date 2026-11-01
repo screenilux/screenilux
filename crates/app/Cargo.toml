@@ -16,10 +16,13 @@ screenilux-core = { path = "../core" }
 screenilux-player = { path = "../player" }
 screenilux-recorder = { path = "../recorder" }
 screenilux-platform = { path = "../platform" }
+screenilux-share = { path = "../share" }
 eframe = "0.37"
 egui = "0.37"
 raw-window-handle = "0.6"
 rfd = "0.17"
+serde = { workspace = true }
+serde_json = { workspace = true }
 tiny-skia = "0.12"
 tracing = { workspace = true }
 tracing-subscriber = "0.3"
