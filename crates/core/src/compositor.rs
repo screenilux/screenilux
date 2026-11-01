@@ -48,7 +48,6 @@ const CLICK_MAX: usize = 12;
 
 const CURSOR_OUTER: f32 = 9.0;
 const CURSOR_INNER: f32 = 6.0;
-const CAMERA_RADIUS: f32 = 16.0;
 
 /// Which overlays to draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,9 +477,16 @@ impl Compositor {
         let (bw, bh) = (bubble.width, bubble.height);
 
         self.with_overlay((x, y, bw, bh), |pixmap| {
-            // Round the corners by clipping the photo to a rounded rect.
+            // A round bubble: the photo clipped to a circle, or to a pill
+            // if the bubble is not square.
             let mut pb = PathBuilder::new();
-            push_rounded_rect(&mut pb, 0.0, 0.0, bw as f32, bh as f32, CAMERA_RADIUS);
+            if bw == bh {
+                let r = bw as f32 / 2.0;
+                pb.push_circle(r, r, r);
+            } else {
+                let radius = bw.min(bh) as f32 / 2.0;
+                push_rounded_rect(&mut pb, 0.0, 0.0, bw as f32, bh as f32, radius);
+            }
             let Some(path) = pb.finish() else { return };
 
             let Some(mut mask) = Pixmap::new(bw, bh) else {
@@ -516,10 +522,11 @@ impl Compositor {
             );
 
             let mut border = Paint::default();
-            border.set_color_rgba8(235, 235, 235, 255);
+            // A light ring, as in the app, so the bubble reads on any screen.
+            border.set_color_rgba8(243, 255, 254, 255);
             border.anti_alias = true;
             let stroke = Stroke {
-                width: 2.0,
+                width: 6.0,
                 ..Stroke::default()
             };
             pixmap.stroke_path(&path, &border, &stroke, Transform::identity(), None);

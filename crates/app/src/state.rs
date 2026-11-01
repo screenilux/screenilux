@@ -7,9 +7,9 @@ use std::sync::mpsc::{Receiver, channel};
 use screenilux_core::EffectOptions;
 use screenilux_core::geometry::Monitor;
 
-/// The camera bubble, in pixels: big enough to read a face, small enough to
-/// leave the screen readable.
-pub const CAMERA_SIZE: (u32, u32) = (320, 240);
+/// The camera bubble, in pixels: a circle big enough to read a face, small
+/// enough to leave the screen readable.
+pub const CAMERA_SIZE: (u32, u32) = (240, 240);
 pub const CAMERA_MARGIN: i32 = 28;
 pub const FPS_CHOICES: [u32; 5] = [10, 15, 24, 30, 60];
 
@@ -29,6 +29,7 @@ pub enum Phase {
 /// inline would hold the window back before it appeared.
 pub struct Probes {
     pub has_microphone: bool,
+    pub has_system_sound: bool,
     pub cameras: Vec<String>,
     pub ready: bool,
     rx: Option<Receiver<ProbeResult>>,
@@ -36,6 +37,7 @@ pub struct Probes {
 
 struct ProbeResult {
     has_microphone: bool,
+    has_system_sound: bool,
     cameras: Vec<String>,
 }
 
@@ -49,12 +51,14 @@ impl Probes {
                 // a moment, which is why this is off the UI thread at all.
                 let _ = tx.send(ProbeResult {
                     has_microphone: screenilux_win::has_microphone(),
+                    has_system_sound: screenilux_win::has_system_sound(),
                     cameras: screenilux_win::cameras(),
                 });
             })
             .ok();
         Self {
             has_microphone: false,
+            has_system_sound: false,
             cameras: Vec::new(),
             ready: false,
             rx: Some(rx),
@@ -66,6 +70,7 @@ impl Probes {
         let Some(rx) = &self.rx else { return };
         if let Ok(r) = rx.try_recv() {
             self.has_microphone = r.has_microphone;
+            self.has_system_sound = r.has_system_sound;
             self.cameras = r.cameras;
             self.ready = true;
             self.rx = None;
@@ -84,6 +89,8 @@ pub struct Settings {
     pub shrink: bool,
     pub effects: EffectOptions,
     pub microphone: bool,
+    /// What the computer plays: video, calls, app sounds.
+    pub system_sound: bool,
     /// A quiet click in the recording for each mouse click.
     pub click_sound: bool,
     pub camera_device: usize,
@@ -102,6 +109,7 @@ impl Settings {
             shrink: true,
             effects: EffectOptions::default(),
             microphone: false,
+            system_sound: true,
             click_sound: true,
             camera_device: 0,
             out_dir: default_output_dir(),
@@ -224,9 +232,9 @@ mod tests {
     }
 
     #[test]
-    fn the_camera_bubble_is_landscape() {
+    fn the_camera_bubble_is_round() {
         let (w, h) = CAMERA_SIZE;
-        assert!(w > h);
+        assert_eq!(w, h, "a square bubble clips to a circle");
     }
 
     #[test]

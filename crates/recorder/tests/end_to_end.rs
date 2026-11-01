@@ -102,6 +102,7 @@ fn config(_f: &Fixture, monitors: Vec<screenilux_core::Monitor>) -> SessionConfi
         monitors,
         fps: 30,
         microphone: false,
+        system_sound: false,
         click_sound: false,
         effects: effects(),
         camera: None,
@@ -337,4 +338,80 @@ fn two_recordings_in_the_same_second_do_not_overwrite_each_other() {
         "the second recording must not land on the first's path"
     );
     assert!(saved.iter().all(|p| p.is_file()));
+}
+
+/// Loudness of the decoded sound in each tenth of a second.
+fn loudness_by_tenth(file: &Path) -> Vec<f64> {
+    let mut decoder = screenilux_win::AudioDecoder::open(file).expect("the file should have sound");
+    let mut samples: Vec<i16> = Vec::new();
+    while let Some((_, pcm)) = decoder.next_chunk().expect("sound should decode") {
+        samples.extend(
+            pcm.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b)),
+        );
+    }
+    // 48kHz stereo: 9,600 samples per tenth of a second.
+    samples
+        .chunks(9_600)
+        .map(|c| (c.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / c.len() as f64).sqrt())
+        .collect()
+}
+
+#[test]
+#[ignore = "records the real screen and plays a short tone through the speakers"]
+fn system_sound_lands_in_the_recording_at_the_right_time() {
+    let Some(f) = fixture() else { return };
+    if !screenilux_win::has_system_sound() {
+        return;
+    }
+    let Ok(all) = display::monitors() else { return };
+    let primary: Vec<_> = all.into_iter().filter(|m| m.is_primary).collect();
+    let mut cfg = config(&f, primary);
+    cfg.system_sound = true;
+
+    let session = Session::start(cfg).expect("session should start");
+    let started = Instant::now();
+    // A quiet 880Hz tone for one second, from 1.5s in. The speaker stream is
+    // not Send, so it lives on its own thread.
+    let tone = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1500));
+        let mut speaker = screenilux_win::Speaker::open().expect("speakers");
+        let rate = screenilux_win::decoder::PLAYBACK_RATE as f64;
+        let pcm: Vec<u8> = (0..rate as usize)
+            .flat_map(|i| {
+                let s = ((i as f64 * 880.0 * std::f64::consts::TAU / rate).sin() * 4_000.0) as i16;
+                [s.to_le_bytes(), s.to_le_bytes()].concat()
+            })
+            .collect();
+        let mut sent = 0;
+        speaker.start();
+        while sent < pcm.len() {
+            sent += speaker.write(&pcm[sent..]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    });
+    tone.join().unwrap();
+    std::thread::sleep(Duration::from_secs(4).saturating_sub(started.elapsed()));
+    let path = session.finish(f.dir.path()).expect("should save");
+
+    let loud = loudness_by_tenth(&path);
+    let quiet_before = loud[..12].iter().cloned().fold(0.0, f64::max);
+    let during = loud[17..24].iter().sum::<f64>() / 7.0;
+    assert!(
+        during > 500.0,
+        "the tone should be in the recording, got {during:.0} RMS ({loud:.0?})"
+    );
+    assert!(
+        quiet_before < during / 4.0,
+        "the tone should start around 1.5s, not before ({loud:.0?})"
+    );
+    let audio = audio_duration_of(&f.ffmpeg, &path).expect("an audio stream");
+    let video = video_duration_of(&f.ffmpeg, &path);
+    assert!(
+        (audio - video).abs() < 0.15,
+        "sound {audio:.2}s and picture {video:.2}s should match"
+    );
 }
