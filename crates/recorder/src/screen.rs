@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use screenilux_core::click::ClickMixer;
 use screenilux_core::compositor::{CameraView, Compositor};
 use screenilux_core::geometry::Point;
 use screenilux_core::ports::{
-    CameraSource, CaptureError, PointerEvent, ScreenSource, SinkError, VideoSink, WriteStatus,
+    CameraSource, CaptureError, PointerEvent, ScreenSource, SinkError, VideoSink,
 };
 use screenilux_core::timing::{FramePacer, SyncClock};
 
@@ -64,8 +64,6 @@ pub struct ScreenJob {
     pub control: Arc<Control>,
     pub sync: Arc<SyncClock>,
     pub elapsed: Arc<Elapsed>,
-    pub label: String,
-    pub notices: Sender<String>,
     /// Overlay compositing. `None` means frames go to the encoder untouched,
     /// which skips a full-frame copy per frame.
     pub compositor: Option<Compositor>,
@@ -147,9 +145,8 @@ impl Sound {
     }
 }
 
-/// Run one screen to completion. Returns the encoder label actually used,
-/// which may differ from the one it started with.
-pub fn run(mut job: ScreenJob) -> Result<&'static str, ScreenError> {
+/// Run one screen to completion.
+pub fn run(mut job: ScreenJob) -> Result<(), ScreenError> {
     let result = capture_loop(&mut job);
     if result.is_err() {
         // Never leave peers parked at the barrier waiting for a screen that
@@ -159,7 +156,7 @@ pub fn run(mut job: ScreenJob) -> Result<&'static str, ScreenError> {
     result
 }
 
-fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
+fn capture_loop(job: &mut ScreenJob) -> Result<(), ScreenError> {
     let mut pacer = FramePacer::new(job.fps);
 
     job.sink.open_segment()?;
@@ -192,7 +189,7 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
                 job.elapsed.set(banked);
 
                 if job.control.wait_while_paused() == RunState::Stopped {
-                    return Ok(job.sink.encoder_label());
+                    return Ok(());
                 }
 
                 job.sink.open_segment()?;
@@ -261,28 +258,8 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
         // Written `due` times rather than once: when capture falls behind,
         // repeating the last frame keeps playback at real-time speed instead
         // of letting it run fast.
-        let mut restarted = false;
         for _ in 0..due {
-            match job.sink.write(encoded)? {
-                WriteStatus::Ok => {}
-                WriteStatus::SegmentRestarted { encoder } => {
-                    let _ = job.notices.send(format!(
-                        "{}: encoder failed, continuing with {encoder}",
-                        job.label
-                    ));
-                    restarted = true;
-                    break;
-                }
-            }
-        }
-
-        if restarted {
-            // The dead segment's frames are gone. Restart pacing from now and
-            // do not bank the abandoned interval, or the reported duration
-            // would count footage that no longer exists.
-            pacer.restart();
-            seg_start = Instant::now();
-            continue;
+            job.sink.write(encoded)?;
         }
         pacer.advance(due);
     }
@@ -293,7 +270,7 @@ fn capture_loop(job: &mut ScreenJob) -> Result<&'static str, ScreenError> {
     job.sink.close_segment(owed)?;
     banked += in_segment;
     job.elapsed.set(banked);
-    Ok(job.sink.encoder_label())
+    Ok(())
 }
 
 /// Hand the sound since the last call to the encoder.
@@ -356,9 +333,6 @@ pub(crate) mod fakes {
         pub segments: Vec<u64>,
         pub pads: Vec<u64>,
         pub finished: bool,
-        /// Write number at which to simulate an encoder death, once.
-        pub fail_at: Option<u64>,
-        pub fell_back: bool,
     }
 
     #[derive(Clone, Default)]
@@ -376,21 +350,13 @@ pub(crate) mod fakes {
             Ok(())
         }
 
-        fn write(&mut self, _frame: &[u8]) -> Result<WriteStatus, SinkError> {
+        fn write(&mut self, _frame: &[u8]) -> Result<(), SinkError> {
             let mut log = self.log();
             log.frames += 1;
-            if let Some(at) = log.fail_at
-                && log.frames >= at
-            {
-                log.fail_at = None;
-                log.fell_back = true;
-                log.segments.push(0);
-                return Ok(WriteStatus::SegmentRestarted { encoder: "CPU" });
-            }
             if let Some(current) = log.segments.last_mut() {
                 *current += 1;
             }
-            Ok(WriteStatus::Ok)
+            Ok(())
         }
 
         fn close_segment(&mut self, pad: u64) -> Result<(), SinkError> {
@@ -407,10 +373,6 @@ pub(crate) mod fakes {
             self.log().finished = true;
             Ok(())
         }
-
-        fn encoder_label(&self) -> &'static str {
-            "fake"
-        }
     }
 }
 
@@ -418,11 +380,9 @@ pub(crate) mod fakes {
 mod tests {
     use super::fakes::*;
     use super::*;
-    use crossbeam_channel::unbounded;
 
     fn job(sink: FakeSink, fps: u32, control: Arc<Control>) -> (ScreenJob, Arc<Elapsed>) {
         let elapsed = Arc::new(Elapsed::default());
-        let (notices, _rx) = unbounded();
         (
             ScreenJob {
                 source: Box::new(FakeSource::new(64, 48)),
@@ -431,8 +391,6 @@ mod tests {
                 control,
                 sync: Arc::new(SyncClock::new(1)),
                 elapsed: Arc::clone(&elapsed),
-                label: "Screen 1".into(),
-                notices,
                 compositor: None,
                 events: None,
                 pointer: Arc::new(|| Point::new(0, 0)),
@@ -537,52 +495,6 @@ mod tests {
 
         let log = sink.log();
         assert_eq!(log.pads.len(), 2, "each segment close must offer a pad");
-    }
-
-    #[test]
-    fn an_encoder_failure_restarts_the_segment_and_keeps_recording() {
-        let sink = FakeSink::default();
-        sink.log().fail_at = Some(5);
-        let control = Arc::new(Control::new());
-        let (j, _) = job(sink.clone(), 30, Arc::clone(&control));
-
-        let c = Arc::clone(&control);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
-            c.stop();
-        });
-        run(j).unwrap();
-
-        let log = sink.log();
-        assert!(log.fell_back, "the failure should have been exercised");
-        assert_eq!(log.segments.len(), 2, "a fresh segment should have opened");
-        assert!(
-            log.segments[1] > 0,
-            "recording must continue after the fallback"
-        );
-    }
-
-    #[test]
-    fn an_abandoned_segment_does_not_inflate_the_duration() {
-        let sink = FakeSink::default();
-        sink.log().fail_at = Some(3);
-        let control = Arc::new(Control::new());
-        let (j, elapsed) = job(sink.clone(), 30, Arc::clone(&control));
-
-        let c = Arc::clone(&control);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
-            c.stop();
-        });
-        let start = Instant::now();
-        run(j).unwrap();
-        let wall = start.elapsed();
-
-        assert!(
-            elapsed.get() <= wall,
-            "reported {:?} for {wall:?} of wall time",
-            elapsed.get()
-        );
     }
 
     #[test]

@@ -12,7 +12,6 @@ pub mod decoder;
 pub mod display;
 pub mod encoder;
 pub mod input;
-pub mod install;
 pub mod ocr;
 pub mod shell;
 pub mod speaker;

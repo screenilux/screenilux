@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use screenilux_core::ports::{SinkError, VideoSink, WriteStatus};
+use screenilux_core::ports::{SinkError, VideoSink};
 use windows_capture::encoder::{
     AudioSettingsBuilder, AudioSettingsSubType, ContainerSettingsBuilder, VideoEncoder,
     VideoSettingsBuilder, VideoSettingsSubType,
@@ -135,7 +135,7 @@ impl VideoSink for NativeSink {
         Ok(())
     }
 
-    fn write(&mut self, frame: &[u8]) -> Result<WriteStatus, SinkError> {
+    fn write(&mut self, frame: &[u8]) -> Result<(), SinkError> {
         let expected = self.width as usize * self.height as usize * 4;
         if frame.len() != expected {
             return Err(SinkError::EncoderDied(format!(
@@ -146,8 +146,7 @@ impl VideoSink for NativeSink {
         self.flip_into_scratch(frame);
         self.send_current()?;
         self.has_frame = true;
-        // Nothing to fall back to: this *is* the platform encoder.
-        Ok(WriteStatus::Ok)
+        Ok(())
     }
 
     /// Top up the owed frames, but keep the encoder open: a pause is not a
@@ -193,10 +192,6 @@ impl VideoSink for NativeSink {
         };
         enc.send_audio_buffer(pcm, 0)
             .map_err(|e| SinkError::EncoderDied(format!("audio: {e}")))
-    }
-
-    fn encoder_label(&self) -> &'static str {
-        ENCODER_LABEL
     }
 }
 
@@ -280,7 +275,7 @@ mod tests {
         let mut sink = NativeSink::new(w, h, fps, false, temp("basic-scratch")).unwrap();
         sink.open_segment().unwrap();
         for i in 0..60 {
-            assert_eq!(sink.write(&frame(w, h, i as u8)).unwrap(), WriteStatus::Ok);
+            sink.write(&frame(w, h, i as u8)).unwrap();
         }
         sink.close_segment(0).unwrap();
         sink.finish(&dest).unwrap();

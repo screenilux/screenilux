@@ -168,10 +168,6 @@ impl SyncClock {
         drop(state);
         self.cv.notify_all();
     }
-
-    pub fn is_aborted(&self) -> bool {
-        self.state.lock().expect("sync clock poisoned").aborted
-    }
 }
 
 impl std::fmt::Debug for SyncClock {
