@@ -1,0 +1,22 @@
+[package]
+name = "screenilux-share"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Uploads a finished recording and gives back a link to watch it in a browser."
+
+[dependencies]
+screenilux-core = { path = "../core" }
+base64 = "0.23.1"
+getrandom = "0.4.3"
+humantime = "2.4.0"
+rusty-s3 = "0.10.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+ureq = { version = "3.4.2", features = ["json"] }
+url = "2.5.8"
+zip = { version = "9.2.0", default-features = false }

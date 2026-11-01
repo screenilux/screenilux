@@ -1,16 +1,18 @@
 //! The main window: the Record tab, the recording bar, and the header both
 //! tabs share.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use screenilux_recorder::{Session, SessionConfig};
+use screenilux_share::{State as ShareState, Upload};
 
 use crate::overlay::Overlay;
 use crate::player_view::{PlayerView, dropped_path, friendly_name, playable};
 use crate::previews::Previews;
+use crate::sharing::{self, Mode, Sharing};
 use crate::sizing::{Fit, Sizer};
 use crate::state::{FPS_CHOICES, Phase, Probes, Runtime, Settings};
 use crate::theme::{self, ON_DARK, icon};
@@ -37,6 +39,14 @@ pub struct App {
     overlay: Option<Overlay>,
     status: String,
     last_save: Option<PathBuf>,
+    /// Where finished recordings are shared to.
+    sharing: Sharing,
+    /// The last recording's upload, if it is being shared.
+    upload: Option<Upload>,
+    /// Its link has been put on the clipboard.
+    link_copied: bool,
+    /// Why the last recording could not be shared, if it could not start.
+    share_error: Option<String>,
     started_at: Option<Instant>,
     /// "More options" is open.
     more: bool,
@@ -87,6 +97,10 @@ impl App {
             overlay: None,
             status: String::new(),
             last_save: None,
+            sharing: Sharing::load(),
+            upload: None,
+            link_copied: false,
+            share_error: None,
             started_at: None,
             more: false,
             hwnd,
@@ -197,6 +211,7 @@ impl App {
         match session.finish(&outdir) {
             Ok(path) => {
                 self.status.clear();
+                self.share(&path);
                 self.last_save = Some(path);
                 self.player.recordings_changed();
             }
@@ -204,6 +219,22 @@ impl App {
         }
         self.phase = Phase::Idle;
         self.started_at = None;
+    }
+
+    /// Upload a recording just saved, if sharing is set up. The link is
+    /// copied as soon as it exists, before the upload finishes: the page it
+    /// opens waits for the rest.
+    fn share(&mut self, path: &Path) {
+        self.upload = None;
+        self.link_copied = false;
+        self.share_error = None;
+        let Some(destination) = self.sharing.destination() else {
+            return;
+        };
+        match sharing::contents(path) {
+            Ok(contents) => self.upload = Some(Upload::start(destination, contents)),
+            Err(e) => self.share_error = Some(e),
+        }
     }
 
     /// Re-read the displays once they have settled after a change. Not
@@ -735,6 +766,122 @@ impl App {
                 }
             });
         });
+        ui.add_enabled_ui(!self.busy(), |ui| self.sharing_options(ui));
+    }
+
+    /// How sharing the last recording is going, and its link.
+    fn share_status(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = theme::palette(ui);
+        if let Some(e) = &self.share_error {
+            theme::notice(ui, format!("Could not share it: {e}"));
+            return;
+        }
+        let Some(progress) = self.upload.as_ref().map(Upload::progress) else {
+            return;
+        };
+        let line = match &progress.state {
+            ShareState::Starting => "Getting a link…".to_string(),
+            ShareState::Uploading => {
+                let done = (progress.uploaded * 100)
+                    .checked_div(progress.total)
+                    .unwrap_or(0);
+                format!("Link copied. Uploading, {done}%")
+            }
+            ShareState::Ready => "Link copied. Ready to watch".to_string(),
+            ShareState::Failed(e) => {
+                theme::notice(ui, format!("Could not share it: {e}"));
+                return;
+            }
+        };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(line).size(13.0).color(p.weak));
+            if let Some(link) = progress.link {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.link("Open").clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(&link));
+                    }
+                    if ui.link("Copy link").clicked() {
+                        ctx.copy_text(link);
+                    }
+                });
+            }
+        });
+    }
+
+    /// Where finished recordings are shared, in More options.
+    fn sharing_options(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        let before = self.sharing.clone();
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label("Share a link when you stop");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let modes = [Mode::Off, Mode::Screenilux, Mode::Bucket];
+                let chosen = modes
+                    .iter()
+                    .position(|&m| m == self.sharing.mode)
+                    .unwrap_or(0);
+                if let Some(i) = theme::segmented(ui, &["Off", "Screenilux", "My bucket"], chosen) {
+                    self.sharing.mode = modes[i];
+                }
+            });
+        });
+        let field =
+            |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, secret: bool| {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(label).size(12.0).color(p.weak));
+                ui.add(
+                    egui::TextEdit::singleline(value)
+                        .hint_text(hint)
+                        .password(secret)
+                        .desired_width(f32::INFINITY),
+                );
+            };
+        match self.sharing.mode {
+            Mode::Off => {}
+            Mode::Screenilux => {
+                field(
+                    ui,
+                    "Upload key",
+                    &mut self.sharing.key,
+                    "Paste your upload key",
+                    true,
+                );
+                theme::hint(ui, "Links last 7 days. Anyone with the link can watch.");
+            }
+            Mode::Bucket => {
+                let b = &mut self.sharing.bucket;
+                field(
+                    ui,
+                    "S3 address",
+                    &mut b.endpoint,
+                    "https://<account>.r2.cloudflarestorage.com",
+                    false,
+                );
+                field(ui, "Bucket", &mut b.bucket, "recordings", false);
+                field(ui, "Region", &mut b.region, "auto", false);
+                field(ui, "Access key ID", &mut b.access_key, "", false);
+                field(ui, "Secret access key", &mut b.secret_key, "", true);
+                field(
+                    ui,
+                    "Public address",
+                    &mut b.public_url,
+                    "https://pub-….r2.dev",
+                    false,
+                );
+                field(ui, "Folder", &mut b.folder, "screenilux", false);
+                ui.add_space(4.0);
+                theme::hint(
+                    ui,
+                    "Any S3-compatible storage: Cloudflare R2, Amazon S3, Backblaze B2, \
+                     Wasabi. Anyone must be able to read its files at the public address, \
+                     and it must let the Screenilux site read them (CORS).",
+                );
+            }
+        }
+        if self.sharing != before {
+            self.sharing.save();
+        }
     }
 
     /// The bottom of the Record tab: the main button, and what happened last.
@@ -766,6 +913,7 @@ impl App {
                             }
                         });
                     });
+                    self.share_status(ui, ctx);
                 } else {
                     let line = if self.status.is_empty() {
                         "Saved to Videos\\ScreenRec when you stop".to_string()
@@ -1096,6 +1244,12 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.probes.poll();
         self.follow_displays(&ctx);
+        if !self.link_copied
+            && let Some(link) = self.upload.as_ref().and_then(|u| u.progress().link)
+        {
+            ctx.copy_text(link);
+            self.link_copied = true;
+        }
         let areas: Vec<_> = self.settings.monitors.iter().map(|m| m.bounds).collect();
         let watching = self.tab == Tab::Record && !self.compact && self.phase == Phase::Idle;
         self.previews.update(&ctx, &areas, watching);

@@ -57,7 +57,7 @@ jobs:
       # encoder, decoder and player tests need the real thing and run
       # locally with `cargo test --workspace`.
       - name: Tests that need no screen or GPU
-        run: cargo test --locked -p screenilux-core -p screenilux-recorder -p screenilux
+        run: cargo test --locked -p screenilux-core -p screenilux-recorder -p screenilux-share -p screenilux
 
       - name: Every other test still compiles
         run: cargo test --workspace --locked --no-run
@@ -85,6 +85,27 @@ jobs:
       # capture, thumbnails, the input hook, encoding, decoding, text.
       - name: Tests on a virtual display
         run: xvfb-run -a -s "-screen 0 1920x1080x24" cargo test --workspace --locked
+
+  check-web:
+    name: Check and build (web player)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+      - name: Types
+        run: npm run check
+      - name: Build
+        run: npm run build
 
   build-windows:
     name: Build (Windows)

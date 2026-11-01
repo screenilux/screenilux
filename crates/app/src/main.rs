@@ -8,6 +8,7 @@ mod icon;
 mod overlay;
 mod player_view;
 mod previews;
+mod sharing;
 mod sizing;
 mod state;
 mod theme;

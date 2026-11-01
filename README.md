@@ -72,6 +72,8 @@ no watermark.
 - **Pause whenever you like.** The paused time is left out of the video.
 - **New screens are found by themselves.** Plug a screen in or unplug one and
   the list updates.
+- **A link the moment you stop.** Turn on sharing and the link is on your
+  clipboard as soon as you stop. See [Sharing a link](#sharing-a-link).
 
 ## Playing
 
@@ -91,6 +93,28 @@ no watermark.
   <img src="docs/full-screen.png" alt="Full screen, with the controls floating over a two-screen recording" width="900">
 </p>
 
+## Sharing a link
+
+Turn on **Share a link when you stop** under **More options**. When you stop
+recording, Screenilux uploads the recording and copies a link to it. Anyone
+can open the link in a browser and watch every screen play in step, with no
+account and nothing to install.
+
+You can send the link straight away. Until the upload finishes, the page
+shows how far along it is, then starts playing by itself.
+
+Choose where recordings go:
+
+- **Screenilux.** Links last 7 days. This needs an upload key, which is not
+  open to everyone yet.
+- **My bucket.** Your own storage: Cloudflare R2, Amazon S3, Backblaze B2,
+  Wasabi or any other S3-compatible service. Recordings stay until you delete
+  them, and your keys never leave your computer.
+  [Setting up your own storage](docs/own-storage.md) takes about five minutes.
+
+Recordings still open only in the Screenilux app on your computer; the
+browser page is for the people you send the link to.
+
 ## How it compares
 
 Tools like Loom are built for sending a quick video as a link. Screenilux is
@@ -103,15 +127,15 @@ getting the most out of it afterwards.
 | Length of a recording | No limit | 5 minutes on the free plan |
 | Number of recordings | No limit | 25 per person on the free plan |
 | Account | None | Required |
-| Where recordings are kept | On your computer | On Loom's servers |
+| Share a link | Yes, from Screenilux or your own storage | Yes |
+| Where recordings are kept | On your computer. Shared ones also in your own storage, or on Screenilux for 7 days | On Loom's servers |
 | Price | Free and open source | Free plan with limits, or a monthly fee per person |
 
 Screenilux also reads the text on screen, on your computer and without
 internet, so you can copy it from a paused video or search a recording for a
 word.
 
-Loom is ahead in sharing: an instant link, comments and reactions, and apps
-for Mac and phones. A share link for Screenilux is next on the list.
+Loom is ahead in comments, reactions, editing, and apps for Mac and phones.
 
 <sub>Loom's limits are from its help pages and plan listings in November 2026.</sub>
 
@@ -159,12 +183,6 @@ together as one `.screenilux` file, which opens in Screenilux.
 - On Linux, the recording bar and the camera preview show in the recording,
   because X11 has no way to hide a window from capture. Turn off **Shrink to a
   bar while recording** to keep the bar out of the way.
-
-## Coming next
-
-- **Share a link in seconds.** Stop recording and get a link that anyone can
-  open in their browser to watch. Keeping recordings only on your computer
-  will stay an option.
 
 ## Building it yourself
 
