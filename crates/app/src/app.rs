@@ -71,6 +71,9 @@ pub struct App {
 /// the final state once.
 const DISPLAY_SETTLE: Duration = Duration::from_millis(400);
 
+/// The smallest the player window can be made before its controls overlap.
+const PLAYER_MIN_SIZE: egui::Vec2 = egui::vec2(640.0, 420.0);
+
 /// The recording bar's opacity when the pointer is elsewhere: there, but out
 /// of the way of what is being recorded behind it.
 const BAR_ALPHA: u8 = 190;
@@ -905,7 +908,7 @@ impl App {
             .with_title(title)
             .with_icon(Arc::clone(&self.player_icon))
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size(crate::sizing::MIN_SIZE)
+            .with_min_inner_size(PLAYER_MIN_SIZE)
             .with_maximized(true);
         let out_dir = self.settings.out_dir.clone();
         let mut closed = false;
@@ -945,19 +948,18 @@ impl App {
         let p = theme::palette(ui);
         let before = self.sharing.clone();
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("Share a link when you stop");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let modes = [Mode::Off, Mode::Screenilux, Mode::Bucket];
-                let chosen = modes
-                    .iter()
-                    .position(|&m| m == self.sharing.mode)
-                    .unwrap_or(0);
-                if let Some(i) = theme::segmented(ui, &["Off", "Screenilux", "My bucket"], chosen) {
-                    self.sharing.mode = modes[i];
-                }
-            });
-        });
+        // The label above the choice, not beside it: the column is too
+        // narrow for both on one line.
+        ui.label("Share a link when you stop");
+        ui.add_space(2.0);
+        let modes = [Mode::Off, Mode::Screenilux, Mode::Bucket];
+        let chosen = modes
+            .iter()
+            .position(|&m| m == self.sharing.mode)
+            .unwrap_or(0);
+        if let Some(i) = theme::segmented(ui, &["Off", "Screenilux", "My bucket"], chosen) {
+            self.sharing.mode = modes[i];
+        }
         let field =
             |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, secret: bool| {
                 ui.add_space(6.0);

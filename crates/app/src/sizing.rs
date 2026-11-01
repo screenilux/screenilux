@@ -16,9 +16,10 @@ use eframe::egui;
 /// width of a compact launcher.
 pub const RECORD_WIDTH: f32 = 420.0;
 
-/// The smallest the window can be made, other than as the bar. Below this the
-/// Record tab's rows start to wrap and the Play tab's controls overlap.
-pub const MIN_SIZE: egui::Vec2 = egui::vec2(400.0, 520.0);
+/// The smallest the window can be made, other than as the bar. Narrower and
+/// the column's rows start to wrap; it can be short, for a short page such as
+/// Settings, since it fits itself to what it shows.
+pub const MIN_SIZE: egui::Vec2 = egui::vec2(400.0, 320.0);
 
 /// The recording bar: stop, the clock, pause and expand in a row.
 pub const BAR_SIZE: egui::Vec2 = egui::vec2(268.0, 56.0);
