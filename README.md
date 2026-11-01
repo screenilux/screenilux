@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
-    <img src="docs/logo.svg" alt="Screenilux logo" width="88">
+    <img src="docs/logo.svg" alt="Screenilux logo: two screens joined by a recording dot" width="112">
   </picture>
 </p>
 
