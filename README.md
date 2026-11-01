@@ -5,9 +5,6 @@ in them.
 
 <img src="docs/record.png" alt="Screenilux, ready to record two screens with the camera and microphone on" width="360">
 
-*This is the new look, which is on its way. The current download still has the
-earlier design.*
-
 ## Recording
 
 - **One screen or several at once.** Each screen gets its own video, and they
