@@ -31,8 +31,13 @@ in them.
   select and copy them.
 - **Search inside recordings.** Choose *Make text searchable*, then search for
   a word and jump to each place it appeared.
+- **Full screen.** Press F or double-click the picture: the recording fills
+  the screen and the controls float over it, out of the way while it plays.
+  Esc brings the window back.
 - **Open recordings your way:** double-click one, drop it on the window, or
   use *Open*.
+
+![Full screen, with the controls floating over a two-screen recording](docs/full-screen.png)
 
 ## How it differs from Loom
 
