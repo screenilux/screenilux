@@ -3,7 +3,10 @@
 Record your screens on Windows, then play them back and copy any text you see
 in them.
 
-![Screenilux, ready to record two screens](docs/record.png)
+<img src="docs/record.png" alt="Screenilux, ready to record two screens with the camera and microphone on" width="360">
+
+*This is the new look, which is on its way. The current download still has the
+earlier design.*
 
 ## Recording
 
@@ -21,7 +24,7 @@ in them.
 
 ## Playing
 
-![A two-screen recording playing side by side, with a title selected](docs/play.png)
+![A two-screen recording playing side by side, with a search for a word on the right](docs/play.png)
 
 - **Every screen plays together:** one at a time following the pointer, side
   by side, or stacked.
