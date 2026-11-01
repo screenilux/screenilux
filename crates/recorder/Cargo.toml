@@ -9,7 +9,7 @@ description = "Recording orchestration for Screenilux: per-screen threads, share
 
 [dependencies]
 screenilux-core = { path = "../core" }
-screenilux-win = { path = "../win" }
+screenilux-platform = { path = "../platform" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crossbeam-channel = { workspace = true }

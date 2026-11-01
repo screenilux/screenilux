@@ -1,0 +1,19 @@
+[package]
+name = "screenilux-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Linux adapters for Screenilux: X11 capture and input, GStreamer media, Tesseract text."
+
+[target.'cfg(target_os = "linux")'.dependencies]
+screenilux-core = { path = "../core" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+crossbeam-channel = { workspace = true }
+gstreamer = "0.24"
+gstreamer-app = "0.24"
+gstreamer-pbutils = "0.24"
+x11rb = { version = "0.13", features = ["randr", "xinput"] }
+libc = "0.2"

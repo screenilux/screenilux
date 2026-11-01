@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Screen recorder for Windows."
+description = "Screen recorder for Windows and Linux."
 
 [[bin]]
 name = "screenilux"
@@ -15,7 +15,7 @@ path = "src/main.rs"
 screenilux-core = { path = "../core" }
 screenilux-player = { path = "../player" }
 screenilux-recorder = { path = "../recorder" }
-screenilux-win = { path = "../win" }
+screenilux-platform = { path = "../platform" }
 eframe = "0.37"
 egui = "0.37"
 raw-window-handle = "0.6"

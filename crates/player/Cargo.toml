@@ -10,7 +10,7 @@ description = "Playback for Screenilux: per-screen decode threads on one clock, 
 [dependencies]
 screenilux-core = { path = "../core" }
 screenilux-recorder = { path = "../recorder" }
-screenilux-win = { path = "../win" }
+screenilux-platform = { path = "../platform" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crossbeam-channel = { workspace = true }

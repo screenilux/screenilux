@@ -17,6 +17,7 @@ use eframe::egui::{
 
 /// Glyphs from Segoe Fluent Icons (Windows 11), which keeps the codepoints of
 /// Segoe MDL2 Assets (Windows 10), so either font serves.
+#[cfg(windows)]
 pub mod icon {
     pub const PLAY: &str = "\u{E768}";
     pub const PAUSE: &str = "\u{E769}";
@@ -35,6 +36,28 @@ pub mod icon {
     pub const FULL_SCREEN: &str = "\u{E740}";
     pub const LEAVE_FULL_SCREEN: &str = "\u{E73F}";
     pub const CHECK: &str = "\u{E73E}";
+}
+
+/// The same icons as symbols in egui's own fonts, which every system has.
+#[cfg(not(windows))]
+pub mod icon {
+    pub const PLAY: &str = "\u{25B6}";
+    pub const PAUSE: &str = "\u{23F8}";
+    pub const FOLDER: &str = "\u{1F4C2}";
+    pub const EXPAND: &str = "\u{26F6}";
+    pub const SEARCH: &str = "\u{1F50D}";
+    pub const CAMERA: &str = "\u{1F4F7}";
+    pub const MIC: &str = "\u{1F3A4}";
+    pub const SPEAKER: &str = "\u{1F50A}";
+    pub const WARNING: &str = "\u{26A0}";
+    pub const REFRESH: &str = "\u{1F504}";
+    pub const MONITOR: &str = "\u{1F5B5}";
+    pub const TEXT: &str = "\u{1F5DB}";
+    pub const CHEVRON_DOWN: &str = "\u{23F7}";
+    pub const CHEVRON_UP: &str = "\u{23F6}";
+    pub const FULL_SCREEN: &str = "\u{26F6}";
+    pub const LEAVE_FULL_SCREEN: &str = "\u{1F5D7}";
+    pub const CHECK: &str = "\u{2714}";
 }
 
 /// The named colours. Two sets, picked by the system theme.
@@ -149,18 +172,15 @@ pub fn install(ctx: &egui::Context) {
     }
 }
 
-/// Segoe UI throughout, falling back to egui's own fonts on a machine
-/// without it. Read from the Windows fonts folder rather than bundled, so the
-/// executable stays small and the app reads as part of Windows.
+/// The system's own interface font, so the app reads as part of it: Segoe UI
+/// on Windows, Noto Sans or DejaVu Sans on Linux. Read from the system's
+/// fonts rather than bundled, so the program stays small, and falling back to
+/// egui's own fonts where none is found.
 fn fonts() -> FontDefinitions {
     let mut defs = FontDefinitions::default();
-    let dir = std::env::var_os("WINDIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "C:\\Windows".into())
-        .join("Fonts");
-    let mut load = |name: &str, files: &[&str]| -> bool {
+    let mut load = |name: &str, files: &[std::path::PathBuf]| -> bool {
         for f in files {
-            if let Ok(bytes) = std::fs::read(dir.join(f)) {
+            if let Ok(bytes) = std::fs::read(f) {
                 defs.font_data
                     .insert(name.to_string(), Arc::new(FontData::from_owned(bytes)));
                 return true;
@@ -168,16 +188,23 @@ fn fonts() -> FontDefinitions {
         }
         false
     };
-    let regular = load("segoe", &["segoeui.ttf"]);
-    let semibold = load("segoe-semibold", &["seguisb.ttf", "segoeuib.ttf"]);
-    let heavy = load("segoe-bold", &["segoeuib.ttf", "seguisb.ttf"]);
-    let icons = load("icons", &["SegoeIcons.ttf", "segmdl2.ttf"]);
+    let faces = system_fonts();
+    let regular = load("ui", &faces.regular);
+    let semibold = load("ui-semibold", &faces.semibold);
+    let heavy = load("ui-bold", &faces.bold);
+    let icons = load("icons", &faces.icons);
 
-    let fallback = defs
+    let mut fallback = defs
         .families
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
+    // Without a system icon font the icons come from egui's own fonts. Its
+    // icon font draws them as interface symbols, where its emoji font draws
+    // some, such as the microphone, as an empty box; so the icon font first.
+    if !icons {
+        fallback.sort_by_key(|name| !name.contains("emoji-icon-font"));
+    }
     let family = |first: Option<&str>| -> Vec<String> {
         let mut v: Vec<String> = first.map(str::to_string).into_iter().collect();
         if icons {
@@ -186,13 +213,66 @@ fn fonts() -> FontDefinitions {
         v.extend(fallback.iter().cloned());
         v
     };
-    let body = regular.then_some("segoe");
+    let body = regular.then_some("ui");
     defs.families.insert(FontFamily::Proportional, family(body));
-    let semi = semibold.then_some("segoe-semibold").or(body);
+    let semi = semibold.then_some("ui-semibold").or(body);
     defs.families.insert(strong(), family(semi));
     defs.families
-        .insert(bold(), family(heavy.then_some("segoe-bold").or(semi)));
+        .insert(bold(), family(heavy.then_some("ui-bold").or(semi)));
     defs
+}
+
+/// Where to look for each weight of the interface font, best first.
+struct Faces {
+    regular: Vec<std::path::PathBuf>,
+    semibold: Vec<std::path::PathBuf>,
+    bold: Vec<std::path::PathBuf>,
+    icons: Vec<std::path::PathBuf>,
+}
+
+#[cfg(windows)]
+fn system_fonts() -> Faces {
+    let dir = std::env::var_os("WINDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "C:\\Windows".into())
+        .join("Fonts");
+    let at = |files: &[&str]| files.iter().map(|f| dir.join(f)).collect();
+    Faces {
+        regular: at(&["segoeui.ttf"]),
+        semibold: at(&["seguisb.ttf", "segoeuib.ttf"]),
+        bold: at(&["segoeuib.ttf", "seguisb.ttf"]),
+        icons: at(&["SegoeIcons.ttf", "segmdl2.ttf"]),
+    }
+}
+
+#[cfg(not(windows))]
+fn system_fonts() -> Faces {
+    // Debian and Ubuntu, then Fedora and Arch layouts.
+    let dirs = [
+        "/usr/share/fonts/truetype/noto",
+        "/usr/share/fonts/google-noto",
+        "/usr/share/fonts/noto",
+        "/usr/share/fonts/truetype/dejavu",
+        "/usr/share/fonts/dejavu-sans-fonts",
+        "/usr/share/fonts/TTF",
+    ];
+    let at = |files: &[&str]| {
+        files
+            .iter()
+            .flat_map(|f| dirs.iter().map(move |d| std::path::Path::new(d).join(f)))
+            .collect()
+    };
+    Faces {
+        regular: at(&["NotoSans-Regular.ttf", "DejaVuSans.ttf"]),
+        semibold: at(&[
+            "NotoSans-SemiBold.ttf",
+            "NotoSans-Medium.ttf",
+            "DejaVuSans-Bold.ttf",
+        ]),
+        bold: at(&["NotoSans-Bold.ttf", "DejaVuSans-Bold.ttf"]),
+        // egui's own fonts carry the symbols used as icons here.
+        icons: Vec::new(),
+    }
 }
 
 fn visuals(theme: Theme, p: Palette) -> Visuals {
@@ -438,13 +518,19 @@ pub fn source_row(
         painter.rect_filled(rect, CornerRadius::same(16), fill);
         let badge = egui::pos2(rect.left() + 32.0, rect.center().y);
         painter.circle_filled(badge, 18.0, if on { p.stroke } else { p.base });
-        painter.text(
-            badge,
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            FontId::proportional(16.0),
-            if on { p.action } else { p.weak },
-        );
+        let ink = if on { p.action } else { p.weak };
+        if glyph == icon::MIC && !cfg!(windows) {
+            // egui's fonts draw the microphone as an empty box, so it is drawn.
+            paint_microphone(painter, badge, ink);
+        } else {
+            painter.text(
+                badge,
+                egui::Align2::CENTER_CENTER,
+                glyph,
+                FontId::proportional(16.0),
+                ink,
+            );
+        }
         painter.text(
             egui::pos2(rect.left() + 62.0, rect.center().y - 9.0),
             egui::Align2::LEFT_CENTER,
@@ -475,6 +561,31 @@ pub fn source_row(
         focus_ring(ui, &response, rect, 18);
     }
     response
+}
+
+/// A microphone in outline, about the size of a 16px icon: a capsule, the
+/// cradle around its lower half, and a stand.
+fn paint_microphone(painter: &egui::Painter, centre: egui::Pos2, ink: Color32) {
+    let stroke = Stroke::new(1.5, ink);
+    let capsule =
+        egui::Rect::from_center_size(centre - egui::vec2(0.0, 2.5), egui::vec2(6.0, 10.0));
+    painter.rect_stroke(
+        capsule,
+        CornerRadius::same(3),
+        stroke,
+        egui::StrokeKind::Middle,
+    );
+    let cradle: Vec<egui::Pos2> = (0..=12)
+        .map(|i| {
+            let a = std::f32::consts::PI * i as f32 / 12.0;
+            centre + egui::vec2(-5.5 * a.cos(), 0.5 + 5.0 * a.sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(cradle, stroke));
+    painter.line_segment(
+        [centre + egui::vec2(0.0, 5.5), centre + egui::vec2(0.0, 8.0)],
+        stroke,
+    );
 }
 
 /// A row of choices in a tinted track, the chosen one lifted onto the ground

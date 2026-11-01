@@ -16,9 +16,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use screenilux_core::session::Manifest;
+use screenilux_platform::{display, set_dpi_awareness};
 use screenilux_recorder::paths::TempDir;
 use screenilux_recorder::{Session, SessionConfig};
-use screenilux_win::{display, set_dpi_awareness};
 
 /// Duration of a finished file, straight from ffprobe.
 fn duration_of(ffmpeg: &Path, file: &Path) -> f64 {
@@ -78,10 +78,9 @@ fn fixture() -> Option<Fixture> {
 }
 
 fn which_ffprobe() -> Option<std::path::PathBuf> {
-    std::env::var_os("PATH")?
-        .to_string_lossy()
-        .split(';')
-        .map(|d| std::path::PathBuf::from(d).join("ffprobe.exe"))
+    let name = format!("ffprobe{}", std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join(&name))
         .find(|p| p.is_file())
 }
 
@@ -289,7 +288,7 @@ fn video_duration_of(ffmpeg: &Path, file: &Path) -> f64 {
 #[ignore = "records the real screen and microphone for several seconds"]
 fn a_pause_does_not_leak_microphone_audio() {
     let Some(f) = fixture() else { return };
-    if !screenilux_win::has_microphone() {
+    if !screenilux_platform::has_microphone() {
         eprintln!("no microphone; skipping the audio check");
         return;
     }
@@ -342,7 +341,8 @@ fn two_recordings_in_the_same_second_do_not_overwrite_each_other() {
 
 /// Loudness of the decoded sound in each tenth of a second.
 fn loudness_by_tenth(file: &Path) -> Vec<f64> {
-    let mut decoder = screenilux_win::AudioDecoder::open(file).expect("the file should have sound");
+    let mut decoder =
+        screenilux_platform::AudioDecoder::open(file).expect("the file should have sound");
     let mut samples: Vec<i16> = Vec::new();
     while let Some((_, pcm)) = decoder.next_chunk().expect("sound should decode") {
         samples.extend(
@@ -363,7 +363,7 @@ fn loudness_by_tenth(file: &Path) -> Vec<f64> {
 #[ignore = "records the real screen and plays a short tone through the speakers"]
 fn system_sound_lands_in_the_recording_at_the_right_time() {
     let Some(f) = fixture() else { return };
-    if !screenilux_win::has_system_sound() {
+    if !screenilux_platform::has_system_sound() {
         return;
     }
     let Ok(all) = display::monitors() else { return };
@@ -377,8 +377,8 @@ fn system_sound_lands_in_the_recording_at_the_right_time() {
     // not Send, so it lives on its own thread.
     let tone = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(1500));
-        let mut speaker = screenilux_win::Speaker::open().expect("speakers");
-        let rate = screenilux_win::decoder::PLAYBACK_RATE as f64;
+        let mut speaker = screenilux_platform::Speaker::open().expect("speakers");
+        let rate = screenilux_platform::decoder::PLAYBACK_RATE as f64;
         let pcm: Vec<u8> = (0..rate as usize)
             .flat_map(|i| {
                 let s = ((i as f64 * 880.0 * std::f64::consts::TAU / rate).sin() * 4_000.0) as i16;

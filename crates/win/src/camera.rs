@@ -1,12 +1,9 @@
 //! Webcam capture via nokhwa (Media Foundation).
 //!
-//! Frames are pulled on a dedicated thread and published as the latest value
-//! rather than queued: the camera runs at its own pace, every screen's
-//! compositor reads the same frame, and a stale frame is worse than a repeated
-//! one.
+//! Frames are pulled on a dedicated thread into a [`CameraFeed`], which the
+//! recorder and the bubble read.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use nokhwa::pixel_format::RgbAFormat;
@@ -15,8 +12,8 @@ use nokhwa::utils::{
     Resolution,
 };
 use nokhwa::{Camera, query};
+pub use screenilux_core::camera::CameraFeed;
 use screenilux_core::geometry::Rect;
-use screenilux_core::ports::{CameraFrame, CameraSource};
 
 /// Device names in the order they are indexed.
 pub fn cameras() -> Vec<String> {
@@ -73,23 +70,6 @@ fn open(index: CameraIndex) -> Result<Camera, String> {
     Err(last)
 }
 
-#[derive(Debug, Default)]
-struct Position {
-    left: i32,
-    top: i32,
-    width: u32,
-    height: u32,
-}
-
-/// A running webcam feed plus the bubble's position on the desktop.
-pub struct CameraFeed {
-    latest: RwLock<Option<Arc<CameraFrame>>>,
-    position: Mutex<Position>,
-    error: Mutex<Option<String>>,
-    seq: AtomicU64,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-}
-
 /// Handle that keeps the capture thread alive.
 pub struct CameraHandle {
     feed: Arc<CameraFeed>,
@@ -103,18 +83,7 @@ impl CameraHandle {
     /// later. Failures surface through [`CameraSource::error`] rather than
     /// here, so a missing camera never blocks starting a recording.
     pub fn start(index: u32, bubble: Rect) -> Self {
-        let feed = Arc::new(CameraFeed {
-            latest: RwLock::new(None),
-            position: Mutex::new(Position {
-                left: bubble.left,
-                top: bubble.top,
-                width: bubble.width,
-                height: bubble.height,
-            }),
-            error: Mutex::new(None),
-            seq: AtomicU64::new(0),
-            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        });
+        let feed = Arc::new(CameraFeed::new(bubble));
 
         let worker = Arc::clone(&feed);
         let thread = std::thread::Builder::new()
@@ -131,14 +100,11 @@ impl CameraHandle {
 
     /// Move the bubble. Called while dragging, so it must be cheap.
     pub fn move_to(&self, left: i32, top: i32) {
-        if let Ok(mut p) = self.feed.position.lock() {
-            p.left = left;
-            p.top = top;
-        }
+        self.feed.move_to(left, top);
     }
 
     pub fn stop(&mut self) {
-        self.feed.stop.store(true, Ordering::SeqCst);
+        self.feed.request_stop();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -156,18 +122,17 @@ fn pump(feed: Arc<CameraFeed>, index: u32) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "could not open the camera");
-            *feed.error.lock().expect("camera error poisoned") = Some(e);
+            feed.fail(e);
             return;
         }
     };
 
     if let Err(e) = cam.open_stream() {
-        *feed.error.lock().expect("camera error poisoned") =
-            Some(format!("could not start the camera stream: {e}"));
+        feed.fail(format!("could not start the camera stream: {e}"));
         return;
     }
 
-    while !feed.stop.load(Ordering::SeqCst) {
+    while !feed.stopping() {
         let Ok(raw) = cam.frame() else {
             // A dropped frame is routine; a dead device shows up as a stall,
             // which the UI sees as a frozen bubble rather than a crash.
@@ -186,38 +151,16 @@ fn pump(feed: Arc<CameraFeed>, index: u32) {
             px.swap(0, 2);
         }
 
-        let frame = Arc::new(CameraFrame {
-            pixels: rgba.into_raw(),
-            width,
-            height,
-            seq: feed.seq.fetch_add(1, Ordering::Relaxed),
-        });
-        if let Ok(mut slot) = feed.latest.write() {
-            *slot = Some(frame);
-        }
+        feed.publish(rgba.into_raw(), width, height);
     }
 
     let _ = cam.stop_stream();
 }
 
-impl CameraSource for CameraFeed {
-    fn latest(&self) -> Option<Arc<CameraFrame>> {
-        self.latest.read().ok()?.clone()
-    }
-
-    fn rect(&self) -> Rect {
-        let p = self.position.lock().expect("camera position poisoned");
-        Rect::new(p.left, p.top, p.width, p.height)
-    }
-
-    fn error(&self) -> Option<String> {
-        self.error.lock().expect("camera error poisoned").clone()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use screenilux_core::ports::{CameraFrame, CameraSource};
     use std::time::{Duration, Instant};
 
     fn wait_for_frame(feed: &CameraFeed, timeout: Duration) -> Option<Arc<CameraFrame>> {

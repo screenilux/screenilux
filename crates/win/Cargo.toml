@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Windows adapters for Screenilux: screen capture, pointer hook, camera, window affinity."
 
-[dependencies]
+[target.'cfg(windows)'.dependencies]
 screenilux-core = { path = "../core" }
 thiserror = { workspace = true }
 tracing = { workspace = true }

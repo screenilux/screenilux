@@ -18,8 +18,8 @@ use screenilux_core::ports::VideoSink;
 use screenilux_core::ports::{CameraSource, PointerEvent};
 use screenilux_core::session::{Focus, FocusEntry, Manifest, Role, Screen};
 use screenilux_core::timing::SyncClock;
-use screenilux_win::capture::ScreenCapture;
-use screenilux_win::encoder::{ENCODER_LABEL, NativeSink};
+use screenilux_platform::capture::ScreenCapture;
+use screenilux_platform::encoder::{ENCODER_LABEL, NativeSink};
 
 use crate::paths::{TempDir, unique_path};
 
@@ -204,7 +204,7 @@ impl Session {
                 elapsed: Arc::clone(&elapsed),
                 compositor,
                 events: Some(event_rx),
-                pointer: Arc::new(screenilux_win::cursor_pos),
+                pointer: Arc::new(screenilux_platform::cursor_pos),
                 camera: if config.camera_enabled() {
                     config.camera.clone()
                 } else {
@@ -212,10 +212,12 @@ impl Session {
                 },
                 sound: audio.then(|| {
                     Sound::new(
-                        config.microphone.then(screenilux_win::AudioCapture::start),
+                        config
+                            .microphone
+                            .then(screenilux_platform::AudioCapture::start),
                         config
                             .system_sound
-                            .then(screenilux_win::AudioCapture::start_system),
+                            .then(screenilux_platform::AudioCapture::start_system),
                         click_rx.take(),
                     )
                 }),
@@ -516,7 +518,7 @@ fn route_events(
                     }
                 }
                 PointerEvent::Wheel { .. } => {
-                    let at = screenilux_win::cursor_pos();
+                    let at = screenilux_platform::cursor_pos();
                     if let Some((_, tx)) = screens.iter().find(|(b, _)| b.contains(at)) {
                         let _ = tx.send(event);
                     }
@@ -545,7 +547,7 @@ fn track_focus(
             .unwrap_or_default()
             .as_secs_f64();
         tracker.sample(
-            screenilux_win::cursor_pos(),
+            screenilux_platform::cursor_pos(),
             recorded,
             state == crate::control::RunState::Running,
         );
@@ -583,7 +585,7 @@ fn iso_timestamp(t: std::time::SystemTime) -> String {
 /// Civil local time, delegated to the platform layer so this crate stays
 /// free of unsafe.
 fn civil_local(_t: std::time::SystemTime) -> (i32, u32, u32, u32, u32, u32) {
-    screenilux_win::now_local()
+    screenilux_platform::now_local()
 }
 
 #[allow(dead_code)]

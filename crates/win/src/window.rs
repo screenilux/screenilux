@@ -13,6 +13,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_LAYERED,
 };
 
+/// Windows can keep a window out of screen capture, so the recording bar and
+/// the camera preview never appear in a recording.
+pub const CAN_HIDE_FROM_CAPTURE: bool = true;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AffinityError {
     #[error("the window handle was null")]
@@ -153,6 +157,19 @@ pub unsafe fn set_circular(hwnd: isize) {
         let region = CreateEllipticRgn((w - d) / 2, (h - d) / 2, (w + d) / 2 + 1, (h + d) / 2 + 1);
         SetWindowRgn(handle, Some(region), true);
     }
+}
+
+/// One of our own top-level windows, found by its title. eframe gives no
+/// handle for a second window such as the camera bubble.
+pub fn find_window(title: &str) -> Option<isize> {
+    // SAFETY: a null class and an owned, terminated title.
+    let found = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::FindWindowW(
+            windows::core::PCWSTR::null(),
+            &windows::core::HSTRING::from(title),
+        )
+    };
+    found.ok().filter(|h| !h.is_invalid()).map(|h| h.0 as isize)
 }
 
 #[cfg(test)]

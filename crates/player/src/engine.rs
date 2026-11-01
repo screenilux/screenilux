@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use screenilux_core::playback::{PlaybackClock, Recording, Track};
-use screenilux_win::decoder::{AudioDecoder, VideoDecoder, VideoFrame};
+use screenilux_platform::decoder::{AudioDecoder, VideoDecoder, VideoFrame};
 
 /// How often an idle thread looks at the clock. Short enough that a seek or
 /// play is picked up within a frame at 60fps.
@@ -319,7 +319,7 @@ fn play_video(
 /// both from the clock's position after any pause or seek.
 fn play_sound(track: &Track, clock: &SharedClock, stop: &AtomicBool) -> Result<(), String> {
     let mut dec = AudioDecoder::open(&track.path).map_err(|e| e.to_string())?;
-    let mut speaker = screenilux_win::Speaker::open()?;
+    let mut speaker = screenilux_platform::Speaker::open()?;
     let mut queue: Vec<u8> = Vec::new();
     let mut seen_generation = u64::MAX;
     let mut was_playing = false;
@@ -402,7 +402,7 @@ mod tests {
         let (w, h) = (320u32, 240u32);
         let dest = dir.join(name);
         let mut sink =
-            screenilux_win::NativeSink::new(w, h, 30, false, dir.join(format!("{name}.part")))
+            screenilux_platform::NativeSink::new(w, h, 30, false, dir.join(format!("{name}.part")))
                 .unwrap();
         sink.open_segment().unwrap();
         for n in 0..frames {
@@ -469,14 +469,14 @@ mod tests {
 
     #[test]
     fn sound_plays_alongside_the_picture() {
-        if screenilux_win::Speaker::open().is_err() {
+        if screenilux_platform::Speaker::open().is_err() {
             return; // no playback device on this machine
         }
         let dir = screenilux_recorder::paths::TempDir::new("screenilux-engine-sound").unwrap();
         let (w, h) = (320u32, 240u32);
         let path = dir.path().join("sound.mp4");
         let mut sink =
-            screenilux_win::NativeSink::new(w, h, 30, true, dir.path().join("sound.part.mp4"))
+            screenilux_platform::NativeSink::new(w, h, 30, true, dir.path().join("sound.part.mp4"))
                 .unwrap();
         sink.open_segment().unwrap();
         // Quiet: this really plays through the speakers.

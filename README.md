@@ -1,7 +1,7 @@
 # Screenilux
 
-Record your screens on Windows, then play them back and copy any text you see
-in them.
+Record your screens on Windows or Linux, then play them back and copy any text
+you see in them.
 
 <img src="docs/record.png" alt="Screenilux, ready to record two screens with the camera and microphone on" width="360">
 
@@ -57,34 +57,47 @@ Screenilux also reads the text on screen, on your PC and without internet, so
 you can copy it from a paused video or search a recording for a word.
 
 Loom is ahead in sharing: an instant link, comments and reactions, and apps
-for Mac and phones. Screenilux runs on Windows only for now, and a share link
-is next (see below).
+for Mac and phones. Screenilux runs on Windows and Linux for now, and a share
+link is next (see below).
 
 Loom's limits are from its help pages and plan listings in November 2026.
 
 ## Getting it
 
-1. Download the latest zip from
-   [Releases](https://github.com/EagleMind/screenilux/releases/latest).
-2. Unzip it and run `screenilux.exe`. There is nothing to install and no
-   administrator rights are needed.
+Download the latest version from
+[Releases](https://github.com/EagleMind/screenilux/releases/latest).
 
-The app is not signed yet, so Windows may say it protected your PC the first
-time. Choose **More info**, then **Run anyway**.
+**Windows:** unzip the Windows download and run `screenilux.exe`. There is
+nothing to install and no administrator rights are needed. The app is not
+signed yet, so Windows may say it protected your PC the first time. Choose
+**More info**, then **Run anyway**.
 
-Recordings are saved in `Videos\ScreenRec`. A single screen is saved as an MP4
-that plays anywhere. Several screens are saved together as one `.screenilux`
-file, which opens in Screenilux.
+**Linux:** unpack the Linux download and run `screenilux`. It uses GStreamer
+for video and sound, and Tesseract for reading text. On Ubuntu or Debian:
+
+```
+sudo apt install gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav tesseract-ocr
+```
+
+Screenilux on Linux records an X11 session. On Ubuntu, choose
+**Ubuntu on Xorg** on the login screen. Wayland sessions are not supported yet.
+
+Recordings are saved in `Videos/ScreenRec` in your home folder. A single screen
+is saved as an MP4 that plays anywhere. Several screens are saved together as
+one `.screenilux` file, which opens in Screenilux.
 
 ## Good to know
 
 - Zooming in makes the picture slightly softer.
-- Copying text needs a Windows language with text recognition installed. The
-  app tells you if it is missing and where to add it.
+- Copying text needs a Windows language with text recognition installed, or
+  Tesseract on Linux. The app tells you if it is missing and how to add it.
 - Text shown for less than two seconds may not turn up in search, but you can
   still pause on it and copy it.
 - Long multi-screen recordings take a moment to open.
 - Pointer effects do not work over apps running as administrator.
+- On Linux, the recording bar and the camera preview show in the recording,
+  because X11 has no way to hide a window from capture. Turn off **Shrink to a
+  bar while recording** to keep the bar out of the way.
 
 ## Upcoming
 
@@ -94,7 +107,9 @@ file, which opens in Screenilux.
 
 ## Building it yourself
 
-Install [Rust](https://rustup.rs), then run:
+Install [Rust](https://rustup.rs). On Linux, also install GStreamer's
+development files (`libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev` on
+Ubuntu). Then run:
 
 ```
 cargo run --release -p screenilux

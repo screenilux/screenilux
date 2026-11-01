@@ -126,8 +126,8 @@ pub fn open(path: &Path) -> Result<Opened, OpenError> {
         });
     }
 
-    let info =
-        screenilux_win::probe(path).map_err(|e| OpenError::Video(title_of(path), e.to_string()))?;
+    let info = screenilux_platform::probe(path)
+        .map_err(|e| OpenError::Video(title_of(path), e.to_string()))?;
     let recording = Recording::single(path, info.width, info.height, info.duration, info.has_audio);
     Ok(Opened {
         // Only used as a seek tolerance for a plain video; 30 is the default
