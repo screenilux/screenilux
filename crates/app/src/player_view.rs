@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use screenilux_core::playback::{Area, Layout, arrange};
-use screenilux_core::text::{Hit, Page, WordRef};
+use screenilux_core::text::{Hit, Page, TextIndex, WordRef};
 use screenilux_player::Player;
 use screenilux_player::open::{Opened, Origin, save_text};
 use screenilux_player::text::{INDEX_INTERVAL, Indexer, TextWorker};
@@ -92,6 +92,9 @@ pub struct PlayerView {
     /// last said; and sharing it, if asked for.
     link: (Link, bool),
     asked: Option<Asked>,
+    /// A recording just made searchable, and its text, for the app to add
+    /// to the recording's link if it has one.
+    indexed: Option<(PathBuf, TextIndex)>,
 }
 
 impl PlayerView {
@@ -116,6 +119,7 @@ impl PlayerView {
             recents: None,
             link: (Link::None, false),
             asked: None,
+            indexed: None,
         }
     }
 
@@ -214,6 +218,11 @@ impl PlayerView {
     /// Where the open recording's link stands, to show beside its title.
     pub fn set_link(&mut self, link: Link, can_share: bool) {
         self.link = (link, can_share);
+    }
+
+    /// A recording made searchable since last time, and its text.
+    pub fn take_indexed(&mut self) -> Option<(PathBuf, TextIndex)> {
+        self.indexed.take()
     }
 
     /// Sharing the open recording, if it was asked for since last time.
@@ -569,6 +578,11 @@ impl PlayerView {
                     Ok(_) => None,
                     Err(e) => Some(format!("Text was read but could not be saved: {e}")),
                 };
+                if let Origin::Package(path) | Origin::Video(path) = &loaded.opened.origin
+                    && words > 0
+                {
+                    self.indexed = Some((path.clone(), index.clone()));
+                }
                 if words == 0 {
                     self.status = Some("No text was found in this recording.".into());
                 }
@@ -579,8 +593,6 @@ impl PlayerView {
         }
     }
 
-    /// Nothing open: a drop target, and the recordings already in the save
-    /// folder so the common case is one click.
     /// The Recordings tab, in the main window: opening a file, and the
     /// recordings in the save folder. Playing one opens the player window.
     pub fn library(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, out_dir: &Path) {

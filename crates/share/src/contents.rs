@@ -57,6 +57,19 @@ pub struct Contents {
 }
 
 impl Contents {
+    /// Add a text index kept outside the recording, such as a single video's.
+    /// A package carries its own, so this does nothing for one that has it.
+    pub fn add_text(&mut self, index_json: Vec<u8>) {
+        if self.items.iter().any(|i| i.name == TEXT_INDEX_NAME) {
+            return;
+        }
+        self.items.push(Item {
+            name: TEXT_INDEX_NAME.into(),
+            len: index_json.len() as u64,
+            source: Source::Bytes(index_json),
+        });
+    }
+
     pub fn total(&self) -> u64 {
         self.items.iter().map(|i| i.len).sum()
     }

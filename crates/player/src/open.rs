@@ -201,6 +201,15 @@ fn cache_path(video: &Path) -> Option<PathBuf> {
     )
 }
 
+/// The text index kept for a recording, if it has been made searchable: in
+/// a package, or cached per user for a plain video.
+pub fn stored_text(path: &Path) -> Option<TextIndex> {
+    if package::is_package(path) {
+        return package::read_text_index(path).ok().flatten();
+    }
+    cache_path(path).and_then(|p| read_index(&p))
+}
+
 /// A stable hash for cache file names. `std`'s hasher is randomly seeded per
 /// process, which would orphan every cache entry on restart.
 fn fnv1a(bytes: &[u8]) -> u64 {

@@ -45,6 +45,12 @@ const SHARE_PER_DEVICE = 1024 ** 3;
 const SHARE_PER_NETWORK = 5 * 1024 ** 3;
 /** The most one upload request can carry. The app sends 32MB parts. */
 const MAX_REQUEST = 50 * 1024 ** 2;
+/**
+ * A recording's text index can be added once the recording is done, when it is
+ * made searchable later, so it is allowed beyond what the recording asked
+ * for, up to this.
+ */
+const MAX_TEXT = 16 * 1024 ** 2;
 /** How long a recording is kept; the bucket's lifecycle rule does the deleting. */
 const KEPT_FOR_MS = 7 * 24 * 60 * 60 * 1000;
 /** An upload that has sent nothing for this long has stopped. */
@@ -295,8 +301,14 @@ async function api(request: Request, env: Env, path: string[]): Promise<Response
   const admit = async (): Promise<Response | undefined> => {
     if (!request.body || !bytes) return problem(411, "The upload must say how big it is.");
     if (bytes > MAX_REQUEST) return problem(413, "That upload is too big for one request.");
+    const late = name === "text.json";
+    if (late && bytes > MAX_TEXT) return problem(413, "The text index is too big.");
     const counted = await updateState(env, id, (s) =>
-      s.received + bytes > s.total ? "full" : { ...s, received: s.received + bytes, updated: Date.now() },
+      late
+        ? { ...s, total: s.total + bytes, received: s.received + bytes, updated: Date.now() }
+        : s.received + bytes > s.total
+          ? "full"
+          : { ...s, received: s.received + bytes, updated: Date.now() },
     );
     if (counted === "full") return problem(413, "The recording is bigger than it said it would be.");
     return counted === "ok" ? undefined : gone;

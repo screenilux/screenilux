@@ -14,7 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use screenilux_core::package;
-use screenilux_share::{Bucket, Contents, Destination, State, Upload};
+use screenilux_core::text::TextIndex;
+use screenilux_share::{Bucket, Contents, Destination, Rights, State, Upload};
 use serde::{Deserialize, Serialize};
 
 use crate::player_view::friendly_name;
@@ -113,8 +114,31 @@ pub(crate) fn write_json(name: &str, value: &impl Serialize) {
     }
 }
 
-/// What to upload for a recording the app saved.
+/// A recording's text index as it is shared. A single video goes up as
+/// `screen1.mp4`, so its text is moved to that name.
+fn shared_text(path: &Path, mut index: TextIndex) -> Option<Vec<u8>> {
+    if !package::is_package(path) {
+        for entry in &mut index.entries {
+            entry.screen = "screen1.mp4".into();
+        }
+    }
+    index.to_json().ok().map(String::into_bytes)
+}
+
+/// What to upload for a recording the app saved, with its text if it has
+/// been made searchable, so the link can search and copy it too.
 pub fn contents(path: &Path) -> Result<Contents, String> {
+    let mut contents = recording(path)?;
+    if !package::is_package(path)
+        && let Some(json) =
+            screenilux_player::open::stored_text(path).and_then(|i| shared_text(path, i))
+    {
+        contents.add_text(json);
+    }
+    Ok(contents)
+}
+
+fn recording(path: &Path) -> Result<Contents, String> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -140,6 +164,9 @@ struct Kept {
     link: String,
     /// When it stops working, in seconds since 1970, if it does.
     expires: Option<u64>,
+    /// The right to add to the share, such as its text later.
+    #[serde(default)]
+    rights: Option<Rights>,
 }
 
 /// Where one recording's link stands.
@@ -269,26 +296,49 @@ impl Shares {
                 fresh = Some(link.clone());
             }
             if let (State::Ready, Some(link)) = (&p.state, &p.link) {
-                finished.push((path.clone(), link.clone(), p.expires));
+                finished.push((path.clone(), link.clone(), p.expires, p.rights.clone()));
                 if *remove_after && let Err(e) = std::fs::remove_file(path) {
                     tracing::warn!(path = %path.display(), error = %e, "could not remove the uploaded recording");
                 }
             }
         }
         if !finished.is_empty() {
-            for (path, link, expires) in finished {
+            for (path, link, expires, rights) in finished {
                 self.live.remove(&path);
                 self.kept.insert(
                     path,
                     Kept {
                         link,
                         expires: expires.map(seconds),
+                        rights,
                     },
                 );
             }
             write_json(LINKS, &self.kept);
         }
         fresh
+    }
+}
+
+impl Shares {
+    /// A recording shared earlier has just been made searchable: add its text
+    /// to the link, in the background, so the people with the link can search
+    /// and copy it too.
+    pub fn add_text(&self, path: &Path, index: TextIndex, bucket: &Bucket) {
+        let Some(kept) = self.kept.get(&key(path)) else {
+            return;
+        };
+        let (Some(rights), Some(json)) = (kept.rights.clone(), shared_text(path, index)) else {
+            return;
+        };
+        let link = kept.link.clone();
+        let bucket = bucket.clone();
+        std::thread::spawn(move || {
+            let bucket = matches!(rights, Rights::Bucket { .. }).then_some(&bucket);
+            if let Err(e) = screenilux_share::add_text(&rights, bucket, &link, &json) {
+                tracing::warn!(error = %e, "could not add the text to the shared link");
+            }
+        });
     }
 }
 
