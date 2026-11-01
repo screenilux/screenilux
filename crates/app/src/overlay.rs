@@ -11,7 +11,7 @@ use std::sync::Arc;
 use eframe::egui;
 use screenilux_core::Rect;
 use screenilux_core::ports::CameraSource;
-use screenilux_win::CameraFeed;
+use screenilux_platform::CameraFeed;
 
 /// The window title is how we find our own HWND: eframe exposes no
 /// per-viewport handle.
@@ -168,16 +168,22 @@ impl Overlay {
             return;
         }
         if self.hwnd.is_none() {
-            self.hwnd = find_window(OVERLAY_TITLE);
+            self.hwnd = screenilux_platform::find_window(OVERLAY_TITLE);
         }
         let Some(h) = self.hwnd else { return };
         if !self.shaped {
             // SAFETY: as below.
-            unsafe { screenilux_win::set_circular(h) };
+            unsafe { screenilux_platform::set_circular(h) };
             self.shaped = true;
         }
+        // Where the system cannot hide it, the preview is what the recording
+        // shows, so there is nothing to warn about.
+        if !screenilux_platform::CAN_HIDE_FROM_CAPTURE {
+            self.excluded = true;
+            return;
+        }
         // SAFETY: a live top-level handle, found by title, owned by us.
-        match unsafe { screenilux_win::exclude_from_capture(h) } {
+        match unsafe { screenilux_platform::exclude_from_capture(h) } {
             Ok(()) => self.excluded = true,
             Err(e) => {
                 self.exclusion_error = Some(format!(
@@ -189,16 +195,4 @@ impl Overlay {
             }
         }
     }
-}
-
-fn find_window(title: &str) -> Option<isize> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    unsafe extern "system" {
-        fn FindWindowW(class: *const u16, title: *const u16) -> isize;
-    }
-    let wide: Vec<u16> = OsStr::new(title).encode_wide().chain(Some(0)).collect();
-    // SAFETY: null class, NUL-terminated title.
-    let h = unsafe { FindWindowW(std::ptr::null(), wide.as_ptr()) };
-    (h != 0).then_some(h)
 }

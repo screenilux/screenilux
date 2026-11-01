@@ -181,6 +181,16 @@ pub fn register_file_types(exe: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Show a file or folder in File Explorer, the file selected.
+pub fn reveal(path: &Path) {
+    let mut cmd = std::process::Command::new("explorer");
+    if path.is_file() {
+        cmd.arg("/select,");
+    }
+    cmd.arg(path);
+    let _ = cmd.spawn();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

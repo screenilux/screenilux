@@ -50,9 +50,9 @@ impl Probes {
                 // Both come from Media Foundation. Enumerating a camera takes
                 // a moment, which is why this is off the UI thread at all.
                 let _ = tx.send(ProbeResult {
-                    has_microphone: screenilux_win::has_microphone(),
-                    has_system_sound: screenilux_win::has_system_sound(),
-                    cameras: screenilux_win::cameras(),
+                    has_microphone: screenilux_platform::has_microphone(),
+                    has_system_sound: screenilux_platform::has_system_sound(),
+                    cameras: screenilux_platform::cameras(),
                 });
             })
             .ok();
@@ -99,7 +99,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn new() -> Self {
-        let monitors = screenilux_win::monitors().unwrap_or_default();
+        let monitors = screenilux_platform::monitors().unwrap_or_default();
         let selected = monitors.iter().map(|m| m.is_primary).collect();
         Self {
             monitors,
@@ -125,7 +125,7 @@ impl Settings {
             .filter(|&(_, &on)| on)
             .map(|(m, _)| m.label.clone())
             .collect();
-        self.monitors = screenilux_win::monitors().unwrap_or_default();
+        self.monitors = screenilux_platform::monitors().unwrap_or_default();
         self.selected = self
             .monitors
             .iter()
@@ -186,6 +186,7 @@ impl Settings {
 
 fn default_output_dir() -> PathBuf {
     std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Videos")
@@ -194,15 +195,15 @@ fn default_output_dir() -> PathBuf {
 
 /// Shared runtime handles the UI needs.
 pub struct Runtime {
-    pub hook: screenilux_win::InputHook,
-    pub camera: Option<screenilux_win::CameraHandle>,
-    pub camera_feed: Option<Arc<screenilux_win::CameraFeed>>,
+    pub hook: screenilux_platform::InputHook,
+    pub camera: Option<screenilux_platform::CameraHandle>,
+    pub camera_feed: Option<Arc<screenilux_platform::CameraFeed>>,
 }
 
 impl Runtime {
     pub fn new() -> Self {
         Self {
-            hook: screenilux_win::InputHook::start(),
+            hook: screenilux_platform::InputHook::start(),
             camera: None,
             camera_feed: None,
         }
@@ -210,7 +211,7 @@ impl Runtime {
 
     pub fn start_camera(&mut self, index: u32, bubble: screenilux_core::Rect) {
         self.stop_camera();
-        let handle = screenilux_win::CameraHandle::start(index, bubble);
+        let handle = screenilux_platform::CameraHandle::start(index, bubble);
         self.camera_feed = Some(handle.feed());
         self.camera = Some(handle);
     }

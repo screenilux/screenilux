@@ -78,7 +78,7 @@ pub struct ScreenJob {
 }
 
 /// Bytes per sample frame of the PCM the encoder takes.
-const BLOCK: usize = screenilux_win::audio::CHANNELS as usize * 2;
+const BLOCK: usize = screenilux_platform::audio::CHANNELS as usize * 2;
 
 /// How far behind the picture the sound is written while recording, so each
 /// source has a little queued and a late packet does not leave a gap. Flushed
@@ -96,8 +96,8 @@ const MAX_QUEUED: Duration = Duration::from_millis(500);
 /// neither, the track is written at the pace of the recording and every
 /// source is mixed into it, so clicks and sound land at the right time.
 pub struct Sound {
-    mic: Option<screenilux_win::AudioCapture>,
-    system: Option<screenilux_win::AudioCapture>,
+    mic: Option<screenilux_platform::AudioCapture>,
+    system: Option<screenilux_platform::AudioCapture>,
     /// One message per mouse click, anywhere on the desktop.
     clicks: Option<Receiver<()>>,
     mixer: ClickMixer,
@@ -109,19 +109,19 @@ pub struct Sound {
 
 impl Sound {
     pub fn new(
-        mic: Option<screenilux_win::AudioCapture>,
-        system: Option<screenilux_win::AudioCapture>,
+        mic: Option<screenilux_platform::AudioCapture>,
+        system: Option<screenilux_platform::AudioCapture>,
         clicks: Option<Receiver<()>>,
     ) -> Self {
-        let rate = screenilux_win::audio::SAMPLE_RATE;
+        let rate = screenilux_platform::audio::SAMPLE_RATE;
         Self {
             mic,
             system,
             clicks,
-            mixer: ClickMixer::new(rate, screenilux_win::audio::CHANNELS),
+            mixer: ClickMixer::new(rate, screenilux_platform::audio::CHANNELS),
             bus: Mixer::new(
                 2,
-                screenilux_win::audio::CHANNELS,
+                screenilux_platform::audio::CHANNELS,
                 (MAX_QUEUED.as_secs_f64() * rate as f64) as usize,
             ),
             written: 0,
@@ -166,7 +166,8 @@ impl Sound {
                 } else {
                     recorded.saturating_sub(CUSHION)
                 };
-                let due = (upto.as_secs_f64() * screenilux_win::audio::SAMPLE_RATE as f64) as u64;
+                let due =
+                    (upto.as_secs_f64() * screenilux_platform::audio::SAMPLE_RATE as f64) as u64;
                 match due.saturating_sub(self.written) {
                     0 => Vec::new(),
                     n => vec![self.bus.pull(n as usize)],

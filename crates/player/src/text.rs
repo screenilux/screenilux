@@ -8,8 +8,8 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use screenilux_core::playback::Recording;
 use screenilux_core::text::{Page, TextIndex};
-use screenilux_win::TextReader;
-use screenilux_win::decoder::{VideoDecoder, VideoFrame};
+use screenilux_platform::TextReader;
+use screenilux_platform::decoder::{VideoDecoder, VideoFrame};
 
 /// How often the indexer samples each screen. Text that is on screen for
 /// less than this may be missed; anything a viewer could read is not.

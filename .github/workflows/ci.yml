@@ -1,7 +1,5 @@
-# Checks every pull request into main, and releases every merge into it.
-#
-# Screenilux is Windows-only for now: capture, encoding, playback, sound and
-# OCR go through Windows APIs, so everything runs on a Windows runner.
+# Checks every pull request into main on Windows and Linux, and releases every
+# merge into it with a download for each.
 
 name: CI/CD
 
@@ -26,10 +24,17 @@ env:
   # own. Raise it deliberately, alongside the code it needs.
   RUST_TOOLCHAIN: "1.99.1"
   CARGO_TERM_COLOR: always
+  # What the Linux backend builds against, and what its tests run: GStreamer
+  # with its encoders, a virtual X display, and Tesseract.
+  LINUX_PACKAGES: >-
+    libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+    gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+    gstreamer1.0-plugins-ugly gstreamer1.0-libav
+    libxkbcommon-dev libgtk-3-dev xvfb tesseract-ocr
 
 jobs:
   check:
-    name: Check and test
+    name: Check and test (Windows)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -57,13 +62,35 @@ jobs:
       - name: Every other test still compiles
         run: cargo test --workspace --locked --no-run
 
-  release:
-    name: Build and release
-    needs: check
+  check-linux:
+    name: Check and test (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LINUX_PACKAGES
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # A virtual X display is enough for the Linux backend's own tests:
+      # capture, thumbnails, the input hook, encoding, decoding, text.
+      - name: Tests on a virtual display
+        run: xvfb-run -a -s "-screen 0 1920x1080x24" cargo test --workspace --locked
+
+  build-windows:
+    name: Build (Windows)
+    needs: [check, check-linux]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v5
 
@@ -73,48 +100,92 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Version
-        id: version
-        shell: pwsh
-        run: |
-          $meta = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
-          $version = ($meta.packages | Where-Object name -eq 'screenilux').version
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "tag=v$version-build.${{ github.run_number }}" >> $env:GITHUB_OUTPUT
-
       - name: Build
         run: cargo build --release --locked -p screenilux
 
       # The executable keeps its name inside the zip: Windows files the
       # "Open with" entry under it.
       - name: Package
-        id: package
         shell: pwsh
         run: |
-          $name = "screenilux-${{ steps.version.outputs.tag }}-windows-x64"
-          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
-          Copy-Item target/release/screenilux.exe, README.md, LICENSE "dist/$name"
-          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
-          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name.zip" | Out-File dist/SHA256SUMS.txt -Encoding ascii
-          "zip=dist/$name.zip" >> $env:GITHUB_OUTPUT
+          New-Item -ItemType Directory -Force dist/screenilux | Out-Null
+          Copy-Item target/release/screenilux.exe, README.md, LICENSE dist/screenilux
+          Compress-Archive -Path dist/screenilux/* -DestinationPath dist/windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/windows-x64.zip
+
+  build-linux:
+    name: Build (Linux)
+    needs: [check, check-linux]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends $LINUX_PACKAGES
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked -p screenilux
+
+      - name: Package
+        run: |
+          mkdir -p dist/screenilux
+          cp target/release/screenilux README.md LICENSE dist/screenilux/
+          tar -czf dist/linux-x64.tar.gz -C dist screenilux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: dist/linux-x64.tar.gz
+
+  release:
+    name: Release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Name the downloads
+        id: files
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          tag="v$version-build.${{ github.run_number }}"
+          mkdir dist
+          cp artifacts/windows-x64/windows-x64.zip "dist/screenilux-$tag-windows-x64.zip"
+          cp artifacts/linux-x64/linux-x64.tar.gz "dist/screenilux-$tag-linux-x64.tar.gz"
+          (cd dist && sha256sum screenilux-* > SHA256SUMS.txt)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Publish the release
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.files.outputs.tag }}
+          VERSION: ${{ steps.files.outputs.version }}
         run: |
           # A re-run of the same workflow run replaces the files rather than
           # failing on a release that already exists.
-          gh release view $env:TAG *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:TAG "${{ steps.package.outputs.zip }}" dist/SHA256SUMS.txt --clobber
-          } else {
-            gh release create $env:TAG "${{ steps.package.outputs.zip }}" dist/SHA256SUMS.txt `
-              --target "${{ github.sha }}" `
-              --title "Screenilux $env:VERSION (build ${{ github.run_number }})" `
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --target "${{ github.sha }}" \
+              --title "Screenilux $VERSION (build ${{ github.run_number }})" \
               --generate-notes
-          }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          fi

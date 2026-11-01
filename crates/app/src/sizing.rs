@@ -191,7 +191,7 @@ fn clamp_onto(area: egui::Rect, pos: egui::Pos2, outer: egui::Vec2) -> egui::Pos
 fn work_area(ctx: &egui::Context, outer: egui::Rect) -> egui::Rect {
     let ppp = ctx.pixels_per_point();
     let centre = outer.center() * ppp;
-    match screenilux_win::display::work_area_at(centre.x as i32, centre.y as i32) {
+    match screenilux_platform::display::work_area_at(centre.x as i32, centre.y as i32) {
         Some(r) => egui::Rect::from_min_size(
             egui::pos2(r.left as f32, r.top as f32) / ppp,
             egui::vec2(r.width as f32, r.height as f32) / ppp,

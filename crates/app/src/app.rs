@@ -49,7 +49,7 @@ pub struct App {
     alpha: u8,
     rounded: bool,
     /// Listens for displays coming and going; kept alive with the app.
-    _displays: screenilux_win::DisplayWatcher,
+    _displays: screenilux_platform::DisplayWatcher,
     display_rx: std::sync::mpsc::Receiver<()>,
     /// When the displays last changed and have not been re-read since.
     displays_changed: Option<Instant>,
@@ -68,7 +68,7 @@ impl App {
     pub fn new(hwnd: Option<isize>, ctx: &egui::Context) -> Self {
         let (tx, display_rx) = std::sync::mpsc::channel();
         let repaint = ctx.clone();
-        let displays = screenilux_win::DisplayWatcher::start(move || {
+        let displays = screenilux_platform::DisplayWatcher::start(move || {
             let _ = tx.send(());
             repaint.request_repaint();
         });
@@ -143,7 +143,12 @@ impl App {
             microphone: self.settings.microphone && self.probes.has_microphone,
             system_sound: self.settings.system_sound && self.probes.has_system_sound,
             click_sound: self.settings.click_sound,
-            effects: self.settings.effects,
+            // Where the camera preview cannot be kept out of the capture it
+            // is recorded as it is, so it is not drawn in a second time.
+            effects: screenilux_core::EffectOptions {
+                camera: self.settings.effects.camera && screenilux_platform::CAN_HIDE_FROM_CAPTURE,
+                ..self.settings.effects
+            },
             camera,
             pointer_events: Some(self.runtime.hook.pointer_events()),
         };
@@ -229,9 +234,9 @@ impl App {
         // long as the app does.
         let result = unsafe {
             if captured {
-                screenilux_win::include_in_capture(h)
+                screenilux_platform::include_in_capture(h)
             } else {
-                screenilux_win::exclude_from_capture(h)
+                screenilux_platform::exclude_from_capture(h)
             }
         };
         if let Err(e) = result {
@@ -252,11 +257,11 @@ impl App {
         // SAFETY: as in `set_captured`.
         unsafe {
             if self.compact != self.rounded {
-                screenilux_win::set_rounded(h, self.compact);
+                screenilux_platform::set_rounded(h, self.compact);
                 self.rounded = self.compact;
             }
             if alpha != self.alpha {
-                screenilux_win::set_opacity(h, alpha);
+                screenilux_platform::set_opacity(h, alpha);
                 self.alpha = alpha;
             }
         }
@@ -717,7 +722,7 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Open").clicked() {
                     let _ = std::fs::create_dir_all(&self.settings.out_dir);
-                    reveal(&self.settings.out_dir);
+                    screenilux_platform::reveal(&self.settings.out_dir);
                 }
                 if ui.add_enabled(!busy, egui::Button::new("Change")).clicked()
                     && let Some(dir) = rfd::FileDialog::new()
@@ -754,7 +759,7 @@ impl App {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.link("Show in folder").clicked() {
-                                reveal(&saved);
+                                screenilux_platform::reveal(&saved);
                             }
                             if ui.link("Play it").clicked() {
                                 self.play(saved.clone(), ctx);
@@ -1153,16 +1158,6 @@ impl eframe::App for App {
         };
         ctx.request_repaint_after(Duration::from_millis(tick));
     }
-}
-
-/// Show a path in Explorer.
-fn reveal(path: &std::path::Path) {
-    let mut cmd = std::process::Command::new("explorer");
-    if path.is_file() {
-        cmd.arg("/select,");
-    }
-    cmd.arg(path);
-    let _ = cmd.spawn();
 }
 
 #[cfg(test)]

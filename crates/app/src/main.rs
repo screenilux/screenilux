@@ -1,7 +1,7 @@
-//! Screenilux: a screen recorder for Windows.
+//! Screenilux: a screen recorder for Windows and Linux.
 
-// A GUI app: no console window on release builds.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// A GUI app: no console window on Windows release builds.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
 mod icon;
@@ -21,7 +21,7 @@ fn main() -> eframe::Result<()> {
         .init();
 
     // Before any window exists, so captures are in physical pixels.
-    screenilux_win::set_dpi_awareness();
+    screenilux_platform::set_dpi_awareness();
 
     // Whichever copy runs keeps .screenilux files and "Open with" pointing
     // at itself, so they work from the first launch, wherever the program
@@ -30,7 +30,7 @@ fn main() -> eframe::Result<()> {
     // UI thread, since Explorer is notified when anything did change.
     if let Ok(exe) = std::env::current_exe() {
         std::thread::spawn(move || {
-            if let Err(e) = screenilux_win::register_file_types(&exe) {
+            if let Err(e) = screenilux_platform::register_file_types(&exe) {
                 tracing::warn!(error = %e, "could not register file types");
             }
         });

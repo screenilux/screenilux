@@ -24,7 +24,7 @@ pub struct Previews {
     areas: Arc<Mutex<Vec<Rect>>>,
     active: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
-    rx: Receiver<(Rect, screenilux_win::Thumbnail)>,
+    rx: Receiver<(Rect, screenilux_platform::Thumbnail)>,
     textures: Vec<(Rect, egui::TextureHandle)>,
 }
 
@@ -42,7 +42,7 @@ impl Previews {
                     if on.load(Ordering::Relaxed) {
                         let rects = a.lock().map(|r| r.clone()).unwrap_or_default();
                         for r in rects {
-                            if let Some(t) = screenilux_win::thumbnail(r, GRAB.0, GRAB.1)
+                            if let Some(t) = screenilux_platform::thumbnail(r, GRAB.0, GRAB.1)
                                 && tx.send((r, t)).is_err()
                             {
                                 return;
