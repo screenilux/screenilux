@@ -14,7 +14,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
-repository = "https://github.com/EagleMind/screenilux"
+repository = "https://github.com/screenilux/screenilux"
 rust-version = "1.95"
 
 [workspace.dependencies]

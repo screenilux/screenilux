@@ -12,8 +12,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/EagleMind/screenilux/actions/workflows/ci.yml"><img src="https://github.com/EagleMind/screenilux/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI/CD"></a>
-  <a href="https://github.com/EagleMind/screenilux/releases/latest"><img src="https://img.shields.io/badge/download-latest-04736f" alt="Download the latest release"></a>
+  <a href="https://github.com/screenilux/screenilux/actions/workflows/ci.yml"><img src="https://github.com/screenilux/screenilux/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI/CD"></a>
+  <a href="https://github.com/screenilux/screenilux/releases/latest"><img src="https://img.shields.io/badge/download-latest-04736f" alt="Download the latest release"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-012625" alt="Windows and Linux">
   <a href="LICENSE"><img src="https://img.shields.io/badge/licence-GPL--3.0-069a95" alt="Licence: GPL-3.0"></a>
   <img src="https://img.shields.io/badge/free-no%20account%2C%20no%20limits-07beb8" alt="Free, with no account and no limits">
@@ -118,7 +118,7 @@ for Mac and phones. A share link for Screenilux is next on the list.
 ## Download
 
 Get the latest version from
-[Releases](https://github.com/EagleMind/screenilux/releases/latest).
+[Releases](https://github.com/screenilux/screenilux/releases/latest).
 
 **Windows 10 and 11**
 
@@ -177,7 +177,9 @@ cargo run --release -p screenilux
 ```
 
 Ideas and fixes are welcome: open an
-[issue](https://github.com/EagleMind/screenilux/issues) or a pull request.
+[issue](https://github.com/screenilux/screenilux/issues) or a pull request.
+See [Contributing](CONTRIBUTING.md) for how, including the one-comment
+[Contributor Licence Agreement](CLA.md).
 
 ## Licence
 

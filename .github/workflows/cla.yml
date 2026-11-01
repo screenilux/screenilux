@@ -1,0 +1,143 @@
+# Asks everyone who writes a commit in a pull request to agree to the CLA once,
+# by posting a comment, and keeps a record of who agreed on the
+# cla-signatures branch. The result shows on the pull request as a check
+# called CLA.
+
+name: CLA
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write       # the record of who agreed
+  pull-requests: write  # the comment explaining what to do
+  statuses: write       # the CLA check
+
+# One run at a time, so two people agreeing at once both land in the record.
+concurrency:
+  group: cla
+  cancel-in-progress: false
+
+jobs:
+  cla:
+    # Never checks out the pull request's code: it only reads who wrote it.
+    if: github.event_name == 'pull_request_target' || github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const AGREE = 'I have read the CLA and I agree to it.';
+            const MAINTAINERS = ['eaglemind'];
+            const BRANCH = 'cla-signatures';
+            const FILE = 'signatures.json';
+            const MARK = '<!-- cla -->';
+            const { owner, repo } = context.repo;
+            const number = context.issue.number;
+            const claUrl = `https://github.com/${owner}/${repo}/blob/main/CLA.md`;
+
+            // A comment matters only when it agrees or asks for a recheck.
+            const comment = context.payload.comment;
+            const said = comment ? comment.body.trim() : '';
+            if (comment && said !== AGREE && said.toLowerCase() !== 'recheck') return;
+
+            // The record: a list of everyone who agreed, on its own branch.
+            let record = [];
+            let recordSha;
+            try {
+              const { data } = await github.rest.repos.getContent({ owner, repo, path: FILE, ref: BRANCH });
+              record = JSON.parse(Buffer.from(data.content, 'base64').toString());
+              recordSha = data.sha;
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+
+            if (said === AGREE && !record.some(s => s.id === comment.user.id)) {
+              record.push({
+                login: comment.user.login,
+                id: comment.user.id,
+                pull_request: number,
+                comment: comment.html_url,
+                date: comment.created_at,
+              });
+              const content = JSON.stringify(record, null, 2) + '\n';
+              const message = `Record that @${comment.user.login} agreed to the CLA`;
+              if (recordSha) {
+                await github.rest.repos.createOrUpdateFileContents({
+                  owner, repo, path: FILE, branch: BRANCH, message, sha: recordSha,
+                  content: Buffer.from(content).toString('base64'),
+                });
+              } else {
+                // The first agreement starts the branch, holding only the record.
+                const { data: blob } = await github.rest.git.createBlob({ owner, repo, content, encoding: 'utf-8' });
+                const { data: tree } = await github.rest.git.createTree({
+                  owner, repo, tree: [{ path: FILE, mode: '100644', type: 'blob', sha: blob.sha }],
+                });
+                const { data: commit } = await github.rest.git.createCommit({ owner, repo, message, tree: tree.sha, parents: [] });
+                await github.rest.git.createRef({ owner, repo, ref: `refs/heads/${BRANCH}`, sha: commit.sha });
+              }
+            }
+
+            // Everyone who wrote a commit in the pull request.
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner, repo, pull_number: number, per_page: 100,
+            });
+            const people = new Map();
+            const unknown = new Set();
+            for (const c of commits) {
+              if (!c.author) {
+                unknown.add(c.commit.author.name);
+              } else if (c.author.type !== 'Bot' && !MAINTAINERS.includes(c.author.login.toLowerCase())) {
+                people.set(c.author.id, c.author.login);
+              }
+            }
+            const waiting = [...people].filter(([id]) => !record.some(s => s.id === id)).map(([, login]) => login);
+            const done = waiting.length === 0 && unknown.size === 0;
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha: pr.head.sha, context: 'CLA', target_url: claUrl,
+              state: done ? 'success' : 'failure',
+              description: done ? 'Everyone has agreed to the CLA' : 'Waiting for agreement to the CLA',
+            });
+
+            // One comment on the pull request, kept up to date.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: number, per_page: 100,
+            });
+            const mine = comments.find(c => c.user.type === 'Bot' && c.body.startsWith(MARK));
+            let body;
+            if (done) {
+              if (!mine) return;
+              body = `${MARK}\nThanks, everyone who wrote a commit here has agreed to the [CLA](${claUrl}).`;
+            } else {
+              body = [
+                MARK,
+                'Thanks for your pull request! Before it can be merged, everyone who wrote a commit in it needs to agree to the',
+                `[Contributor Licence Agreement](${claUrl}). It takes one comment, once: you won't be asked again.`,
+                '',
+                'To agree, read the CLA, then post this comment exactly as written:',
+                '',
+                '```',
+                AGREE,
+                '```',
+              ];
+              if (waiting.length) body.push('', `Still to agree: ${waiting.map(l => '@' + l).join(', ')}`);
+              if (unknown.size) {
+                body.push(
+                  '',
+                  `Some commits were made with an email address that isn't linked to a GitHub account (${[...unknown].join(', ')}),`,
+                  'so their author can\'t agree yet. Add that address to your GitHub account under Settings > Emails,',
+                  'or change the commits to use one that is, then comment `recheck`.',
+                );
+              }
+              body = body.join('\n');
+            }
+            if (mine) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+            }
