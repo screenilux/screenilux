@@ -13,6 +13,3 @@ screenilux-win = { path = "../win" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crossbeam-channel = { workspace = true }
-
-[dev-dependencies]
-tracing-subscriber = "0.3"

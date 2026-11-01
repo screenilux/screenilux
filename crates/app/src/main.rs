@@ -19,12 +19,6 @@ fn main() -> eframe::Result<()> {
         .with_target(false)
         .init();
 
-    // What "Uninstall" in Windows' installed apps list runs.
-    if std::env::args().any(|a| a == "--uninstall") {
-        uninstall();
-        return Ok(());
-    }
-
     // Before any window exists, so captures are in physical pixels.
     screenilux_win::set_dpi_awareness();
 
@@ -73,49 +67,10 @@ fn main() -> eframe::Result<()> {
             let mut app = app::App::new(hwnd, &cc.egui_ctx);
             // `screenilux path\to\recording.screenilux` opens it for playing,
             // which is what double-clicking a recording passes.
-            if let Some(path) = std::env::args_os()
-                .skip(1)
-                .find(|a| !a.to_string_lossy().starts_with("--"))
-            {
+            if let Some(path) = std::env::args_os().nth(1) {
                 app.play(std::path::PathBuf::from(path), &cc.egui_ctx);
             }
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     )
-}
-
-/// Remove Screenilux after asking. The executable cannot delete itself while
-/// it runs, so a short-lived command prompt removes the folder once this
-/// process has exited.
-fn uninstall() {
-    use screenilux_win::install;
-    if !install::confirm(
-        "Uninstall Screenilux",
-        "Remove Screenilux from this PC?\n\nYour recordings are not deleted.",
-    ) {
-        return;
-    }
-    install::uninstall();
-    if let Some(dir) = install::install_dir()
-        && dir.is_dir()
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("cmd")
-            .args([
-                "/C",
-                "ping",
-                "127.0.0.1",
-                "-n",
-                "3",
-                ">nul",
-                "&",
-                "rmdir",
-                "/S",
-                "/Q",
-            ])
-            .arg(&dir)
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
-    }
 }

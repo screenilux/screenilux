@@ -4,9 +4,8 @@
 //! AAC itself, so the player needs no ffmpeg either.
 //!
 //! Video is read as NV12 and converted here rather than asking the reader for
-//! RGB. A spike (`examples/spike_decode.rs`) measured the reader's own RGB
-//! path at about 100fps on 1080p against about 540fps for NV12, and two 60fps
-//! screens need 120.
+//! RGB: on 1080p the reader's own RGB path decodes at about 100fps against
+//! about 540fps for NV12, and two 60fps screens need 120.
 //!
 //! Neither decoder is `Send`: a COM source reader stays on the thread that
 //! made it, so each playback thread opens its own.

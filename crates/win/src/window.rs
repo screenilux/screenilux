@@ -128,26 +128,6 @@ pub unsafe fn set_rounded(hwnd: isize, rounded: bool) {
     }
 }
 
-/// Whether this Windows build can exclude a window from capture at all.
-///
-/// `WDA_EXCLUDEFROMCAPTURE` arrived in Windows 10 2004; older builds reject it.
-/// Probing with a throwaway window lets the UI warn up front rather than
-/// producing a doubled camera halfway through a recording.
-///
-/// # Safety
-///
-/// `hwnd` must be a live top-level window handle.
-pub unsafe fn supports_exclusion(hwnd: isize) -> bool {
-    // SAFETY: delegated to the caller's guarantee.
-    unsafe {
-        let ok = exclude_from_capture(hwnd).is_ok();
-        if ok {
-            let _ = include_in_capture(hwnd);
-        }
-        ok
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

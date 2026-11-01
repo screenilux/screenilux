@@ -3,7 +3,7 @@
 //! Chosen over a cloud model for the copyable-text feature because it gives
 //! each word's position, which is what lets a user drag across text on the
 //! video itself, and because it is free, offline and already installed. A
-//! spike read 344 words off a 1080p screen in about 130ms.
+//! test read 344 words off a 1080p screen in about 130ms.
 
 use screenilux_core::text::{Line, Page, Word};
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};

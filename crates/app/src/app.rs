@@ -34,7 +34,6 @@ pub struct App {
     session: Option<Session>,
     overlay: Option<Overlay>,
     status: String,
-    notices: Vec<String>,
     last_save: Option<PathBuf>,
     started_at: Option<Instant>,
     /// The main window's handle, when the platform gave one.
@@ -82,7 +81,6 @@ impl App {
             session: None,
             overlay: None,
             status: "Ready".into(),
-            notices: Vec::new(),
             last_save: None,
             started_at: None,
             hwnd,
@@ -427,10 +425,6 @@ impl App {
             .and_then(|o| o.exclusion_error.clone())
         {
             theme::notice(ui, err);
-            any = true;
-        }
-        for n in &self.notices {
-            theme::notice(ui, n.clone());
             any = true;
         }
         if any {
@@ -961,13 +955,6 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.probes.poll();
         self.follow_displays(&ctx);
-
-        if let Some(session) = &self.session {
-            let fresh = session.notices();
-            if !fresh.is_empty() {
-                self.notices.extend(fresh);
-            }
-        }
 
         // A recording dropped onto the window opens in the player.
         if let Some(path) = dropped_path(&ctx)

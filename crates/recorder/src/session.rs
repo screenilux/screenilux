@@ -83,7 +83,7 @@ struct ScreenSlot {
     monitor: Monitor,
     elapsed: Arc<Elapsed>,
     audio: bool,
-    handle: Option<JoinHandle<Result<&'static str, crate::screen::ScreenError>>>,
+    handle: Option<JoinHandle<Result<(), crate::screen::ScreenError>>>,
     sink: SinkHandle,
 }
 
@@ -104,7 +104,6 @@ pub struct Session {
     workspace: TempDir,
     focus: Option<FocusWorker>,
     router: Option<RouterWorker>,
-    notices_rx: Receiver<String>,
     started: std::time::SystemTime,
 }
 
@@ -147,7 +146,6 @@ impl Session {
         let workspace = TempDir::new("screenilux-session")?;
         let control = Arc::new(Control::new());
         let sync = Arc::new(SyncClock::new(config.monitors.len()));
-        let (notices, notices_rx) = unbounded();
 
         let mut screens = Vec::new();
         let mut event_senders: Vec<(screenilux_core::geometry::Rect, Sender<PointerEvent>)> =
@@ -201,8 +199,6 @@ impl Session {
                 control: Arc::clone(&control),
                 sync: Arc::clone(&sync),
                 elapsed: Arc::clone(&elapsed),
-                label: monitor.label.clone(),
-                notices: notices.clone(),
                 compositor,
                 events: Some(event_rx),
                 pointer: Arc::new(screenilux_win::cursor_pos),
@@ -275,7 +271,6 @@ impl Session {
             workspace,
             focus,
             router,
-            notices_rx,
             started: std::time::SystemTime::now(),
         })
     }
@@ -288,10 +283,6 @@ impl Session {
         self.control.resume();
     }
 
-    pub fn is_paused(&self) -> bool {
-        self.control.state() == crate::control::RunState::Paused
-    }
-
     /// Recorded seconds, excluding paused time.
     pub fn duration(&self) -> Duration {
         self.screens
@@ -299,11 +290,6 @@ impl Session {
             .map(|s| s.elapsed.get())
             .max()
             .unwrap_or_default()
-    }
-
-    /// Anything worth telling the user, such as an encoder fallback.
-    pub fn notices(&self) -> Vec<String> {
-        self.notices_rx.try_iter().collect()
     }
 
     /// Stop every screen and join its thread.
@@ -472,10 +458,7 @@ impl screenilux_core::ports::VideoSink for SinkCarrier {
     fn open_segment(&mut self) -> Result<(), screenilux_core::ports::SinkError> {
         self.inner.as_mut().expect("sink taken").open_segment()
     }
-    fn write(
-        &mut self,
-        frame: &[u8],
-    ) -> Result<screenilux_core::ports::WriteStatus, screenilux_core::ports::SinkError> {
+    fn write(&mut self, frame: &[u8]) -> Result<(), screenilux_core::ports::SinkError> {
         self.inner.as_mut().expect("sink taken").write(frame)
     }
     fn close_segment(&mut self, pad: u64) -> Result<(), screenilux_core::ports::SinkError> {
@@ -486,9 +469,6 @@ impl screenilux_core::ports::VideoSink for SinkCarrier {
     }
     fn write_audio(&mut self, pcm: &[u8]) -> Result<(), screenilux_core::ports::SinkError> {
         self.inner.as_mut().expect("sink taken").write_audio(pcm)
-    }
-    fn encoder_label(&self) -> &'static str {
-        self.inner.as_ref().expect("sink taken").encoder_label()
     }
 }
 
