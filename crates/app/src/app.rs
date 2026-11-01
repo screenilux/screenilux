@@ -794,13 +794,20 @@ impl App {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(icon::CHECK).size(16.0).color(p.signal));
+                    // The buttons take their room first, so a long name is
+                    // cut short instead of running under them.
+                    let name_width = (ui.available_width() - 130.0).max(60.0);
                     ui.vertical(|ui| {
+                        ui.set_max_width(name_width);
                         ui.spacing_mut().item_spacing.y = 1.0;
                         ui.label(
                             egui::RichText::new("Saved")
                                 .font(egui::FontId::new(15.0, theme::strong())),
                         );
-                        ui.label(egui::RichText::new(name).size(13.0).color(p.weak));
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(name).size(13.0).color(p.weak))
+                                .truncate(),
+                        );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let folder =

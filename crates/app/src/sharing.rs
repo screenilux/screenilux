@@ -368,8 +368,10 @@ fn open_button(ui: &mut egui::Ui, link: &str) {
 /// the link itself, and copying or opening it.
 pub fn link_panel(ui: &mut egui::Ui, link: &Link) -> Option<Asked> {
     let p = theme::palette(ui);
+    // A mark, then text that wraps under it rather than running off the edge.
     let status = |ui: &mut egui::Ui, mark: &str, colour: egui::Color32, text: String| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             ui.label(egui::RichText::new(mark).color(colour));
             ui.label(egui::RichText::new(text).size(13.0).color(p.weak));
         });
@@ -394,8 +396,6 @@ pub fn link_panel(ui: &mut egui::Ui, link: &Link) -> Option<Asked> {
                 p.signal,
                 "Link copied. You can send it now; it plays as soon as the upload ends.".into(),
             );
-            ui.add_space(2.0);
-            link_row(ui, link, false);
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 theme::progress(ui, *done, ui.available_width() - 44.0);
@@ -405,6 +405,8 @@ pub fn link_panel(ui: &mut egui::Ui, link: &Link) -> Option<Asked> {
                         .color(p.weak),
                 );
             });
+            ui.add_space(6.0);
+            link_row(ui, link, false);
         }
         Link::Ready { link, expires } => {
             let mut text = "Ready to watch. Only people with the link can.".to_string();
@@ -415,7 +417,7 @@ pub fn link_panel(ui: &mut egui::Ui, link: &Link) -> Option<Asked> {
                 );
             }
             status(ui, icon::CHECK, p.signal, text);
-            ui.add_space(2.0);
+            ui.add_space(6.0);
             link_row(ui, link, true);
         }
         Link::Failed(e) => {
@@ -428,27 +430,26 @@ pub fn link_panel(ui: &mut egui::Ui, link: &Link) -> Option<Asked> {
     asked
 }
 
-/// The link, then copy and open.
+/// The link across the whole width, then copy and open under it.
 fn link_row(ui: &mut egui::Ui, link: &str, ready: bool) {
     let p = theme::palette(ui);
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            open_button(ui, link);
-            copy_button(ui, link, ready);
-            let field = egui::Frame::new()
-                .fill(p.base)
-                .stroke(egui::Stroke::new(1.0, p.stroke))
-                .corner_radius(egui::CornerRadius::same(10))
-                .inner_margin(egui::Margin::symmetric(10, 8));
-            field.show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.add(
-                    egui::Label::new(egui::RichText::new(readable(link)).size(13.0).color(p.weak))
-                        .truncate(),
-                )
-                .on_hover_text(readable(link));
-            });
+    egui::Frame::new()
+        .fill(p.base)
+        .stroke(egui::Stroke::new(1.0, p.stroke))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(
+                egui::Label::new(egui::RichText::new(readable(link)).size(13.0).color(p.weak))
+                    .truncate(),
+            )
+            .on_hover_text(readable(link));
         });
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        copy_button(ui, link, ready);
+        open_button(ui, link);
     });
 }
 

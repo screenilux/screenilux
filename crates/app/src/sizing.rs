@@ -58,9 +58,9 @@ pub struct Sizer {
     bar: Option<Shape>,
     /// What the window adds around its content, measured once it exists.
     frame: egui::Vec2,
-    /// The Record tab's height last asked for, so a resize still on its way
-    /// is not asked for again every frame.
-    asked_height: Option<f32>,
+    /// The Record tab's size last asked for, so a resize still on its way is
+    /// not asked for again every frame.
+    asked: Option<egui::Vec2>,
 }
 
 impl Sizer {
@@ -71,7 +71,7 @@ impl Sizer {
             stage: None,
             bar: None,
             frame: FRAME_GUESS,
-            asked_height: None,
+            asked: None,
         }
     }
 
@@ -134,7 +134,9 @@ impl Sizer {
     }
 
     /// Make the Record tab's window `content` tall, as far as the screen
-    /// allows, keeping its width and its bottom on the screen.
+    /// allows, keeping its bottom on the screen. It also stays at least as
+    /// wide as the column, which can be lost when the window moves to a
+    /// screen with another scale: narrower, the rows overlap.
     pub fn fit_height(&mut self, ctx: &egui::Context, content: f32) {
         if self.current != Some(Fit::Settings) {
             return;
@@ -150,26 +152,22 @@ impl Sizer {
         let height = content
             .ceil()
             .clamp(MIN_SIZE.y, (reach.height() - self.frame.y).max(MIN_SIZE.y));
-        if (inner.height() - height).abs() < 1.0 {
-            self.asked_height = None;
+        let width = inner.width().max(RECORD_WIDTH);
+        let wanted = egui::vec2(width, height);
+        if (inner.size() - wanted).abs().max_elem() < 1.0 {
+            self.asked = None;
             return;
         }
-        if self.asked_height == Some(height) {
+        if self.asked == Some(wanted) {
             return;
         }
-        self.asked_height = Some(height);
-        let bottom = outer.top() + self.frame.y + height;
-        if bottom > reach.bottom() {
-            let top = (reach.bottom() - self.frame.y - height).max(reach.top());
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                outer.left(),
-                top,
-            )));
+        self.asked = Some(wanted);
+        let outer_size = wanted + self.frame;
+        let pos = clamp_onto(reach, outer.min, outer_size);
+        if pos != outer.min {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            inner.width(),
-            height,
-        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
     }
 
     fn slot(&mut self, fit: Fit) -> &mut Option<Shape> {
