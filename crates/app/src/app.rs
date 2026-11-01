@@ -46,6 +46,9 @@ pub struct App {
     /// What is kept between runs besides sharing: where recordings go and
     /// whether a copy stays here once shared.
     prefs: Prefs,
+    /// How tall the Record tab last wanted to be; the Recordings tab keeps
+    /// to it.
+    record_height: f32,
     /// The player window's icon, made once.
     player_icon: Arc<egui::IconData>,
     started_at: Option<Instant>,
@@ -104,6 +107,7 @@ impl App {
             sharing: Sharing::load(),
             shares: Shares::load(),
             prefs: Prefs::default(),
+            record_height: 0.0,
             player_icon: Arc::new(egui::IconData {
                 rgba: crate::icon::rgba(64),
                 width: 64,
@@ -1122,28 +1126,19 @@ impl App {
     }
 
     /// The Recordings tab: open a file, or one saved here. Either plays in
-    /// the player window.
-    fn recordings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> f32 {
+    /// the player window. It keeps the Record tab's height, so switching
+    /// between the two does not resize the window, and its list scrolls.
+    fn recordings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = theme::palette(ui);
         let out_dir = self.settings.out_dir.clone();
-        let top = 4.0;
-        let bottom = 20.0;
-        let column = egui::CentralPanel::default_margins()
+        egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
                 left: MARGIN,
                 right: MARGIN,
-                top: top as i8,
-                bottom: bottom as i8,
+                top: 4,
+                bottom: 20,
             }))
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| self.player.library(ui, ctx, &out_dir))
-                    .content_size
-                    .y
-            })
-            .inner;
-        top + column + bottom
+            .show(ui, |ui| self.player.library(ui, ctx, &out_dir));
     }
 
     /// Settings: only what is set once and left. Recording options stay on
@@ -1506,9 +1501,15 @@ impl eframe::App for App {
         self.sizer.update(&ctx, Fit::Settings);
         let column = match self.tab {
             Tab::Record => self.record_tab(ui, &ctx),
-            Tab::Recordings => self.recordings_tab(ui, &ctx),
+            Tab::Recordings => {
+                self.recordings_tab(ui, &ctx);
+                self.record_height
+            }
             Tab::Settings => self.settings_tab(ui),
         };
+        if self.tab == Tab::Record {
+            self.record_height = column;
+        }
         self.sizer.fit_height(&ctx, header + column);
         self.player_window(&ctx);
 

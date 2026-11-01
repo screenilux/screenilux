@@ -681,11 +681,16 @@ impl PlayerView {
                     egui::RichText::new("Recent recordings")
                         .font(egui::FontId::new(14.0, theme::strong())),
                 );
-                for r in recents.iter() {
-                    if recent_row(ui, r).clicked() {
-                        open = Some(r.path.clone());
-                    }
-                }
+                // The list scrolls in whatever height the window has left.
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        for r in recents.iter() {
+                            if recent_row(ui, r).clicked() {
+                                open = Some(r.path.clone());
+                            }
+                        }
+                    });
             });
         });
         if let Some(path) = open {
