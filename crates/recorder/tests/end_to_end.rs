@@ -102,6 +102,7 @@ fn config(_f: &Fixture, monitors: Vec<screenilux_core::Monitor>) -> SessionConfi
         monitors,
         fps: 30,
         microphone: false,
+        click_sound: false,
         effects: effects(),
         camera: None,
         // No hook here: these runs verify capture and timing, not overlays
@@ -180,15 +181,21 @@ fn records_every_screen_in_sync_with_a_manifest() {
     let session = Session::start(config(&f, all)).expect("session should start");
     std::thread::sleep(Duration::from_secs(4));
     let recorded = session.duration().as_secs_f64();
-    let folder = session.finish(f.dir.path()).expect("should save");
+    let package = session.finish(f.dir.path()).expect("should save");
 
     assert!(
-        folder.is_dir(),
-        "several screens should give a session folder"
+        package.is_file() && screenilux_core::package::is_package(&package),
+        "several screens should give one .screenilux file, got {}",
+        package.display()
     );
-    let manifest_path = folder.join("recording.json");
-    let text = std::fs::read_to_string(&manifest_path).expect("manifest should exist");
-    let manifest = Manifest::from_json(&text).expect("manifest should parse");
+    // Unpacked, it is the session folder the player and older tools read.
+    let folder = f.dir.path().join("unpacked");
+    let manifest = screenilux_core::package::unpack(&package, &folder).expect("should unpack");
+    assert_eq!(
+        Manifest::from_json(&std::fs::read_to_string(folder.join("recording.json")).unwrap())
+            .unwrap(),
+        manifest
+    );
 
     assert_eq!(manifest.screens.len(), count);
     assert_eq!(manifest.fps, 30);
@@ -231,6 +238,83 @@ fn records_every_screen_in_sync_with_a_manifest() {
     assert!(
         spread <= 2,
         "screens differ by {spread} frames ({frames:?}); the shared clock should hold them within one or two"
+    );
+}
+
+/// Duration of the first audio stream, or `None` if the file has none.
+fn audio_duration_of(ffmpeg: &Path, file: &Path) -> Option<f64> {
+    let out = Command::new(ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(file)
+        .output()
+        .expect("ffprobe should run");
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+fn video_duration_of(ffmpeg: &Path, file: &Path) -> f64 {
+    let out = Command::new(ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(file)
+        .output()
+        .expect("ffprobe should run");
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0.0)
+}
+
+/// The encoder places audio by counting samples, not by timestamp. So any
+/// microphone audio captured while paused that reaches the encoder both plays
+/// in the output and pushes every later sample out of sync with the picture.
+#[test]
+#[ignore = "records the real screen and microphone for several seconds"]
+fn a_pause_does_not_leak_microphone_audio() {
+    let Some(f) = fixture() else { return };
+    if !screenilux_win::has_microphone() {
+        eprintln!("no microphone; skipping the audio check");
+        return;
+    }
+    let Ok(all) = display::monitors() else { return };
+    let primary: Vec<_> = all.into_iter().filter(|m| m.is_primary).collect();
+
+    let mut cfg = config(&f, primary);
+    cfg.microphone = true;
+    let session = Session::start(cfg).expect("session should start");
+    std::thread::sleep(Duration::from_millis(1500));
+    session.pause();
+    // Long enough for the capture queue to fill completely.
+    std::thread::sleep(Duration::from_millis(3000));
+    session.resume();
+    std::thread::sleep(Duration::from_millis(1500));
+    let path = session.finish(f.dir.path()).expect("should save");
+
+    let video = video_duration_of(&f.ffmpeg, &path);
+    let Some(audio) = audio_duration_of(&f.ffmpeg, &path) else {
+        // A microphone blocked by privacy settings yields no stream at all.
+        eprintln!("no audio stream was written; skipping");
+        return;
+    };
+    assert!(
+        (audio - video).abs() < 0.15,
+        "audio is {audio:.3}s against {video:.3}s of video; paused audio leaked in"
     );
 }
 

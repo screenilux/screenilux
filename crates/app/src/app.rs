@@ -1,4 +1,4 @@
-//! The settings window.
+//! The main window: the Record tab, and the frame around both tabs.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -6,12 +6,27 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use screenilux_recorder::{Session, SessionConfig};
-use screenilux_win::Hotkey;
 
 use crate::overlay::Overlay;
-use crate::state::{CAMERA_SIZES, FPS_CHOICES, Phase, Probes, Runtime, Settings};
+use crate::player_view::{PlayerView, dropped_path, playable};
+use crate::sizing::{Fit, Sizer};
+use crate::state::{FPS_CHOICES, Phase, Probes, Runtime, Settings};
+use crate::theme::{self, Palette, icon};
+
+/// The widest the Record tab's settings get. Wider, and a label sits too far
+/// from the switch it describes.
+const COLUMN: f32 = 760.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Record,
+    Play,
+}
 
 pub struct App {
+    tab: Tab,
+    sizer: Sizer,
+    player: PlayerView,
     settings: Settings,
     probes: Probes,
     runtime: Runtime,
@@ -21,18 +36,45 @@ pub struct App {
     status: String,
     notices: Vec<String>,
     last_save: Option<PathBuf>,
-    /// Re-shown after a recording stops, if the window minimised itself.
-    was_minimised: bool,
     started_at: Option<Instant>,
-    unavailable_hotkeys: Vec<String>,
+    /// The main window's handle, when the platform gave one.
+    hwnd: Option<isize>,
+    /// Shrunk to the recording bar.
+    compact: bool,
+    /// The window's opacity and corners as last set, so Windows is only
+    /// asked when they change.
+    alpha: u8,
+    rounded: bool,
+    /// Listens for displays coming and going; kept alive with the app.
+    _displays: screenilux_win::DisplayWatcher,
+    display_rx: std::sync::mpsc::Receiver<()>,
+    /// When the displays last changed and have not been re-read since.
+    displays_changed: Option<Instant>,
 }
 
+/// Windows sends several messages for one change, and the new layout can
+/// take a moment to settle; reading once after a short quiet spell catches
+/// the final state once.
+const DISPLAY_SETTLE: Duration = Duration::from_millis(400);
+
+/// The recording bar's opacity when the pointer is elsewhere: there, but out
+/// of the way of what is being recorded behind it.
+const BAR_ALPHA: u8 = 170;
+
 impl App {
-    pub fn new() -> Self {
+    pub fn new(hwnd: Option<isize>, ctx: &egui::Context) -> Self {
+        let (tx, display_rx) = std::sync::mpsc::channel();
+        let repaint = ctx.clone();
+        let displays = screenilux_win::DisplayWatcher::start(move || {
+            let _ = tx.send(());
+            repaint.request_repaint();
+        });
         let runtime = Runtime::new();
         let probes = Probes::start();
-        let unavailable_hotkeys = runtime.hook.unavailable_hotkeys();
         Self {
+            tab: Tab::Record,
+            sizer: Sizer::new(),
+            player: PlayerView::new(),
             settings: Settings::new(),
             probes,
             runtime,
@@ -42,10 +84,21 @@ impl App {
             status: "Ready".into(),
             notices: Vec::new(),
             last_save: None,
-            was_minimised: false,
             started_at: None,
-            unavailable_hotkeys,
+            hwnd,
+            compact: false,
+            alpha: 255,
+            rounded: false,
+            _displays: displays,
+            display_rx,
+            displays_changed: None,
         }
+    }
+
+    /// Switch to the Play tab and open `path`.
+    pub fn play(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.tab = Tab::Play;
+        self.player.open(path, ctx);
     }
 
     fn busy(&self) -> bool {
@@ -84,6 +137,7 @@ impl App {
             monitors: targets,
             fps: self.settings.fps,
             microphone: self.settings.microphone && self.probes.has_microphone,
+            click_sound: self.settings.click_sound,
             effects: self.settings.effects,
             camera,
             pointer_events: Some(self.runtime.hook.pointer_events()),
@@ -95,10 +149,10 @@ impl App {
                 self.phase = Phase::Recording;
                 self.status = "Recording".into();
                 self.started_at = Some(Instant::now());
-                if self.settings.minimize {
-                    self.was_minimised = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                }
+                // The window stays out of the recording, as the bar or not.
+                self.set_captured(false);
+                self.compact = self.settings.shrink;
+                ctx.request_repaint();
             }
             Err(e) => self.status = format!("Could not start: {e}"),
         }
@@ -127,10 +181,8 @@ impl App {
         };
         self.phase = Phase::Saving;
         self.status = "Saving…".into();
-        if self.was_minimised {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            self.was_minimised = false;
-        }
+        self.compact = false;
+        self.set_captured(true);
         // Painted once so the window shows "Saving…" before the blocking work.
         ctx.request_repaint();
 
@@ -142,11 +194,162 @@ impl App {
                     path.file_name().unwrap_or_default().to_string_lossy()
                 );
                 self.last_save = Some(path);
+                self.player.recordings_changed();
             }
             Err(e) => self.status = format!("Could not save: {e}"),
         }
         self.phase = Phase::Idle;
         self.started_at = None;
+    }
+
+    /// Re-read the displays once they have settled after a change. Not
+    /// during a recording: what is being recorded is fixed at the start.
+    fn follow_displays(&mut self, ctx: &egui::Context) {
+        if self.display_rx.try_iter().count() > 0 {
+            self.displays_changed = Some(Instant::now());
+        }
+        let Some(at) = self.displays_changed else {
+            return;
+        };
+        if self.busy() || self.phase == Phase::Saving {
+            return;
+        }
+        let quiet = at.elapsed();
+        if quiet < DISPLAY_SETTLE {
+            ctx.request_repaint_after(DISPLAY_SETTLE - quiet);
+            return;
+        }
+        self.displays_changed = None;
+        self.settings.refresh_monitors();
+    }
+
+    /// Let screen capture see this window, or hide it from capture.
+    fn set_captured(&self, captured: bool) {
+        let Some(h) = self.hwnd else { return };
+        // SAFETY: the handle eframe gave for this window, which lives as
+        // long as the app does.
+        let result = unsafe {
+            if captured {
+                screenilux_win::include_in_capture(h)
+            } else {
+                screenilux_win::exclude_from_capture(h)
+            }
+        };
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "could not change the window's capture visibility");
+        }
+    }
+
+    /// The bar is see-through until the pointer is over it, and has round
+    /// corners; the normal window has neither.
+    fn dress_window(&mut self, ctx: &egui::Context) {
+        let Some(h) = self.hwnd else { return };
+        let hovered = ctx.input(|i| i.pointer.hover_pos().is_some());
+        let alpha = if self.compact && !hovered {
+            BAR_ALPHA
+        } else {
+            255
+        };
+        // SAFETY: as in `set_captured`.
+        unsafe {
+            if self.compact != self.rounded {
+                screenilux_win::set_rounded(h, self.compact);
+                self.rounded = self.compact;
+            }
+            if alpha != self.alpha {
+                screenilux_win::set_opacity(h, alpha);
+                self.alpha = alpha;
+            }
+        }
+    }
+
+    /// The window shrunk to a row at the bottom of the screen while
+    /// recording: the clock, pause and stop, and a way back to the full
+    /// window. Drag it anywhere to move it.
+    fn bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = theme::palette(ui);
+        egui::CentralPanel::default_margins()
+            .frame(
+                egui::Frame::new()
+                    .fill(p.surface)
+                    .stroke(egui::Stroke::new(1.0, p.stroke))
+                    .inner_margin(egui::Margin::symmetric(14, 0)),
+            )
+            .show(ui, |ui| {
+                let grip = ui.interact(
+                    ui.max_rect(),
+                    egui::Id::unique("bar-drag"),
+                    egui::Sense::drag(),
+                );
+                if grip.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                let paused = self.phase == Phase::Paused;
+                let accent = if paused { p.paused } else { p.tally };
+                ui.horizontal_centered(|ui| {
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 5.5, accent);
+                    let secs = self.recorded().as_secs();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{:02}:{:02}:{:02}",
+                            secs / 3600,
+                            (secs % 3600) / 60,
+                            secs % 60
+                        ))
+                        .font(egui::FontId::new(22.0, theme::light()))
+                        .color(p.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let stop = theme::primary(format!("{}  Stop", icon::STOP), p.signal)
+                            .min_size(egui::vec2(0.0, 32.0));
+                        if ui.add(stop).on_hover_text("Stop and save").clicked() {
+                            self.stop(ctx);
+                        }
+                        let (glyph, text) = if paused {
+                            (icon::RECORD, "Resume")
+                        } else {
+                            (icon::PAUSE, "Pause")
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(format!("{glyph}  {text}"))
+                                    .min_size(egui::vec2(0.0, 32.0)),
+                            )
+                            .clicked()
+                        {
+                            self.toggle_pause();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(icon::EXPAND)
+                                    .frame(false)
+                                    .min_size(egui::vec2(32.0, 32.0)),
+                            )
+                            .on_hover_text("Show the full window")
+                            .clicked()
+                        {
+                            self.compact = false;
+                        }
+                    });
+                });
+            });
+    }
+
+    /// The camera bubble, shown whenever the camera is on, recording or not,
+    /// so it can be positioned before starting.
+    fn show_overlay(&mut self, ctx: &egui::Context) {
+        if let (Some(overlay), Some(feed)) =
+            (self.overlay.as_mut(), self.runtime.camera_feed.as_ref())
+        {
+            let size = self.settings.camera_dimensions();
+            overlay.show(ctx, feed, size);
+            if let Some(cam) = &self.runtime.camera {
+                let p = overlay.position();
+                cam.move_to(p.left, p.top);
+            }
+        }
     }
 
     fn toggle_camera(&mut self, on: bool) {
@@ -177,146 +380,147 @@ impl App {
         }
     }
 
-    fn handle_hotkeys(&mut self, ctx: &egui::Context) {
-        let pressed: Vec<Hotkey> = self.runtime.hook.hotkeys().try_iter().collect();
-        for key in pressed {
-            match key {
-                Hotkey::StartStop => {
-                    if self.busy() {
-                        self.stop(ctx);
-                    } else {
-                        self.start(ctx);
-                    }
-                }
-                Hotkey::PauseResume => self.toggle_pause(),
-            }
+    // -- Record tab --------------------------------------------------------
+
+    fn record_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = theme::palette(ui);
+        egui::Panel::bottom("transport")
+            .frame(
+                egui::Frame::new()
+                    .fill(p.surface)
+                    .inner_margin(egui::Margin::symmetric(20, 14)),
+            )
+            .show_separator_line(true)
+            .show(ui, |ui| {
+                theme::centered(ui, COLUMN, |ui| self.transport(ui, ctx))
+            });
+
+        egui::CentralPanel::default_margins()
+            .frame(
+                egui::Frame::new()
+                    .fill(p.base)
+                    .inner_margin(egui::Margin::symmetric(20, 14)),
+            )
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        theme::centered(ui, COLUMN, |ui| {
+                            self.warnings(ui);
+                            self.screens_section(ui);
+                            ui.add_space(6.0);
+                            self.sound_section(ui);
+                            ui.add_space(6.0);
+                            self.pointer_section(ui);
+                            ui.add_space(6.0);
+                            self.output_section(ui);
+                        });
+                    });
+            });
+    }
+
+    fn warnings(&self, ui: &mut egui::Ui) {
+        let mut any = false;
+        if let Some(err) = self
+            .overlay
+            .as_ref()
+            .and_then(|o| o.exclusion_error.clone())
+        {
+            theme::notice(ui, err);
+            any = true;
+        }
+        for n in &self.notices {
+            theme::notice(ui, n.clone());
+            any = true;
+        }
+        if any {
+            ui.add_space(4.0);
         }
     }
 
-    // -- panels -----------------------------------------------------------
-
-    fn screens_panel(&mut self, ui: &mut egui::Ui) {
+    fn screens_section(&mut self, ui: &mut egui::Ui) {
         let busy = self.busy();
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Screens to record").strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Refresh"))
-                    .clicked()
-                {
-                    self.settings.refresh_monitors();
+        let phase = self.phase;
+        let bubble = self
+            .overlay
+            .as_ref()
+            .filter(|_| self.settings.effects.camera)
+            .map(|o| o.position());
+        ui.label(egui::RichText::new("Screens").font(egui::FontId::new(14.0, theme::strong())));
+        let p = theme::palette(ui);
+        egui::Frame::new()
+            .fill(p.surface)
+            .stroke(egui::Stroke::new(1.0, p.stroke))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if self.settings.monitors.is_empty() {
+                    ui.label(
+                        "No displays were found. One will show here as soon as it is connected.",
+                    );
+                    return;
+                }
+                let s = &mut self.settings;
+                let whole = s.whole_desktop && s.monitors.len() > 1;
+                monitor_map(
+                    ui,
+                    &s.monitors,
+                    &mut s.selected,
+                    whole,
+                    !busy,
+                    phase,
+                    bubble,
+                );
+                let chosen = s.selected.iter().filter(|&&on| on).count();
+                let summary = if whole {
+                    "The whole desktop is recorded as one video.".to_string()
+                } else if chosen > 1 {
+                    format!("{chosen} screens, each its own video, saved together as one file.")
+                } else if s.monitors.len() > 1 {
+                    "Click another screen to record it too.".to_string()
+                } else {
+                    "This screen is recorded.".to_string()
+                };
+                theme::hint(ui, &summary);
+                if s.monitors.len() > 1 {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        theme::switch(
+                            ui,
+                            &mut s.whole_desktop,
+                            "Record the whole desktop as one video",
+                        );
+                    });
                 }
             });
-        });
-
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            let multiple = self.settings.monitors.len() > 1;
-            let locked = busy || (multiple && self.settings.whole_desktop);
-            for (i, monitor) in self.settings.monitors.iter().enumerate() {
-                let label = format!(
-                    "{}  –  {}×{}{}",
-                    monitor.label,
-                    monitor.bounds.width,
-                    monitor.bounds.height,
-                    if monitor.is_primary {
-                        "  (primary)"
-                    } else {
-                        ""
-                    }
-                );
-                ui.add_enabled(
-                    !locked,
-                    egui::Checkbox::new(&mut self.settings.selected[i], label),
-                );
-            }
-            if multiple {
-                ui.separator();
-                let all = screenilux_core::virtual_bounds(&self.settings.monitors);
-                let label = match all {
-                    Some(r) => format!("Whole desktop as one video  –  {}×{}", r.width, r.height),
-                    None => "Whole desktop as one video".to_string(),
-                };
-                ui.add_enabled(
-                    !busy,
-                    egui::Checkbox::new(&mut self.settings.whole_desktop, label),
-                );
-            }
-            if self.settings.monitors.is_empty() {
-                ui.label("No displays detected");
-            }
-        });
     }
 
-    fn options_panel(&mut self, ui: &mut egui::Ui) {
+    fn sound_section(&mut self, ui: &mut egui::Ui) {
         let busy = self.busy();
-
-        ui.horizontal(|ui| {
-            let available = self.probes.has_microphone;
-            ui.add_enabled(
-                !busy && available,
-                egui::Checkbox::new(&mut self.settings.microphone, "Record microphone"),
-            );
-            if self.probes.ready && !available {
-                ui.label(egui::RichText::new("no microphone found").weak().small());
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("FPS");
-            ui.add_enabled_ui(!busy, |ui| {
-                egui::ComboBox::from_id_salt("fps")
-                    .selected_text(self.settings.fps.to_string())
-                    .width(70.0)
-                    .show_ui(ui, |ui| {
-                        for f in FPS_CHOICES {
-                            ui.selectable_value(&mut self.settings.fps, f, f.to_string());
-                        }
-                    });
-            });
-            ui.add_space(12.0);
-            ui.checkbox(&mut self.settings.minimize, "Minimize while recording");
-        });
-
-        ui.add_space(6.0);
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label("Mouse");
-            ui.separator();
-            let fx = &mut self.settings.effects;
-            ui.add_enabled_ui(!busy, |ui| {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut fx.cursor, "Show cursor");
-                    ui.add_space(16.0);
-                    ui.checkbox(&mut fx.zoom, "Wheel zoom");
-                });
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut fx.trail, "Mouse trail");
-                    ui.add_space(16.0);
-                    ui.checkbox(&mut fx.clicks, "Click effect");
-                });
-            });
-            ui.label(
-                egui::RichText::new(
-                    "Zoom with Ctrl+Alt+wheel while recording; Ctrl+Alt+middle-click resets it.",
-                )
-                .weak()
-                .small(),
-            );
-        });
-
-        ui.add_space(6.0);
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.label("Camera");
-            ui.separator();
+        theme::section(ui, "Sound and camera", |ui| {
             ui.horizontal(|ui| {
+                let available = self.probes.has_microphone;
+                ui.label(icon::MIC);
+                ui.add_enabled_ui(!busy && available, |ui| {
+                    theme::switch(ui, &mut self.settings.microphone, "Microphone");
+                });
+                if self.probes.ready && !available {
+                    theme::hint(ui, "No microphone found");
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(icon::CAMERA);
                 let mut on = self.settings.effects.camera;
-                if ui
-                    .add_enabled(!busy, egui::Checkbox::new(&mut on, "Show camera"))
-                    .changed()
-                {
+                let changed = ui
+                    .add_enabled_ui(!busy, |ui| theme::switch(ui, &mut on, "Camera"))
+                    .inner
+                    .changed();
+                if changed {
                     self.settings.effects.camera = on;
                     self.toggle_camera(on);
                 }
-
+                ui.add_space(8.0);
                 let current = self
                     .probes
                     .cameras
@@ -324,30 +528,20 @@ impl App {
                     .cloned()
                     .unwrap_or_else(|| {
                         if self.probes.ready {
-                            "(no camera found)".into()
+                            "No camera found".into()
                         } else {
-                            "(looking…)".into()
+                            "Looking for cameras…".into()
                         }
                     });
-                ui.add_enabled_ui(!busy, |ui| {
+                ui.add_enabled_ui(!busy && !self.probes.cameras.is_empty(), |ui| {
                     let mut changed = false;
                     egui::ComboBox::from_id_salt("cam")
                         .selected_text(current)
-                        .width(200.0)
+                        .width(190.0)
                         .show_ui(ui, |ui| {
                             for (i, name) in self.probes.cameras.iter().enumerate() {
                                 changed |= ui
                                     .selectable_value(&mut self.settings.camera_device, i, name)
-                                    .changed();
-                            }
-                        });
-                    egui::ComboBox::from_id_salt("camsize")
-                        .selected_text(CAMERA_SIZES[self.settings.camera_size].0)
-                        .width(90.0)
-                        .show_ui(ui, |ui| {
-                            for (i, (name, _, _)) in CAMERA_SIZES.iter().enumerate() {
-                                changed |= ui
-                                    .selectable_value(&mut self.settings.camera_size, i, *name)
                                     .changed();
                             }
                         });
@@ -356,117 +550,417 @@ impl App {
                     }
                 });
             });
-            ui.label(
-                egui::RichText::new(
-                    "Drag the bubble anywhere; it is burned into that screen's recording.",
-                )
-                .weak()
-                .small(),
+            theme::hint(
+                ui,
+                "Drag the camera bubble where you want it, even while recording. It is \
+                 recorded into the screen it sits on.",
             );
         });
+    }
 
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("Save to");
-            let mut text = self.settings.out_dir.display().to_string();
-            if ui
-                .add_enabled(
-                    !busy,
-                    egui::TextEdit::singleline(&mut text).desired_width(300.0),
-                )
-                .changed()
-            {
-                self.settings.out_dir = PathBuf::from(text);
-            }
-            if ui.add_enabled(!busy, egui::Button::new("Open")).clicked() {
-                let target = self
-                    .last_save
-                    .clone()
-                    .unwrap_or_else(|| self.settings.out_dir.clone());
-                reveal(&target);
-            }
+    fn pointer_section(&mut self, ui: &mut egui::Ui) {
+        let busy = self.busy();
+        theme::section(ui, "Pointer", |ui| {
+            let fx = &mut self.settings.effects;
+            ui.add_enabled_ui(!busy, |ui| {
+                egui::Grid::new("pointer")
+                    .num_columns(2)
+                    .spacing(egui::vec2(32.0, 10.0))
+                    .show(ui, |ui| {
+                        theme::switch(ui, &mut fx.cursor, "Show the pointer");
+                        theme::switch(ui, &mut fx.zoom, "Zoom with the wheel");
+                        ui.end_row();
+                        theme::switch(ui, &mut fx.trail, "Trail behind the pointer");
+                        theme::switch(ui, &mut self.settings.click_sound, "Click sound");
+                        ui.end_row();
+                    });
+            });
+            theme::hint(
+                ui,
+                "While recording, Ctrl+Alt+wheel zooms in where the pointer is and \
+                 Ctrl+Alt+middle-click zooms back out.",
+            );
+        });
+    }
+
+    fn output_section(&mut self, ui: &mut egui::Ui) {
+        let busy = self.busy();
+        theme::section(ui, "Video", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Frame rate");
+                ui.add_enabled_ui(!busy, |ui| {
+                    egui::ComboBox::from_id_salt("fps")
+                        .selected_text(format!("{} fps", self.settings.fps))
+                        .width(84.0)
+                        .show_ui(ui, |ui| {
+                            for f in FPS_CHOICES {
+                                ui.selectable_value(&mut self.settings.fps, f, format!("{f} fps"));
+                            }
+                        });
+                });
+                ui.add_space(24.0);
+                theme::switch(
+                    ui,
+                    &mut self.settings.shrink,
+                    "Shrink to a bar while recording",
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label(icon::FOLDER);
+                ui.label(egui::RichText::new(self.settings.out_dir.display().to_string()).weak())
+                    .on_hover_text("Where recordings are saved");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Open folder").clicked() {
+                        let _ = std::fs::create_dir_all(&self.settings.out_dir);
+                        reveal(&self.settings.out_dir);
+                    }
+                    if ui
+                        .add_enabled(!busy, egui::Button::new("Change…"))
+                        .clicked()
+                        && let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Save recordings to")
+                            .set_directory(&self.settings.out_dir)
+                            .pick_folder()
+                    {
+                        self.settings.out_dir = dir;
+                        self.player.recordings_changed();
+                    }
+                });
+            });
         });
     }
 
     fn transport(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let secs = self.recorded().as_secs();
-        ui.vertical_centered(|ui| {
-            ui.label(
-                egui::RichText::new(format!(
+        let p = theme::palette(ui);
+        let (accent, label) = match self.phase {
+            Phase::Recording => (p.tally, "Recording"),
+            Phase::Paused => (p.paused, "Paused"),
+            Phase::Saving => (p.weak, "Saving…"),
+            Phase::Idle => (p.weak, "Ready"),
+        };
+
+        // The tally light: a red rule along the top while anything is being
+        // recorded, so the state reads from across the room.
+        if matches!(self.phase, Phase::Recording | Phase::Paused) {
+            let r = ui.max_rect();
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(r.left() - 20.0, r.top() - 14.0),
+                egui::pos2(r.right() + 20.0, r.top() - 11.0),
+            );
+            ui.painter().rect_filled(bar, 0.0, accent);
+        }
+
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                let secs = self.recorded().as_secs();
+                let clock = format!(
                     "{:02}:{:02}:{:02}",
                     secs / 3600,
                     (secs % 3600) / 60,
                     secs % 60
-                ))
-                .size(34.0)
-                .monospace(),
-            );
-            let colour = match self.phase {
-                Phase::Recording => egui::Color32::from_rgb(200, 64, 56),
-                Phase::Paused => egui::Color32::from_rgb(190, 130, 30),
-                _ => ui.visuals().weak_text_color(),
-            };
-            ui.colored_label(colour, &self.status);
-        });
+                );
+                let colour = if self.phase == Phase::Idle {
+                    p.weak
+                } else {
+                    p.text
+                };
+                ui.label(
+                    egui::RichText::new(clock)
+                        .font(egui::FontId::new(40.0, theme::light()))
+                        .color(colour),
+                );
+                ui.horizontal(|ui| {
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 4.5, accent);
+                    let status = if self.phase == Phase::Idle && self.status != "Ready" {
+                        self.status.clone()
+                    } else {
+                        label.to_string()
+                    };
+                    ui.label(egui::RichText::new(status).color(p.weak));
+                });
+            });
 
-        ui.add_space(8.0);
-        let saving = self.phase == Phase::Saving;
-        ui.columns(3, |cols| {
-            if cols[0]
-                .add_enabled(
-                    !self.busy() && !saving,
-                    egui::Button::new("Start recording").min_size(egui::vec2(0.0, 30.0)),
-                )
-                .clicked()
-            {
-                self.start(ctx);
-            }
-            let pause_label = if self.phase == Phase::Paused {
-                "Resume"
-            } else {
-                "Pause"
-            };
-            if cols[1]
-                .add_enabled(
-                    self.busy(),
-                    egui::Button::new(pause_label).min_size(egui::vec2(0.0, 30.0)),
-                )
-                .clicked()
-            {
-                self.toggle_pause();
-            }
-            if cols[2]
-                .add_enabled(
-                    self.busy(),
-                    egui::Button::new("Stop & save").min_size(egui::vec2(0.0, 30.0)),
-                )
-                .clicked()
-            {
-                self.stop(ctx);
-            }
-        });
-
-        ui.add_space(6.0);
-        ui.vertical_centered(|ui| {
-            ui.label(
-                egui::RichText::new(format!("Encoder:  {}", self.probes.encoder_label()))
-                    .weak()
-                    .small(),
-            );
-            ui.label(
-                egui::RichText::new("Ctrl+Alt+R start/stop      Ctrl+Alt+P pause/resume")
-                    .weak()
-                    .small(),
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| match self.phase {
+                    Phase::Idle => {
+                        let start =
+                            theme::primary(format!("{}  Start recording", icon::RECORD), p.tally)
+                                .min_size(egui::vec2(170.0, 38.0));
+                        if ui.add(start).clicked() {
+                            self.start(ctx);
+                        }
+                        if let Some(saved) = self.last_save.clone() {
+                            if ui
+                                .add(
+                                    egui::Button::new(format!("{}  Play", icon::PLAY))
+                                        .min_size(egui::vec2(0.0, 38.0)),
+                                )
+                                .on_hover_text("Watch the recording you just made")
+                                .clicked()
+                            {
+                                self.play(saved.clone(), ctx);
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(format!("{}  Show", icon::FOLDER))
+                                        .min_size(egui::vec2(0.0, 38.0)),
+                                )
+                                .on_hover_text("Show it in File Explorer")
+                                .clicked()
+                            {
+                                reveal(&saved);
+                            }
+                        }
+                    }
+                    Phase::Recording | Phase::Paused => {
+                        let stop =
+                            theme::primary(format!("{}  Stop and save", icon::STOP), p.signal)
+                                .min_size(egui::vec2(160.0, 38.0));
+                        if ui.add(stop).clicked() {
+                            self.stop(ctx);
+                        }
+                        let (glyph, text) = if self.phase == Phase::Paused {
+                            (icon::RECORD, "Resume")
+                        } else {
+                            (icon::PAUSE, "Pause")
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(format!("{glyph}  {text}"))
+                                    .min_size(egui::vec2(110.0, 38.0)),
+                            )
+                            .clicked()
+                        {
+                            self.toggle_pause();
+                        }
+                    }
+                    Phase::Saving => {
+                        ui.spinner();
+                    }
+                },
             );
         });
     }
+
+    /// Tabs on the left; recording state stays visible from either tab.
+    fn header(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        ui.horizontal(|ui| {
+            for (tab, glyph, name) in [
+                (Tab::Record, icon::RECORD, "Record"),
+                (Tab::Play, icon::PLAY, "Play"),
+            ] {
+                if tab_button(ui, self.tab == tab, glyph, name).clicked() {
+                    self.tab = tab;
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.tab == Tab::Play && self.busy() {
+                    let paused = self.phase == Phase::Paused;
+                    let colour = if paused { p.paused } else { p.tally };
+                    let text = if paused {
+                        "Recording paused"
+                    } else {
+                        "Recording"
+                    };
+                    let button = egui::Button::new(
+                        egui::RichText::new(format!("{}  {text}", icon::RECORD)).color(colour),
+                    )
+                    .frame(false);
+                    if ui
+                        .add(button)
+                        .on_hover_text("Go to the recording")
+                        .clicked()
+                    {
+                        self.tab = Tab::Record;
+                    }
+                }
+            });
+        });
+    }
+}
+
+/// The displays drawn at their real arrangement, as Windows' display settings
+/// shows them: click one to choose it. While recording, the screens being
+/// captured carry the tally colour.
+fn monitor_map(
+    ui: &mut egui::Ui,
+    monitors: &[screenilux_core::Monitor],
+    selected: &mut [bool],
+    whole: bool,
+    enabled: bool,
+    phase: Phase,
+    bubble: Option<screenilux_core::Rect>,
+) {
+    let p = theme::palette(ui);
+    let Some(all) = screenilux_core::virtual_bounds(monitors) else {
+        return;
+    };
+    let width = ui.available_width();
+    let scale = (width / all.width as f32).min(150.0 / all.height as f32);
+    let used = egui::vec2(all.width as f32 * scale, all.height as f32 * scale);
+    let (area, _) = ui.allocate_exact_size(egui::vec2(width, used.y + 4.0), egui::Sense::hover());
+    let origin = egui::pos2(area.center().x - used.x / 2.0, area.top() + 2.0);
+    let map = |r: screenilux_core::Rect| {
+        egui::Rect::from_min_size(
+            origin
+                + egui::vec2(
+                    (r.left - all.left) as f32 * scale,
+                    (r.top - all.top) as f32 * scale,
+                ),
+            egui::vec2(r.width as f32 * scale, r.height as f32 * scale),
+        )
+        .shrink(3.0)
+    };
+    let live = match phase {
+        Phase::Recording => Some(p.tally),
+        Phase::Paused => Some(p.paused),
+        _ => None,
+    };
+    let clickable = enabled && !whole && monitors.len() > 1;
+
+    for (i, m) in monitors.iter().enumerate() {
+        let rect = map(m.bounds);
+        let sense = if clickable {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        let response = ui
+            .interact(rect, ui.scope_id().with(("monitor", i)), sense)
+            .on_hover_text(format!(
+                "{}, {}×{}",
+                m.label, m.bounds.width, m.bounds.height
+            ));
+        if response.clicked() {
+            selected[i] = !selected[i];
+            // Never leave nothing to record.
+            if !selected.iter().any(|&on| on) {
+                selected[i] = true;
+            }
+        }
+        if clickable && response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let on = whole || selected[i];
+        paint_monitor(ui, rect, m, on, live, clickable && response.hovered(), &p);
+    }
+
+    if whole {
+        let colour = live.unwrap_or(p.signal);
+        ui.painter().rect_stroke(
+            map(all).expand(4.0),
+            8.0,
+            egui::Stroke::new(2.0, colour),
+            egui::StrokeKind::Outside,
+        );
+    }
+
+    // Where the camera bubble sits, so it is clear which screen carries it.
+    if let Some(b) = bubble {
+        let r = map(b).expand(3.0);
+        let radius = (r.width().min(r.height()) / 2.0).clamp(3.0, 9.0);
+        ui.painter().circle_filled(r.center(), radius, p.text);
+    }
+}
+
+fn paint_monitor(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    m: &screenilux_core::Monitor,
+    on: bool,
+    live: Option<egui::Color32>,
+    hovered: bool,
+    p: &Palette,
+) {
+    let painter = ui.painter();
+    let fill = match (on, hovered) {
+        (true, _) => theme::blend(p.raised, p.signal, 0.22),
+        (false, true) => theme::blend(p.raised, p.text, 0.08),
+        (false, false) => p.raised,
+    };
+    let stroke = match (on, live) {
+        (true, Some(tally)) => egui::Stroke::new(2.5, tally),
+        (true, None) => egui::Stroke::new(2.0, p.signal),
+        (false, _) => egui::Stroke::new(1.0, p.stroke),
+    };
+    painter.rect(rect, 6.0, fill, stroke, egui::StrokeKind::Inside);
+
+    // The screen's number, large, as Windows shows it; its size beneath.
+    let number = m
+        .label
+        .rsplit(' ')
+        .next()
+        .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(&m.label)
+        .to_string();
+    let big = (rect.height() * 0.32).clamp(14.0, 34.0);
+    let colour = if on { p.text } else { p.weak };
+    painter.text(
+        rect.center() - egui::vec2(0.0, big * 0.25),
+        egui::Align2::CENTER_CENTER,
+        number,
+        egui::FontId::new(big, theme::light()),
+        colour,
+    );
+    if rect.height() > 60.0 {
+        let detail = if m.is_primary {
+            format!("{}×{}, main", m.bounds.width, m.bounds.height)
+        } else {
+            format!("{}×{}", m.bounds.width, m.bounds.height)
+        };
+        painter.text(
+            rect.center() + egui::vec2(0.0, big * 0.6),
+            egui::Align2::CENTER_CENTER,
+            detail,
+            egui::FontId::proportional(11.5),
+            p.weak,
+        );
+    }
+    if let (true, Some(tally)) = (on, live) {
+        painter.circle_filled(rect.right_top() + egui::vec2(-12.0, 12.0), 4.5, tally);
+    }
+}
+
+/// A tab: text with an underline in the signal colour when selected.
+fn tab_button(ui: &mut egui::Ui, selected: bool, glyph: &str, name: &str) -> egui::Response {
+    let p = theme::palette(ui);
+    let colour = if selected { p.text } else { p.weak };
+    let font = if selected {
+        egui::FontId::new(15.0, theme::strong())
+    } else {
+        egui::FontId::proportional(15.0)
+    };
+    let response = ui.add(
+        egui::Button::new(
+            egui::RichText::new(format!("{glyph}  {name}"))
+                .font(font)
+                .color(colour),
+        )
+        .frame(false)
+        .min_size(egui::vec2(0.0, 30.0)),
+    );
+    if selected {
+        let r = response.rect;
+        ui.painter().line_segment(
+            [
+                egui::pos2(r.left() + 6.0, r.bottom() + 7.0),
+                egui::pos2(r.right() - 6.0, r.bottom() + 7.0),
+            ],
+            egui::Stroke::new(2.5, p.signal),
+        );
+    }
+    response
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.probes.poll();
-        self.handle_hotkeys(&ctx);
+        self.follow_displays(&ctx);
 
         if let Some(session) = &self.session {
             let fresh = session.notices();
@@ -475,57 +969,60 @@ impl eframe::App for App {
             }
         }
 
-        // The root Ui from eframe 0.37 carries no margin or background of its
-        // own; its docs point at this helper, which supplies both. Applied
-        // outside the scroll area, or the first row is clipped at the top.
-        egui::Frame::central_panel(ui.style()).show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                // Fill the window rather than shrinking to the content, or the
-                // area below the controls is left unpainted.
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    self.screens_panel(ui);
-                    ui.add_space(8.0);
-                    self.options_panel(ui);
-                    ui.separator();
-                    self.transport(ui, &ctx);
-
-                    if let Some(err) = self
-                        .overlay
-                        .as_ref()
-                        .and_then(|o| o.exclusion_error.clone())
-                    {
-                        ui.add_space(4.0);
-                        ui.colored_label(egui::Color32::from_rgb(200, 140, 60), err);
-                    }
-                    for notice in &self.notices {
-                        ui.colored_label(egui::Color32::from_rgb(200, 140, 60), notice);
-                    }
-                    for key in self.unavailable_hotkeys.iter() {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(200, 140, 60),
-                            format!("{key} is already used by another application"),
-                        );
-                    }
-                });
-        });
-
-        // The bubble is shown whenever the camera is on, recording or not, so
-        // it can be positioned before starting.
-        if let (Some(overlay), Some(feed)) =
-            (self.overlay.as_mut(), self.runtime.camera_feed.as_ref())
+        // A recording dropped onto the window opens in the player.
+        if let Some(path) = dropped_path(&ctx)
+            && playable(&path)
         {
-            let size = self.settings.camera_dimensions();
-            overlay.show(&ctx, feed, size);
-            if let Some(cam) = &self.runtime.camera {
-                let p = overlay.position();
-                cam.move_to(p.left, p.top);
+            self.play(path, &ctx);
+        }
+
+        if !self.busy() {
+            self.compact = false;
+        }
+        self.dress_window(&ctx);
+        if self.compact {
+            self.sizer.update(&ctx, Fit::Bar);
+            self.bar(ui, &ctx);
+            self.show_overlay(&ctx);
+            ctx.request_repaint_after(Duration::from_millis(100));
+            return;
+        }
+
+        let p = theme::palette(ui);
+        egui::Panel::top("header")
+            .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
+                left: 16,
+                right: 16,
+                top: 10,
+                bottom: 8,
+            }))
+            .show_separator_line(true)
+            .show(ui, |ui| self.header(ui));
+
+        let fit = match self.tab {
+            Tab::Record => Fit::Settings,
+            Tab::Play => Fit::Stage,
+        };
+        self.sizer.update(&ctx, fit);
+
+        match self.tab {
+            Tab::Record => self.record_tab(ui, &ctx),
+            Tab::Play => {
+                let out_dir = self.settings.out_dir.clone();
+                self.player.ui(ui, &ctx, &out_dir);
             }
         }
 
-        // Repaint steadily so the timer ticks and hotkeys are serviced even
-        // when nothing is being interacted with.
-        ctx.request_repaint_after(Duration::from_millis(if self.busy() { 100 } else { 250 }));
+        self.show_overlay(&ctx);
+
+        // While playing, each new frame asks for its own repaint; this only
+        // keeps the clocks moving between them.
+        let tick = if self.busy() || self.player.is_playing() {
+            100
+        } else {
+            250
+        };
+        ctx.request_repaint_after(Duration::from_millis(tick));
     }
 }
 

@@ -209,6 +209,17 @@ impl Drop for NativeSink {
     }
 }
 
+/// Held by each test that encodes, so they take turns.
+///
+/// Laptop GPUs cap how many encoding sessions run at once; past the cap,
+/// creating one fails with "Invalid pointer". The recorder opens one per
+/// screen, well under it, but a parallel test run opens a dozen.
+#[cfg(test)]
+pub(crate) fn one_encoder_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +276,7 @@ mod tests {
     fn encodes_a_playable_file() {
         let (w, h, fps) = (640u32, 480u32, 30u32);
         let dest = temp("basic");
+        let _turn = one_encoder_at_a_time();
         let mut sink = NativeSink::new(w, h, fps, false, temp("basic-scratch")).unwrap();
         sink.open_segment().unwrap();
         for i in 0..60 {
@@ -289,6 +301,7 @@ mod tests {
     fn padding_lengthens_the_output() {
         let (w, h, fps) = (320u32, 240u32, 30u32);
         let dest = temp("pad");
+        let _turn = one_encoder_at_a_time();
         let mut sink = NativeSink::new(w, h, fps, false, temp("pad-scratch")).unwrap();
         sink.open_segment().unwrap();
         for _ in 0..15 {
@@ -310,6 +323,7 @@ mod tests {
     fn a_pause_leaves_no_gap_in_the_output() {
         let (w, h, fps) = (320u32, 240u32, 30u32);
         let dest = temp("pause");
+        let _turn = one_encoder_at_a_time();
         let mut sink = NativeSink::new(w, h, fps, false, temp("pause-scratch")).unwrap();
 
         sink.open_segment().unwrap();
@@ -355,6 +369,7 @@ mod tests {
 
     #[test]
     fn a_wrong_sized_frame_is_rejected() {
+        let _turn = one_encoder_at_a_time();
         let mut sink = NativeSink::new(320, 240, 30, false, temp("bad-scratch")).unwrap();
         sink.open_segment().unwrap();
         assert!(sink.write(&[0u8; 16]).is_err());
@@ -363,6 +378,7 @@ mod tests {
     #[test]
     fn finishing_with_no_frames_is_an_error_not_an_empty_file() {
         let dest = temp("empty");
+        let _turn = one_encoder_at_a_time();
         let mut sink = NativeSink::new(320, 240, 30, false, temp("empty-scratch")).unwrap();
         sink.open_segment().unwrap();
         assert!(sink.finish(&dest).is_err());
@@ -383,6 +399,7 @@ mod tests {
     fn an_abandoned_sink_leaves_no_file_behind() {
         let scratch = temp("abandoned-scratch");
         {
+            let _turn = one_encoder_at_a_time();
             let mut sink = NativeSink::new(320, 240, 30, false, scratch.clone()).unwrap();
             sink.open_segment().unwrap();
             sink.write(&frame(320, 240, 5)).unwrap();

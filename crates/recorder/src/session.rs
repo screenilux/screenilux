@@ -24,7 +24,7 @@ use screenilux_win::encoder::{ENCODER_LABEL, NativeSink};
 use crate::paths::{TempDir, unique_path};
 
 use crate::control::Control;
-use crate::screen::{Elapsed, ScreenJob, run};
+use crate::screen::{Elapsed, ScreenJob, Sound, run};
 
 const FOCUS_INTERVAL: Duration = Duration::from_millis(80);
 const MANIFEST_NAME: &str = screenilux_core::session::MANIFEST_NAME;
@@ -50,6 +50,8 @@ pub struct SessionConfig {
     pub fps: u32,
     /// Record the default microphone alongside the first screen.
     pub microphone: bool,
+    /// Put a quiet click in the sound track for each mouse click.
+    pub click_sound: bool,
     pub effects: EffectOptions,
     /// The live camera, if the bubble is enabled.
     pub camera: Option<Arc<dyn CameraSource>>,
@@ -64,6 +66,7 @@ impl std::fmt::Debug for SessionConfig {
             .field("monitors", &self.monitors.len())
             .field("fps", &self.fps)
             .field("microphone", &self.microphone)
+            .field("click_sound", &self.click_sound)
             .field("effects", &self.effects)
             .field("camera", &self.camera.is_some())
             .finish()
@@ -98,7 +101,6 @@ pub struct Session {
     sync: Arc<SyncClock>,
     screens: Vec<ScreenSlot>,
     /// Kept alive for the session; removes the scratch files when dropped.
-    #[allow(dead_code)]
     workspace: TempDir,
     focus: Option<FocusWorker>,
     router: Option<RouterWorker>,
@@ -150,6 +152,14 @@ impl Session {
         let mut screens = Vec::new();
         let mut event_senders: Vec<(screenilux_core::geometry::Rect, Sender<PointerEvent>)> =
             Vec::new();
+        // Clicks anywhere on the desktop, for the screen carrying the sound.
+        let (click_tx, click_rx) = if config.click_sound {
+            let (tx, rx) = unbounded();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let mut click_rx = click_rx;
         for (i, monitor) in config.monitors.iter().enumerate() {
             let mut capture = ScreenCapture::start(monitor.bounds)
                 .map_err(|e| SessionError::Capture(format!("{}: {e}", monitor.label)))?;
@@ -160,7 +170,7 @@ impl Session {
 
             // Only the first screen carries sound; a single file with audio
             // is what the manifest records and what a player expects.
-            let audio = i == 0 && config.microphone;
+            let audio = i == 0 && (config.microphone || config.click_sound);
             let scratch = workspace.path().join(format!("screen{}.mp4", i + 1));
             let sink = NativeSink::new(
                 monitor.bounds.width,
@@ -201,7 +211,12 @@ impl Session {
                 } else {
                     None
                 },
-                audio: audio.then(screenilux_win::AudioCapture::start),
+                sound: audio.then(|| {
+                    Sound::new(
+                        config.microphone.then(screenilux_win::AudioCapture::start),
+                        click_rx.take(),
+                    )
+                }),
             };
 
             let label = monitor.label.clone();
@@ -226,14 +241,14 @@ impl Session {
 
         // The hook is only worth installing if something consumes it.
         let router = config.pointer_events.clone().and_then(|events| {
-            if !(config.effects.zoom || config.effects.clicks) {
+            if !(config.effects.zoom || config.effects.clicks || config.click_sound) {
                 return None;
             }
             let stop = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&stop);
             let handle = std::thread::Builder::new()
                 .name("screenilux-router".into())
-                .spawn(move || route_events(events, event_senders, flag))
+                .spawn(move || route_events(events, event_senders, click_tx, flag))
                 .ok();
             Some(RouterWorker { stop, handle })
         });
@@ -326,8 +341,9 @@ impl Session {
 
     /// Stop recording and write the result into `outdir`.
     ///
-    /// One screen yields a single MP4; several yield a session folder with a
-    /// manifest. Returns the path written.
+    /// One screen yields a single MP4, which plays anywhere. Several yield a
+    /// `.screenilux` package: the per-screen MP4s and their manifest in one
+    /// file. Returns the path written.
     pub fn finish(mut self, outdir: &Path) -> Result<PathBuf, SessionError> {
         let failures = self.halt();
         let focus_timeline = self
@@ -347,7 +363,10 @@ impl Session {
             return Ok(dest);
         }
 
-        let folder = unique_path(outdir, &format!("recording_{stamp}"), "");
+        // Assembled as a session folder in scratch space, then packed. The
+        // finished videos are moved, not copied, into the folder, so the
+        // only full copy is the one into the package.
+        let folder = self.workspace.path().join("session");
         std::fs::create_dir_all(&folder)?;
 
         let mut manifest = Manifest::new(
@@ -417,7 +436,14 @@ impl Session {
         if !lost.is_empty() {
             tracing::warn!(lost = lost.join("; "), "some screens did not save");
         }
-        Ok(folder)
+        let dest = unique_path(
+            outdir,
+            &format!("recording_{stamp}"),
+            screenilux_core::package::PACKAGE_EXT,
+        );
+        screenilux_core::package::pack(&folder, &dest)
+            .map_err(|e| SessionError::Manifest(e.to_string()))?;
+        Ok(dest)
     }
 }
 
@@ -478,6 +504,7 @@ impl Drop for SinkCarrier {
 fn route_events(
     events: Receiver<PointerEvent>,
     screens: Vec<(screenilux_core::geometry::Rect, Sender<PointerEvent>)>,
+    clicks: Option<Sender<()>>,
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Relaxed) {
@@ -497,6 +524,9 @@ fn route_events(
                 PointerEvent::Click { at } => {
                     if let Some((_, tx)) = screens.iter().find(|(b, _)| b.contains(at)) {
                         let _ = tx.send(event);
+                    }
+                    if let Some(c) = &clicks {
+                        let _ = c.send(());
                     }
                 }
                 PointerEvent::Wheel { .. } => {

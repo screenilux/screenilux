@@ -1,0 +1,120 @@
+# Checks every pull request into main, and releases every merge into it.
+#
+# Screenilux is Windows-only for now: capture, encoding, playback, sound and
+# OCR go through Windows APIs, so everything runs on a Windows runner.
+
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request makes the older run pointless. Runs
+# on main always finish, so no merge goes unreleased.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned so a new Rust release cannot fail the build with new lints on its
+  # own. Raise it deliberately, alongside the code it needs.
+  RUST_TOOLCHAIN: "1.99.1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check and test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Lints
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Hosted runners have no GPU, display, microphone or camera. These
+      # crates' tests use fakes or skip what is missing; the capture,
+      # encoder, decoder and player tests need the real thing and run
+      # locally with `cargo test --workspace`.
+      - name: Tests that need no screen or GPU
+        run: cargo test --locked -p screenilux-core -p screenilux-recorder -p screenilux
+
+      - name: Every other test still compiles
+        run: cargo test --workspace --locked --no-run
+
+  release:
+    name: Build and release
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Version
+        id: version
+        shell: pwsh
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          $version = ($meta.packages | Where-Object name -eq 'screenilux').version
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version-build.${{ github.run_number }}" >> $env:GITHUB_OUTPUT
+
+      - name: Build
+        run: cargo build --release --locked -p screenilux
+
+      # The executable keeps its name inside the zip: Windows files the
+      # "Open with" entry under it.
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $name = "screenilux-${{ steps.version.outputs.tag }}-windows-x64"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item target/release/screenilux.exe, README.md, LICENSE "dist/$name"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File dist/SHA256SUMS.txt -Encoding ascii
+          "zip=dist/$name.zip" >> $env:GITHUB_OUTPUT
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # A re-run of the same workflow run replaces the files rather than
+          # failing on a release that already exists.
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG "${{ steps.package.outputs.zip }}" dist/SHA256SUMS.txt --clobber
+          } else {
+            gh release create $env:TAG "${{ steps.package.outputs.zip }}" dist/SHA256SUMS.txt `
+              --target "${{ github.sha }}" `
+              --title "Screenilux $env:VERSION (build ${{ github.run_number }})" `
+              --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

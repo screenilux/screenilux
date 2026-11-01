@@ -1,40 +1,26 @@
-//! The global pointer hook and the recording hotkeys.
+//! The global pointer hook.
 //!
-//! Both live on one thread because both need a Win32 message pump: a
-//! `WH_MOUSE_LL` hook is only serviced while its installing thread pumps
-//! messages, and `RegisterHotKey` posts `WM_HOTKEY` to that same queue.
+//! It lives on a thread of its own because a `WH_MOUSE_LL` hook is only
+//! serviced while its installing thread pumps messages.
 //!
 //! The hook callback does nothing but decode and enqueue. Windows silently
 //! removes a low-level hook whose callback is too slow to return, which would
 //! disable zoom and click effects mid-recording with no error anywhere.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use screenilux_core::geometry::Point;
 use screenilux_core::ports::{PointerEvent, PointerSource};
 use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey,
-    UnregisterHotKey, VK_CONTROL, VK_MENU, VK_P, VK_R,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, HHOOK, KBDLLHOOKSTRUCT_FLAGS, MSG,
     MSLLHOOKSTRUCT, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    WH_MOUSE_LL, WM_HOTKEY, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
+    WH_MOUSE_LL, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
 };
-
-/// A recording command triggered by a global hotkey.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Hotkey {
-    StartStop,
-    PauseResume,
-}
-
-const HOTKEY_START_STOP: i32 = 1;
-const HOTKEY_PAUSE_RESUME: i32 = 2;
 
 /// Where the hook callback posts what it sees.
 ///
@@ -106,30 +92,22 @@ pub struct InputHook {
     thread: Option<JoinHandle<()>>,
     tid: ThreadId,
     pointer_rx: Receiver<PointerEvent>,
-    hotkey_rx: Receiver<Hotkey>,
-    /// Hotkeys another application already owns. Surfaced rather than only
-    /// logged: losing a global hotkey silently is the kind of thing a user
-    /// discovers mid-recording.
-    unavailable: Arc<Mutex<Vec<String>>>,
 }
 
 impl InputHook {
-    /// Install the hook and register the hotkeys.
+    /// Install the hook.
     pub fn start() -> Self {
         let (ptx, pointer_rx) = unbounded();
-        let (htx, hotkey_rx) = unbounded();
         *POINTER_SINK.lock().expect("sink poisoned") = Some(ptx);
 
         let ready = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let signal = std::sync::Arc::clone(&ready);
         let tid: ThreadId = std::sync::Arc::new(AtomicU32::new(0));
         let tid_for_pump = std::sync::Arc::clone(&tid);
-        let unavailable: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let taken = Arc::clone(&unavailable);
 
         let thread = std::thread::Builder::new()
             .name("screenilux-input".into())
-            .spawn(move || pump(htx, signal, tid_for_pump, taken))
+            .spawn(move || pump(signal, tid_for_pump))
             .expect("failed to spawn the input thread");
 
         // Wait for the pump to publish its thread id, so an immediate stop
@@ -150,28 +128,13 @@ impl InputHook {
             thread: Some(thread),
             tid,
             pointer_rx,
-            hotkey_rx,
-            unavailable,
         }
-    }
-
-    /// Hotkeys that could not be registered because something else owns them.
-    pub fn unavailable_hotkeys(&self) -> Vec<String> {
-        self.unavailable
-            .lock()
-            .map(|v| v.clone())
-            .unwrap_or_default()
-    }
-
-    pub fn hotkeys(&self) -> &Receiver<Hotkey> {
-        &self.hotkey_rx
     }
 
     /// A handle on the pointer stream.
     ///
-    /// The app owns one hook for its whole life - hotkeys must work while
-    /// idle, and while the window is minimised during a recording - and hands
-    /// this to each recording session. Crossbeam receivers are multi-consumer,
+    /// The app owns one hook for its whole life and hands this to each
+    /// recording session. Crossbeam receivers are multi-consumer,
     /// so events are split rather than duplicated; only one consumer should
     /// drain pointer events at a time.
     pub fn pointer_events(&self) -> Receiver<PointerEvent> {
@@ -221,12 +184,7 @@ pub fn cursor_pos() -> Point {
 }
 
 /// The hook thread: install, pump, clean up.
-fn pump(
-    hotkeys: Sender<Hotkey>,
-    ready: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>,
-    tid_out: ThreadId,
-    unavailable: Arc<Mutex<Vec<String>>>,
-) {
+fn pump(ready: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>, tid_out: ThreadId) {
     // SAFETY: installing a thread-local-scoped global hook with a 'static fn.
     let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) };
     let hook: HHOOK = match hook {
@@ -239,25 +197,6 @@ fn pump(
 
     let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
     tid_out.store(tid, Ordering::SeqCst);
-
-    // Registering rather than polling key state: Windows delivers an edge per
-    // press, so a fast tap cannot be missed and nothing races on the shared
-    // "pressed since last read" bit that GetAsyncKeyState clears process-wide.
-    let modifiers: HOT_KEY_MODIFIERS = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
-    // SAFETY: registering against the calling thread (no window handle).
-    unsafe {
-        for (id, vk, name) in [
-            (HOTKEY_START_STOP, VK_R.0 as u32, "Ctrl+Alt+R"),
-            (HOTKEY_PAUSE_RESUME, VK_P.0 as u32, "Ctrl+Alt+P"),
-        ] {
-            if RegisterHotKey(None, id, modifiers, vk).is_err() {
-                tracing::warn!(hotkey = name, "already claimed by another application");
-                if let Ok(mut v) = unavailable.lock() {
-                    v.push(name.to_string());
-                }
-            }
-        }
-    }
 
     {
         let (lock, cv) = &*ready;
@@ -274,26 +213,14 @@ fn pump(
         if got <= 0 {
             break;
         }
-        if msg.message == WM_HOTKEY {
-            let which = match msg.wParam.0 as i32 {
-                HOTKEY_START_STOP => Some(Hotkey::StartStop),
-                HOTKEY_PAUSE_RESUME => Some(Hotkey::PauseResume),
-                _ => None,
-            };
-            if let Some(h) = which {
-                let _ = hotkeys.send(h);
-            }
-        }
         unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
 
-    // SAFETY: unregistering what this thread registered.
+    // SAFETY: removing the hook this thread installed.
     unsafe {
-        let _ = UnregisterHotKey(None, HOTKEY_START_STOP);
-        let _ = UnregisterHotKey(None, HOTKEY_PAUSE_RESUME);
         if !hook.is_invalid() {
             let _ = UnhookWindowsHookEx(hook);
         }
