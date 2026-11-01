@@ -342,16 +342,30 @@ pub fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
-/// The app's mark: a rounded screen with a live dot, drawn rather than
-/// loaded so it is crisp at any size.
+/// The app's mark: two screens overlapping at a corner, joined by the live
+/// recording dot, as in `docs/logo.svg`. Drawn rather than loaded so it is
+/// crisp at any size, and in ink so it follows the light or dark theme.
 pub fn logo(ui: &mut egui::Ui, size: f32) {
     let p = palette(ui);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    let screen = egui::Rect::from_center_size(rect.center(), egui::vec2(size, size * 0.72));
-    ui.painter()
-        .rect_filled(screen, CornerRadius::same((size * 0.22) as u8), p.text);
-    ui.painter()
-        .circle_filled(screen.center(), size * 0.17, p.signal);
+    // The logo's own 64 grid, fitted to `size`.
+    let k = size / 64.0;
+    let at = |x: f32, y: f32| rect.min + egui::vec2(x * k, y * k);
+    let corner = CornerRadius::same((8.0 * k).round() as u8);
+    let painter = ui.painter();
+    painter.rect_filled(
+        egui::Rect::from_min_max(at(3.0, 7.0), at(43.0, 36.0)),
+        corner,
+        p.soft,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(at(21.0, 28.0), at(61.0, 57.0)),
+        corner,
+        p.text,
+    );
+    // The gap around the dot, cut back to the window's own colour.
+    painter.circle_filled(at(32.0, 32.0), 10.5 * k, p.base);
+    painter.circle_filled(at(32.0, 32.0), 6.5 * k, p.signal);
 }
 
 /// An outlined pill button, the quiet kind.

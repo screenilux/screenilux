@@ -1,11 +1,13 @@
 //! The app's icon, drawn in code.
 //!
-//! Two screens, the nearer one outlined in the signal blue, with a red tally
-//! dot: several screens, one being recorded. Drawn rather than shipped as an
-//! image so the window icon and the executable's icon (rendered by
-//! `build.rs`, which includes this file) cannot drift apart.
+//! The Screenilux mark on a deep teal tile: two screens overlapping at a
+//! corner, joined by the live recording dot. The tile keeps it readable on a
+//! light taskbar and a dark one alike. Drawn rather than shipped as an image
+//! so the window icon and the executable's icon (rendered by `build.rs`,
+//! which includes this file) cannot drift apart from each other, and match
+//! `docs/logo-dark.svg`.
 
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Transform};
 
 fn rounded(x: f32, y: f32, w: f32, h: f32, r: f32) -> tiny_skia::Path {
     let mut pb = PathBuilder::new();
@@ -34,43 +36,34 @@ pub fn render(size: u32) -> Pixmap {
     let mut pm = Pixmap::new(size, size).expect("icon size is non-zero");
     // Drawn on a 256 grid and scaled.
     let t = Transform::from_scale(size as f32 / 256.0, size as f32 / 256.0);
-    // Small sizes get thicker lines, or the screens dissolve into a blur.
-    let line = if size <= 24 {
-        22.0
-    } else if size <= 48 {
-        18.0
-    } else {
-        14.0
-    };
-
+    let tile = paint(0x01, 0x26, 0x25);
     pm.fill_path(
         &rounded(8.0, 8.0, 240.0, 240.0, 56.0),
-        &paint(0x24, 0x28, 0x2E),
+        &tile,
         FillRule::Winding,
         t,
         None,
     );
-    let stroke = Stroke {
-        width: line,
-        ..Stroke::default()
+
+    // The mark, drawn on the logo's own 64 grid and fitted inside the tile.
+    let m = t.pre_translate(40.0, 40.0).pre_scale(2.75, 2.75);
+    let fill = |pm: &mut Pixmap, path: &tiny_skia::Path, p: &Paint| {
+        pm.fill_path(path, p, FillRule::Winding, m, None);
     };
-    // The screen behind.
-    pm.stroke_path(
-        &rounded(40.0, 52.0, 128.0, 88.0, 14.0),
-        &paint(0x9B, 0xA3, 0xAD),
-        &stroke,
-        t,
-        None,
+    let circle = |r: f32| PathBuilder::from_circle(32.0, 32.0, r).expect("circle");
+    fill(
+        &mut pm,
+        &rounded(3.0, 7.0, 40.0, 29.0, 8.0),
+        &paint(0x07, 0xBE, 0xB8),
     );
-    // The screen in front, filled so it hides the one behind.
-    let front = rounded(84.0, 104.0, 132.0, 92.0, 14.0);
-    pm.fill_path(&front, &paint(0x2E, 0x33, 0x3A), FillRule::Winding, t, None);
-    pm.stroke_path(&front, &paint(0x4C, 0x8D, 0xF6), &stroke, t, None);
-    // The tally: ringed in the background colour so it reads at 16px.
-    let ring = PathBuilder::from_circle(206.0, 70.0, 34.0).expect("circle");
-    pm.fill_path(&ring, &paint(0x24, 0x28, 0x2E), FillRule::Winding, t, None);
-    let dot = PathBuilder::from_circle(206.0, 70.0, 24.0).expect("circle");
-    pm.fill_path(&dot, &paint(0xE5, 0x48, 0x4D), FillRule::Winding, t, None);
+    fill(
+        &mut pm,
+        &rounded(21.0, 28.0, 40.0, 29.0, 8.0),
+        &paint(0xE1, 0xF7, 0xF7),
+    );
+    // The gap around the dot, cut back to the tile.
+    fill(&mut pm, &circle(10.5), &tile);
+    fill(&mut pm, &circle(6.5), &paint(0x2D, 0xA8, 0xA4));
     pm
 }
 
