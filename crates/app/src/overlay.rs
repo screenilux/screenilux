@@ -22,6 +22,8 @@ pub struct Overlay {
     last_seq: u64,
     hwnd: Option<isize>,
     excluded: bool,
+    /// Clipped to a circle, which needs the window to exist first.
+    shaped: bool,
     /// Set once if the platform refuses the exclusion, so the UI can say so
     /// rather than silently recording a doubled camera.
     pub exclusion_error: Option<String>,
@@ -35,6 +37,7 @@ impl Overlay {
             last_seq: u64::MAX,
             hwnd: None,
             excluded: false,
+            shaped: false,
             exclusion_error: None,
             position,
         }
@@ -64,7 +67,7 @@ impl Overlay {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(16, 16, 16)))
                     .show(vp_ctx, |ui| {
-                        self.paint(ui, feed, size);
+                        self.paint(ui, feed);
 
                         let drag = ui.interact(
                             ui.max_rect(),
@@ -87,7 +90,7 @@ impl Overlay {
         self.apply_exclusion();
     }
 
-    fn paint(&mut self, ui: &mut egui::Ui, feed: &Arc<CameraFeed>, size: (u32, u32)) {
+    fn paint(&mut self, ui: &mut egui::Ui, feed: &Arc<CameraFeed>) {
         if let Some(err) = feed.error() {
             ui.centered_and_justified(|ui| {
                 ui.colored_label(egui::Color32::from_rgb(220, 120, 120), err);
@@ -128,11 +131,25 @@ impl Overlay {
 
         match &self.texture {
             Some(tex) => {
-                ui.add(
-                    egui::Image::new((tex.id(), egui::vec2(size.0 as f32, size.1 as f32)))
-                        .maintain_aspect_ratio(true)
-                        .max_size(egui::vec2(size.0 as f32, size.1 as f32)),
-                );
+                // Fill the bubble, cropping the middle of the picture to its
+                // shape, as the recording does.
+                let rect = ui.max_rect();
+                let [tw, th] = tex.size().map(|v| v as f32);
+                let (want, have) = (rect.width() / rect.height(), tw / th);
+                let uv = if have > want {
+                    let w = want / have;
+                    egui::Rect::from_min_max(
+                        egui::pos2((1.0 - w) / 2.0, 0.0),
+                        egui::pos2((1.0 + w) / 2.0, 1.0),
+                    )
+                } else {
+                    let h = have / want;
+                    egui::Rect::from_min_max(
+                        egui::pos2(0.0, (1.0 - h) / 2.0),
+                        egui::pos2(1.0, (1.0 + h) / 2.0),
+                    )
+                };
+                ui.painter().image(tex.id(), rect, uv, egui::Color32::WHITE);
             }
             None => {
                 ui.centered_and_justified(|ui| {
@@ -154,6 +171,11 @@ impl Overlay {
             self.hwnd = find_window(OVERLAY_TITLE);
         }
         let Some(h) = self.hwnd else { return };
+        if !self.shaped {
+            // SAFETY: as below.
+            unsafe { screenilux_win::set_circular(h) };
+            self.shaped = true;
+        }
         // SAFETY: a live top-level handle, found by title, owned by us.
         match unsafe { screenilux_win::exclude_from_capture(h) } {
             Ok(()) => self.excluded = true,

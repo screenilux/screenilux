@@ -11,17 +11,16 @@
 
 use eframe::egui;
 
-/// The Record tab's width: its settings column plus margins. The widest row,
-/// the controls under the clock with a recording just saved, fits in this
-/// without wrapping.
-pub const RECORD_WIDTH: f32 = 660.0;
+/// The Record tab's width: two screen tiles side by side plus margins, the
+/// width of a compact launcher.
+pub const RECORD_WIDTH: f32 = 420.0;
 
 /// The smallest the window can be made, other than as the bar. Below this the
 /// Record tab's rows start to wrap and the Play tab's controls overlap.
-pub const MIN_SIZE: egui::Vec2 = egui::vec2(560.0, 520.0);
+pub const MIN_SIZE: egui::Vec2 = egui::vec2(400.0, 520.0);
 
-/// The recording bar: a clock and two buttons in a row.
-pub const BAR_SIZE: egui::Vec2 = egui::vec2(380.0, 52.0);
+/// The recording bar: stop, the clock, pause and expand in a row.
+pub const BAR_SIZE: egui::Vec2 = egui::vec2(268.0, 56.0);
 
 /// The bar's gap above the taskbar.
 const BAR_MARGIN: f32 = 12.0;

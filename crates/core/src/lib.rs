@@ -11,6 +11,7 @@ pub mod click;
 pub mod compositor;
 pub mod focus;
 pub mod geometry;
+pub mod mix;
 pub mod package;
 pub mod playback;
 pub mod ports;

@@ -50,6 +50,8 @@ pub struct SessionConfig {
     pub fps: u32,
     /// Record the default microphone alongside the first screen.
     pub microphone: bool,
+    /// Record what the computer plays, mixed with the microphone if both.
+    pub system_sound: bool,
     /// Put a quiet click in the sound track for each mouse click.
     pub click_sound: bool,
     pub effects: EffectOptions,
@@ -66,6 +68,7 @@ impl std::fmt::Debug for SessionConfig {
             .field("monitors", &self.monitors.len())
             .field("fps", &self.fps)
             .field("microphone", &self.microphone)
+            .field("system_sound", &self.system_sound)
             .field("click_sound", &self.click_sound)
             .field("effects", &self.effects)
             .field("camera", &self.camera.is_some())
@@ -168,7 +171,7 @@ impl Session {
 
             // Only the first screen carries sound; a single file with audio
             // is what the manifest records and what a player expects.
-            let audio = i == 0 && (config.microphone || config.click_sound);
+            let audio = i == 0 && (config.microphone || config.system_sound || config.click_sound);
             let scratch = workspace.path().join(format!("screen{}.mp4", i + 1));
             let sink = NativeSink::new(
                 monitor.bounds.width,
@@ -210,6 +213,9 @@ impl Session {
                 sound: audio.then(|| {
                     Sound::new(
                         config.microphone.then(screenilux_win::AudioCapture::start),
+                        config
+                            .system_sound
+                            .then(screenilux_win::AudioCapture::start_system),
                         click_rx.take(),
                     )
                 }),
