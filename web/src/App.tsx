@@ -1,90 +1,181 @@
 import { useEffect, useState } from "react";
 import { Player } from "./Player";
-import { type Manifest, Missing, readManifest, readShare, readText, type Share, type TextIndex } from "./share";
+import { Locked, type Manifest, Missing, readManifest, readStatus, readText, type Status, type TextIndex } from "./share";
 
 // How often a page waiting for an upload checks on it.
 const POLL_MS = 3000;
+// Where the service worker finds each page's key (public/sw.js).
+const KEYS = "screenilux-keys";
+
+/** What the address says to open. The key is always after the #. */
+type Link =
+  | { kind: "hosted"; id: string; key: string }
+  | { kind: "bucket"; files: string; key: string }
+  | { kind: "incomplete" };
 
 /**
- * Where the shared recording's files are, from the address:
- * /v/<id> on the Screenilux storage, or /b#<address> in someone's own bucket.
+ * /v/<id>#k=<key> on the Screenilux storage, or /b#k=<key>&u=<address> in
+ * someone's own bucket.
  */
-function locate(): string | undefined {
-  const { pathname, hash, origin } = window.location;
+function locate(): Link | undefined {
+  const { pathname, hash } = window.location;
+  const params = new URLSearchParams(hash.slice(1));
+  const key = params.get("k") ?? "";
+  const whole = /^[A-Za-z0-9_-]{43}$/.test(key);
   const hosted = /^\/v\/([A-Za-z0-9_-]{22})\/?$/.exec(pathname);
-  if (hosted) return `${origin}/r/${hosted[1]}/`;
-  if (pathname === "/b" && hash.length > 1) {
+  if (hosted) return whole ? { kind: "hosted", id: hosted[1]!, key } : { kind: "incomplete" };
+  if (pathname === "/b") {
     try {
-      const url = new URL(decodeURIComponent(hash.slice(1)));
+      const url = new URL(params.get("u") ?? "");
       // Plain http only for a bucket on this computer, while testing.
       const local = url.hostname === "localhost" || url.hostname === "127.0.0.1";
-      if (url.protocol !== "https:" && !local) return undefined;
-      return url.href.endsWith("/") ? url.href : `${url.href}/`;
+      if (url.protocol !== "https:" && !local) return { kind: "incomplete" };
+      if (!whole) return { kind: "incomplete" };
+      return { kind: "bucket", files: url.href.endsWith("/") ? url.href : `${url.href}/`, key };
     } catch {
-      return undefined;
+      return { kind: "incomplete" };
     }
   }
   return undefined;
 }
 
 export function App() {
-  const [base, setBase] = useState(locate);
-  // A bucket link differs only after the #, which does not load a new page.
+  const [link, setLink] = useState(locate);
+  // Bucket links differ only after the #, which does not load a new page.
   useEffect(() => {
-    const onHash = () => setBase(locate());
+    const onHash = () => setLink(locate());
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
   return (
     <div className="flex min-h-dvh flex-col">
       <main className="mx-auto flex w-full max-w-[1600px] flex-1 flex-col px-4 pt-4 pb-6 sm:px-6">
-        {base ? <Shared key={base} base={base} /> : <Home />}
+        {!link ? (
+          <Home />
+        ) : link.kind === "incomplete" ? (
+          <Notice title="This link is incomplete">
+            Part of the link is missing. Ask whoever sent it to send it again, and copy all of it, including everything
+            after the #.
+          </Notice>
+        ) : (
+          <Shared key={JSON.stringify(link)} link={link} />
+        )}
       </main>
     </div>
   );
 }
 
+class Unsupported extends Error {}
+
+/**
+ * Make sure the service worker that decrypts is in charge of this page. The
+ * first visit has to wait for it to install; a hard reload bypasses it, so
+ * the page reloads once to put it back in charge.
+ */
+async function decrypter(): Promise<void> {
+  if (!("serviceWorker" in navigator) || !("caches" in window)) throw new Unsupported();
+  await navigator.serviceWorker.register("/sw.js");
+  await navigator.serviceWorker.ready;
+  if (navigator.serviceWorker.controller) return;
+  const claimed = new Promise<boolean>((resolve) => {
+    navigator.serviceWorker.addEventListener("controllerchange", () => resolve(true), { once: true });
+    window.setTimeout(() => resolve(false), 3000);
+  });
+  if (await claimed) return;
+  if (!sessionStorage.getItem("reloaded")) {
+    sessionStorage.setItem("reloaded", "1");
+    window.location.reload();
+    await new Promise(() => {});
+  }
+  throw new Unsupported();
+}
+
+/** Hand the service worker this page's key and where the files are. */
+async function openSession(files: string, key: string): Promise<{ base: string; close: () => void }> {
+  await decrypter();
+  sessionStorage.removeItem("reloaded");
+  const id = crypto.randomUUID();
+  const cache = await caches.open(KEYS);
+  await cache.put(`/__keys/${id}`, Response.json({ base: files, key }));
+  return { base: `/__decrypt/${id}/`, close: () => void cache.delete(`/__keys/${id}`) };
+}
+
 type State =
   | { kind: "loading" }
   | { kind: "missing" }
+  | { kind: "locked" }
+  | { kind: "unsupported" }
   | { kind: "error" }
-  | { kind: "waiting"; share: Share }
-  | { kind: "failed"; share: Share }
-  | { kind: "ready"; share: Share; manifest: Manifest; text?: TextIndex };
+  | { kind: "waiting"; status?: Status }
+  | { kind: "stalled" }
+  | { kind: "ready"; base: string; manifest: Manifest; text?: TextIndex; status?: Status };
 
-function Shared({ base }: { base: string }) {
+function Shared({ link }: { link: Exclude<Link, { kind: "incomplete" }> }) {
   const [state, setState] = useState<State>({ kind: "loading" });
 
   useEffect(() => {
     let stopped = false;
     let timer = 0;
-    const check = async () => {
-      try {
-        const share = await readShare(base);
-        if (stopped) return;
-        if (share.status === "uploading") {
-          setState({ kind: "waiting", share });
-          timer = window.setTimeout(check, POLL_MS);
-        } else if (share.status === "failed") {
-          setState({ kind: "failed", share });
-        } else {
-          const [manifest, text] = await Promise.all([readManifest(base), share.text ? readText(base) : undefined]);
-          if (!stopped) setState({ kind: "ready", share, manifest, text });
-        }
-      } catch (e) {
-        if (!stopped) setState({ kind: e instanceof Missing ? "missing" : "error" });
-      }
+    let close = () => {};
+    const fail = (e: unknown) => {
+      if (stopped) return;
+      if (e instanceof Missing) setState({ kind: "missing" });
+      else if (e instanceof Locked) setState({ kind: "locked" });
+      else if (e instanceof Unsupported) setState({ kind: "unsupported" });
+      else setState({ kind: "error" });
     };
-    void check();
+    const again = (check: () => Promise<void>) => {
+      timer = window.setTimeout(() => void check().catch(fail), POLL_MS);
+    };
+    const load = async (base: string, status?: Status) => {
+      const [manifest, text] = await Promise.all([readManifest(base), readText(base)]);
+      if (!stopped) setState({ kind: "ready", base, manifest, text, status });
+    };
+
+    void (async () => {
+      const files = link.kind === "hosted" ? `${window.location.origin}/r/${link.id}/` : link.files;
+      const session = await openSession(files, link.key);
+      close = session.close;
+      if (stopped) return close();
+
+      if (link.kind === "hosted") {
+        // The server counts what has arrived, so the page can show progress.
+        const check = async () => {
+          const status = await readStatus(link.id);
+          if (stopped) return;
+          if (status.status === "ready") return load(session.base, status);
+          setState(status.status === "stalled" ? { kind: "stalled" } : { kind: "waiting", status });
+          again(check);
+        };
+        await check();
+      } else {
+        // A bucket has no server to ask; the manifest goes up last, so it
+        // being there means the upload is done.
+        const check = async () => {
+          try {
+            await load(session.base);
+          } catch (e) {
+            if (!(e instanceof Missing)) throw e;
+            if (stopped) return;
+            setState({ kind: "waiting" });
+            again(check);
+          }
+        };
+        await check();
+      }
+    })().catch(fail);
+
     return () => {
       stopped = true;
       window.clearTimeout(timer);
+      close();
     };
-  }, [base]);
+  }, [link]);
 
+  const title = state.kind === "ready" ? titleOf(state.manifest) : undefined;
   useEffect(() => {
-    if ("share" in state) document.title = `${state.share.title} · Screenilux`;
-  }, [state]);
+    document.title = title ? `${title} · Screenilux` : "Screenilux";
+  }, [title]);
 
   switch (state.kind) {
     case "loading":
@@ -95,55 +186,90 @@ function Shared({ base }: { base: string }) {
           The link may be mistyped, or the recording has expired. Recordings shared on Screenilux last 7 days.
         </Notice>
       );
+    case "locked":
+      return (
+        <Notice title="This link doesn't open the recording">
+          The part of the link after the # is the key to the recording, and it doesn't match. Ask whoever sent the link
+          to send it again, and copy all of it.
+        </Notice>
+      );
+    case "unsupported":
+      return (
+        <Notice title="This window can't open the recording">
+          Recordings are encrypted, and this browser window can't decrypt them. Private windows in some browsers can't.
+          Try a normal window of Chrome, Edge, Firefox or Safari.
+        </Notice>
+      );
     case "error":
       return (
         <Notice title="The recording couldn't be opened">
           Check your connection and reload the page. If it keeps happening, ask whoever sent the link to share it again.
         </Notice>
       );
-    case "failed":
+    case "stalled":
       return (
-        <Notice title={state.share.title}>
-          The upload didn't finish. Ask whoever sent the link to share the recording again.
+        <Notice title="The upload stopped">
+          This recording stopped uploading before it finished. Ask whoever sent the link to share it again.
         </Notice>
       );
     case "waiting": {
-      const done = state.share.total ? Math.floor((state.share.uploaded / state.share.total) * 100) : 0;
+      const status = state.status;
+      const done = status?.total ? Math.floor((status.received / status.total) * 100) : undefined;
       return (
         <Notice title="Still uploading">
           <span className="block">
-            {state.share.title} will play here as soon as it's uploaded. Keep this page open.
+            {link.kind === "hosted"
+              ? "This recording will play here as soon as it's uploaded. Keep this page open."
+              : "This recording isn't here yet. If it was just shared, it's still uploading; this page will keep checking."}
           </span>
-          <span className="mt-5 block h-1.5 overflow-hidden rounded-full bg-mist" role="progressbar" aria-valuenow={done} aria-valuemin={0} aria-valuemax={100}>
-            <span className="block h-full rounded-full bg-signal transition-[width] duration-500" style={{ width: `${done}%` }} />
-          </span>
-          <span className="mt-2 block text-sm tabular-nums">{done}% uploaded</span>
+          {done !== undefined && (
+            <>
+              <span
+                className="mt-5 block h-1.5 overflow-hidden rounded-full bg-mist"
+                role="progressbar"
+                aria-valuenow={done}
+                aria-valuemin={0}
+                aria-valuemax={100}
+              >
+                <span className="block h-full rounded-full bg-signal transition-[width] duration-500" style={{ width: `${done}%` }} />
+              </span>
+              <span className="mt-2 block text-sm tabular-nums">{done}% uploaded</span>
+            </>
+          )}
         </Notice>
       );
     }
     case "ready":
       return (
         <>
-          <Title share={state.share} screens={state.manifest.screens.length} />
-          <Player base={base} manifest={state.manifest} text={state.text} />
+          <Title title={title!} manifest={state.manifest} expires={state.status?.expires} />
+          <Player base={state.base} manifest={state.manifest} text={state.text} />
         </>
       );
   }
 }
 
-function Title({ share, screens }: { share: Share; screens: number }) {
-  const when = (iso: string) =>
-    new Date(iso).toLocaleString(undefined, { day: "numeric", month: "long", hour: "numeric", minute: "2-digit" });
+function when(iso: string): string {
+  return new Date(iso).toLocaleString(undefined, { day: "numeric", month: "long", hour: "numeric", minute: "2-digit" });
+}
+
+/** The title the app gave it, or failing that, when it was recorded. */
+function titleOf(manifest: Manifest): string {
+  return manifest.title?.trim() || `Recording, ${when(manifest.created)}`;
+}
+
+function Title({ title, manifest, expires }: { title: string; manifest: Manifest; expires?: string }) {
+  const screens = manifest.screens.length;
   return (
     <header className="mb-4 flex flex-wrap items-center gap-x-4 gap-y-1">
       <a href="https://github.com/screenilux/screenilux" aria-label="Screenilux" className="shrink-0">
         <Logo size={32} />
       </a>
       <div className="min-w-0 flex-1">
-        <h1 className="truncate text-lg font-semibold">{share.title}</h1>
+        <h1 className="truncate text-lg font-semibold">{title}</h1>
         <p className="text-sm text-weak">
-          {screens > 1 ? `${screens} screens` : "1 screen"} · Recorded {when(share.created)}
-          {share.expires && ` · Available until ${when(share.expires)}`}
+          {screens > 1 ? `${screens} screens` : "1 screen"} · Recorded {when(manifest.created)}
+          {expires && ` · Available until ${when(expires)}`}
         </p>
       </div>
     </header>

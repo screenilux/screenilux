@@ -1,39 +1,40 @@
 //! Share links: upload a finished recording and get a link that plays it in a
 //! browser.
 //!
-//! A shared recording is a folder of plain files: `share.json`, then the
-//! manifest, each screen's video and the text index if there is one. That
-//! folder goes either to the Screenilux storage, which hands out an upload
-//! token for each recording, or to the user's own S3-compatible bucket. Either way the link exists
-//! before anything else is uploaded: `share.json` is written first, saying
-//! the upload is still going, so the link can be sent at once and the web
-//! player (`web/`) waits for it to finish.
+//! A shared recording is a folder of files: each screen's video, the text
+//! index if there is one, and the manifest. Every file is encrypted here
+//! first (see [`seal`]), with a key that only the link carries, so whoever
+//! keeps the files cannot watch them.
+//!
+//! The folder goes either to the Screenilux storage, which hands out an
+//! upload token for each recording and keeps track of how its upload is
+//! going, or to the user's own S3-compatible bucket. The link exists before
+//! anything is uploaded, so it can be sent at once; the web player (`web/`)
+//! waits for the upload to finish. In a bucket there is no server to ask, so
+//! the manifest goes up last and its arrival is what says the upload is done.
 
 mod contents;
+mod seal;
 mod store;
 
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime};
 
+use screenilux_core::session::MANIFEST_NAME;
 use serde::{Deserialize, Serialize};
 
 pub use contents::{Contents, Item};
+use seal::Sealer;
+pub use seal::{ShareKey, open, sealed_len};
 use store::{Hosted, Own, Store};
 
 /// Where the web player lives. Links point here.
 pub const PLAYER: &str = "https://screenilux.hassen-ben-mbarek.workers.dev";
 
-/// How long the Screenilux storage keeps a recording. The bucket's lifecycle
-/// rule does the deleting; this is only what the player tells viewers.
-pub const KEPT_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-
 /// Files bigger than this go up in parts of this size. The Screenilux storage
 /// takes at most 100MB in one request; buckets need parts of at least 5MB.
 const PART: usize = 32 * 1024 * 1024;
-
-/// How often `share.json` is rewritten with the progress, at most.
-const REPORT_EVERY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShareError {
@@ -165,61 +166,32 @@ fn lock(p: &Mutex<Progress>) -> std::sync::MutexGuard<'_, Progress> {
     p.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// What `share.json` says. The web player reads it (web/src/share.ts).
-#[derive(Serialize)]
-struct ShareDoc<'a> {
-    format: &'static str,
-    version: u32,
-    status: &'static str,
-    title: &'a str,
-    created: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expires: Option<String>,
-    uploaded: u64,
-    total: u64,
-    text: bool,
-}
-
 fn run(
     destination: &Destination,
     contents: &Contents,
     progress: &Mutex<Progress>,
 ) -> Result<(), ShareError> {
     let agent = ureq::Agent::new_with_defaults();
-    let (store, link, expires): (Box<dyn Store>, String, Option<String>) = match destination {
+    let key = ShareKey::generate()?;
+    let manifest = seal::seal(&key, &titled_manifest(contents)?)?;
+    let files: Vec<&Item> = contents
+        .items
+        .iter()
+        .filter(|i| i.name != MANIFEST_NAME)
+        .collect();
+    let total = files.iter().map(|i| sealed_len(i.len)).sum::<u64>() + manifest.len() as u64;
+    lock(progress).total = total;
+
+    let (store, link): (Box<dyn Store>, String) = match destination {
         Destination::Screenilux { server } => {
-            let (hosted, link) = Hosted::create(agent, server, contents.total())?;
-            let expires =
-                humantime::format_rfc3339_seconds(SystemTime::now() + KEPT_FOR).to_string();
-            (Box::new(hosted), link, Some(expires))
+            let (hosted, link) = Hosted::create(agent, server, total)?;
+            (Box::new(hosted), format!("{link}#k={}", key.to_link()))
         }
         Destination::Bucket(bucket) => {
-            let (own, link) = Own::create(agent, bucket, &new_id()?)?;
-            (Box::new(own), link, None)
+            let (own, link) = Own::create(agent, bucket, &new_id()?, &key.to_link())?;
+            (Box::new(own), link)
         }
     };
-
-    let total = contents.total();
-    let report = |status: &'static str, uploaded: u64| -> Result<(), ShareError> {
-        let doc = ShareDoc {
-            format: "screenilux-share",
-            version: 1,
-            status,
-            title: &contents.title,
-            created: &contents.created,
-            expires: expires.clone(),
-            uploaded,
-            total,
-            text: contents
-                .items
-                .iter()
-                .any(|i| i.name == screenilux_core::text::TEXT_INDEX_NAME),
-        };
-        let json = serde_json::to_vec_pretty(&doc).expect("share.json serialises");
-        store.put("share.json", &json, "application/json")
-    };
-
-    report("uploading", 0)?;
     {
         let mut p = lock(progress);
         p.link = Some(link);
@@ -227,65 +199,101 @@ fn run(
     }
 
     let mut uploaded = 0u64;
-    let mut reported = Instant::now();
+    let mut sent = Vec::new();
     let result = (|| {
-        for item in &contents.items {
-            let mut reader = item.open()?;
-            let kind = content_type(&item.name);
-            if item.len <= PART as u64 {
-                let mut body = Vec::with_capacity(item.len as usize);
-                std::io::Read::read_to_end(&mut reader, &mut body)
-                    .map_err(|e| ShareError::Read(e.to_string()))?;
-                store.put(&item.name, &body, kind)?;
-                uploaded += body.len() as u64;
-            } else {
-                let upload_id = store.start_parts(&item.name, kind)?;
-                let mut etags = Vec::new();
-                let mut buf = vec![0u8; PART];
-                let parts = (|| {
-                    loop {
-                        let n = fill(&mut reader, &mut buf)?;
-                        if n == 0 {
-                            break;
-                        }
-                        let number = etags.len() as u16 + 1;
-                        etags.push(store.put_part(&item.name, &upload_id, number, &buf[..n])?);
-                        uploaded += n as u64;
-                        lock(progress).uploaded = uploaded;
-                        if reported.elapsed() >= REPORT_EVERY {
-                            report("uploading", uploaded)?;
-                            reported = Instant::now();
-                        }
-                    }
-                    store.finish_parts(&item.name, &upload_id, &etags)
-                })();
-                if let Err(e) = parts {
-                    let _ = store.abort_parts(&item.name, &upload_id);
-                    return Err(e);
-                }
-            }
-            lock(progress).uploaded = uploaded;
+        for item in &files {
+            let sealer = Sealer::new(item.open()?, item.len, &key)?;
+            upload(
+                store.as_ref(),
+                &item.name,
+                sealer,
+                sealed_len(item.len),
+                &mut uploaded,
+                progress,
+            )?;
+            sent.push(item.name.clone());
         }
-        Ok(())
+        store.put(MANIFEST_NAME, &manifest)?;
+        sent.push(MANIFEST_NAME.to_string());
+        uploaded += manifest.len() as u64;
+        lock(progress).uploaded = uploaded;
+        store.complete()
     })();
 
     match result {
         Ok(()) => {
-            report("ready", total)?;
             lock(progress).state = State::Ready;
             Ok(())
         }
         Err(e) => {
-            // Tell anyone already watching the link, if the storage still
-            // answers.
-            let _ = report("failed", uploaded);
+            // Half a recording is no use to anyone; take back what went up.
+            let _ = store.discard(&sent);
             Err(e)
         }
     }
 }
 
+/// The manifest as uploaded: the recording's own, plus its title, which the
+/// player shows. Both are encrypted, so the title stays private.
+fn titled_manifest(contents: &Contents) -> Result<Vec<u8>, ShareError> {
+    let item = contents
+        .items
+        .iter()
+        .find(|i| i.name == MANIFEST_NAME)
+        .ok_or_else(|| ShareError::Read("the recording has no manifest".into()))?;
+    let mut json = Vec::new();
+    item.open()?
+        .read_to_end(&mut json)
+        .map_err(|e| ShareError::Read(e.to_string()))?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&json).map_err(|e| ShareError::Read(e.to_string()))?;
+    manifest["title"] = contents.title.clone().into();
+    Ok(serde_json::to_vec(&manifest).expect("a JSON value serialises"))
+}
+
+/// Upload one file of `len` bytes, read from `reader`, in parts if it is big.
+fn upload(
+    store: &dyn Store,
+    name: &str,
+    mut reader: impl Read,
+    len: u64,
+    uploaded: &mut u64,
+    progress: &Mutex<Progress>,
+) -> Result<(), ShareError> {
+    if len <= PART as u64 {
+        let mut body = Vec::with_capacity(len as usize);
+        reader
+            .read_to_end(&mut body)
+            .map_err(|e| ShareError::Read(e.to_string()))?;
+        store.put(name, &body)?;
+        *uploaded += body.len() as u64;
+        lock(progress).uploaded = *uploaded;
+        return Ok(());
+    }
+    let upload_id = store.start_parts(name)?;
+    let mut etags = Vec::new();
+    let mut buf = vec![0u8; PART];
+    let parts = (|| {
+        loop {
+            let n = fill(&mut reader, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let number = etags.len() as u16 + 1;
+            etags.push(store.put_part(name, &upload_id, number, &buf[..n])?);
+            *uploaded += n as u64;
+            lock(progress).uploaded = *uploaded;
+        }
+        store.finish_parts(name, &upload_id, &etags)
+    })();
+    if parts.is_err() {
+        let _ = store.abort_parts(name, &upload_id);
+    }
+    parts
+}
+
 /// Read until `buf` is full or the file ends.
-fn fill(reader: &mut impl std::io::Read, buf: &mut [u8]) -> Result<usize, ShareError> {
+fn fill(reader: &mut impl Read, buf: &mut [u8]) -> Result<usize, ShareError> {
     let mut n = 0;
     while n < buf.len() {
         match reader.read(&mut buf[n..]) {
@@ -296,16 +304,6 @@ fn fill(reader: &mut impl std::io::Read, buf: &mut [u8]) -> Result<usize, ShareE
         }
     }
     Ok(n)
-}
-
-fn content_type(name: &str) -> &'static str {
-    if name.ends_with(".mp4") {
-        "video/mp4"
-    } else if name.ends_with(".json") {
-        "application/json"
-    } else {
-        "application/octet-stream"
-    }
 }
 
 /// A random id that cannot be guessed: 128 bits, as the Screenilux storage
@@ -335,7 +333,7 @@ mod tests {
     #[test]
     fn fill_reads_across_short_reads() {
         let data: Vec<u8> = (0..100).collect();
-        let mut reader = std::io::Read::chain(&data[..30], &data[30..]);
+        let mut reader = Read::chain(&data[..30], &data[30..]);
         let mut buf = [0u8; 64];
         assert_eq!(fill(&mut reader, &mut buf).unwrap(), 64);
         assert_eq!(&buf[..], &data[..64]);

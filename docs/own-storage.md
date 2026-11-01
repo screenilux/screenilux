@@ -24,8 +24,10 @@ needs a public address.
    **custom domain** you own.
 3. Copy the public address, for example `https://pub-1234abcd.r2.dev`.
 
-Only someone with a link can find a recording: each one is kept under a long,
-random name.
+This doesn't make your recordings public. Screenilux encrypts every file
+before uploading it, and the key is only in the link, so anyone reading the
+bucket gets scrambled bytes. Each recording is also kept under a long, random
+name.
 
 ## 3. Let the Screenilux page read it
 

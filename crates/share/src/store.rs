@@ -1,6 +1,7 @@
 //! The two places a recording can go: the Screenilux storage, through its
 //! upload API (web/worker/index.ts), and the user's own bucket, through the
-//! S3 API.
+//! S3 API. Either way the files are already encrypted, so they go up as plain
+//! bytes.
 
 use std::time::Duration;
 
@@ -13,10 +14,13 @@ use crate::{Bucket, PLAYER, ShareError};
 /// How long a signed bucket request stays valid. Covers a slow part upload.
 const SIGNED_FOR: Duration = Duration::from_secs(60 * 60);
 
+/// Encrypted files say nothing about what is inside.
+const KIND: &str = "application/octet-stream";
+
 pub(crate) trait Store: Send {
-    fn put(&self, name: &str, body: &[u8], kind: &str) -> Result<(), ShareError>;
+    fn put(&self, name: &str, body: &[u8]) -> Result<(), ShareError>;
     /// Start a file that goes up in parts; returns the upload's id.
-    fn start_parts(&self, name: &str, kind: &str) -> Result<String, ShareError>;
+    fn start_parts(&self, name: &str) -> Result<String, ShareError>;
     /// One part, numbered from 1; returns its ETag.
     fn put_part(
         &self,
@@ -27,14 +31,18 @@ pub(crate) trait Store: Send {
     ) -> Result<String, ShareError>;
     fn finish_parts(&self, name: &str, upload: &str, etags: &[String]) -> Result<(), ShareError>;
     fn abort_parts(&self, name: &str, upload: &str) -> Result<(), ShareError>;
+    /// Say that every file is up.
+    fn complete(&self) -> Result<(), ShareError>;
+    /// Remove what an upload that failed had sent.
+    fn discard(&self, names: &[String]) -> Result<(), ShareError>;
 }
 
 /// The Screenilux storage.
 pub(crate) struct Hosted {
     agent: ureq::Agent,
     auth: String,
-    /// `<server>/api/recordings/<id>/`
-    files: String,
+    /// `<server>/api/recordings/<id>`
+    recording: String,
 }
 
 #[derive(Deserialize)]
@@ -75,25 +83,32 @@ impl Hosted {
             return Err(ShareError::TooBig);
         }
         let auth = format!("Bearer {}", created.token);
-        let files = format!("{server}/api/recordings/{}/", created.id);
-        Ok((Self { agent, auth, files }, created.link))
+        let recording = format!("{server}/api/recordings/{}", created.id);
+        Ok((
+            Self {
+                agent,
+                auth,
+                recording,
+            },
+            created.link,
+        ))
     }
 }
 
 impl Store for Hosted {
-    fn put(&self, name: &str, body: &[u8], kind: &str) -> Result<(), ShareError> {
+    fn put(&self, name: &str, body: &[u8]) -> Result<(), ShareError> {
         self.agent
-            .put(format!("{}{name}", self.files))
+            .put(format!("{}/{name}", self.recording))
             .header("Authorization", &self.auth)
-            .header("Content-Type", kind)
+            .header("Content-Type", KIND)
             .send(body)?;
         Ok(())
     }
 
-    fn start_parts(&self, name: &str, _kind: &str) -> Result<String, ShareError> {
+    fn start_parts(&self, name: &str) -> Result<String, ShareError> {
         let started: Started = self
             .agent
-            .post(format!("{}{name}/uploads", self.files))
+            .post(format!("{}/{name}/uploads", self.recording))
             .header("Authorization", &self.auth)
             .send_empty()?
             .body_mut()
@@ -110,7 +125,10 @@ impl Store for Hosted {
     ) -> Result<String, ShareError> {
         let part: Part = self
             .agent
-            .put(format!("{}{name}/uploads/{upload}/{number}", self.files))
+            .put(format!(
+                "{}/{name}/uploads/{upload}/{number}",
+                self.recording
+            ))
             .header("Authorization", &self.auth)
             .send(body)?
             .body_mut()
@@ -125,7 +143,7 @@ impl Store for Hosted {
             .map(|(i, etag)| serde_json::json!({ "partNumber": i + 1, "etag": etag }))
             .collect();
         self.agent
-            .post(format!("{}{name}/uploads/{upload}", self.files))
+            .post(format!("{}/{name}/uploads/{upload}", self.recording))
             .header("Authorization", &self.auth)
             .send_json(serde_json::json!({ "parts": parts }))?;
         Ok(())
@@ -133,7 +151,23 @@ impl Store for Hosted {
 
     fn abort_parts(&self, name: &str, upload: &str) -> Result<(), ShareError> {
         self.agent
-            .delete(format!("{}{name}/uploads/{upload}", self.files))
+            .delete(format!("{}/{name}/uploads/{upload}", self.recording))
+            .header("Authorization", &self.auth)
+            .call()?;
+        Ok(())
+    }
+
+    fn complete(&self) -> Result<(), ShareError> {
+        self.agent
+            .post(format!("{}/complete", self.recording))
+            .header("Authorization", &self.auth)
+            .send_empty()?;
+        Ok(())
+    }
+
+    fn discard(&self, _names: &[String]) -> Result<(), ShareError> {
+        self.agent
+            .delete(&self.recording)
             .header("Authorization", &self.auth)
             .call()?;
         Ok(())
@@ -150,11 +184,13 @@ pub(crate) struct Own {
 }
 
 impl Own {
-    /// A place for a new recording in the bucket, and its link.
+    /// A place for a new recording in the bucket, and its link, which
+    /// carries `key`.
     pub fn create(
         agent: ureq::Agent,
         settings: &Bucket,
         id: &str,
+        key: &str,
     ) -> Result<(Self, String), ShareError> {
         let bad = |what: &str| ShareError::Bucket(what.to_string());
         let endpoint = Url::parse(settings.endpoint.trim())
@@ -188,7 +224,7 @@ impl Own {
         }
         let files = format!("{}/{prefix}", public.as_str().trim_end_matches('/'));
         let link = format!(
-            "{PLAYER}/b#{}",
+            "{PLAYER}/b#k={key}&u={}",
             url::form_urlencoded::byte_serialize(files.as_bytes()).collect::<String>()
         );
         Ok((
@@ -208,27 +244,27 @@ impl Own {
 }
 
 impl Store for Own {
-    fn put(&self, name: &str, body: &[u8], kind: &str) -> Result<(), ShareError> {
+    fn put(&self, name: &str, body: &[u8]) -> Result<(), ShareError> {
         let key = self.key(name);
         let mut action = self.bucket.put_object(Some(&self.credentials), &key);
-        action.headers_mut().insert("content-type", kind);
+        action.headers_mut().insert("content-type", KIND);
         self.agent
             .put(action.sign(SIGNED_FOR).as_str())
-            .header("Content-Type", kind)
+            .header("Content-Type", KIND)
             .send(body)?;
         Ok(())
     }
 
-    fn start_parts(&self, name: &str, kind: &str) -> Result<String, ShareError> {
+    fn start_parts(&self, name: &str) -> Result<String, ShareError> {
         let key = self.key(name);
         let mut action = self
             .bucket
             .create_multipart_upload(Some(&self.credentials), &key);
-        action.headers_mut().insert("content-type", kind);
+        action.headers_mut().insert("content-type", KIND);
         let xml = self
             .agent
             .post(action.sign(SIGNED_FOR).as_str())
-            .header("Content-Type", kind)
+            .header("Content-Type", KIND)
             .send_empty()?
             .body_mut()
             .read_to_string()?;
@@ -287,6 +323,21 @@ impl Store for Own {
         self.agent.delete(action.sign(SIGNED_FOR).as_str()).call()?;
         Ok(())
     }
+
+    /// Nothing to say: the manifest, uploaded last, is what tells the player
+    /// the recording is ready.
+    fn complete(&self) -> Result<(), ShareError> {
+        Ok(())
+    }
+
+    fn discard(&self, names: &[String]) -> Result<(), ShareError> {
+        for name in names {
+            let key = self.key(name);
+            let action = self.bucket.delete_object(Some(&self.credentials), &key);
+            self.agent.delete(action.sign(SIGNED_FOR).as_str()).call()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -306,13 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn a_bucket_link_carries_where_the_files_are() {
+    fn a_bucket_link_carries_the_key_and_where_the_files_are() {
         let (own, link) =
-            Own::create(ureq::Agent::new_with_defaults(), &settings(), "abc").unwrap();
+            Own::create(ureq::Agent::new_with_defaults(), &settings(), "abc", "KEY").unwrap();
         assert_eq!(own.key("screen1.mp4"), "shared/abc/screen1.mp4");
         assert_eq!(
             link,
-            format!("{PLAYER}/b#https%3A%2F%2Fpub-x.r2.dev%2Fshared%2Fabc%2F")
+            format!("{PLAYER}/b#k=KEY&u=https%3A%2F%2Fpub-x.r2.dev%2Fshared%2Fabc%2F")
         );
     }
 
@@ -321,22 +372,24 @@ mod tests {
         let mut s = settings();
         s.public_url = "http://pub-x.r2.dev".into();
         assert!(matches!(
-            Own::create(ureq::Agent::new_with_defaults(), &s, "abc"),
+            Own::create(ureq::Agent::new_with_defaults(), &s, "abc", "KEY"),
             Err(ShareError::Bucket(_))
         ));
     }
 
     #[test]
     fn signed_uploads_go_to_the_bucket_by_path() {
-        let (own, _) = Own::create(ureq::Agent::new_with_defaults(), &settings(), "abc").unwrap();
-        let key = own.key("share.json");
+        let (own, _) =
+            Own::create(ureq::Agent::new_with_defaults(), &settings(), "abc", "KEY").unwrap();
+        let key = own.key("recording.json");
         let url = own
             .bucket
             .put_object(Some(&own.credentials), &key)
             .sign(SIGNED_FOR);
         assert!(
-            url.as_str()
-                .starts_with("https://acc.r2.cloudflarestorage.com/videos/shared/abc/share.json?")
+            url.as_str().starts_with(
+                "https://acc.r2.cloudflarestorage.com/videos/shared/abc/recording.json?"
+            )
         );
         assert!(url.query().unwrap().contains("X-Amz-Signature="));
     }

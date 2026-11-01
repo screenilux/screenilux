@@ -1,25 +1,20 @@
 // What a shared recording is made of, and how to read one.
 //
-// A share is a folder of plain files at some address: on the Screenilux
-// storage (/r/<id>/) or in someone's own bucket. The desktop app writes
-// share.json there first, uploads the rest, then rewrites share.json as
-// ready. The formats of recording.json and text.json are the desktop app's
-// own (crates/core/src/session.rs and text.rs).
+// A share is a folder of encrypted files at some address: on the Screenilux
+// storage (/r/<id>/) or in someone's own bucket. The page reads them through
+// the service worker (public/sw.js), which decrypts them with the key from
+// the link, so everything here sees plain files under /__decrypt/<session>/.
+// The formats of recording.json and text.json are the desktop app's own
+// (crates/core/src/session.rs and text.rs); the uploaded manifest also
+// carries the recording's title.
 
-export interface Share {
-  format: "screenilux-share";
-  version: 1;
-  status: "uploading" | "ready" | "failed";
-  title: string;
-  /** When it was recorded, as an RFC 3339 time. */
-  created: string;
-  /** When the link stops working, if it does. */
-  expires?: string;
-  /** Bytes uploaded so far, of how many. */
-  uploaded: number;
+/** How an upload to the Screenilux storage is going, as its server counts it. */
+export interface Status {
+  status: "uploading" | "stalled" | "ready";
+  received: number;
   total: number;
-  /** Whether text.json is there. */
-  text: boolean;
+  started: string;
+  expires: string;
 }
 
 export interface Screen {
@@ -36,6 +31,9 @@ export interface Screen {
 
 export interface Manifest {
   format: "screenrec-session";
+  title?: string;
+  /** When it was recorded, as an RFC 3339 time. */
+  created: string;
   duration: number;
   fps: number;
   screens: Screen[];
@@ -69,21 +67,25 @@ export interface Hit {
   snippet: string;
 }
 
+/** The file is not there, or the recording has expired. */
 export class Missing extends Error {}
+/** The file is there but does not open with the link's key. */
+export class Locked extends Error {}
 
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
-  if (res.status === 404 || res.status === 403) throw new Missing(url);
+  if (res.status === 404 || res.status === 403 || res.status === 410) throw new Missing(url);
+  if (res.status === 422) throw new Locked(url);
   if (!res.ok) throw new Error(`${url}: ${res.status}`);
   return (await res.json()) as T;
 }
 
-export function readShare(base: string): Promise<Share> {
-  return json<Share>(`${base}share.json`, { cache: "no-store" });
+export function readStatus(id: string): Promise<Status> {
+  return json<Status>(`/api/recordings/${id}`, { cache: "no-store" });
 }
 
 export function readManifest(base: string): Promise<Manifest> {
-  return json<Manifest>(`${base}recording.json`);
+  return json<Manifest>(`${base}recording.json`, { cache: "no-store" });
 }
 
 export async function readText(base: string): Promise<TextIndex | undefined> {

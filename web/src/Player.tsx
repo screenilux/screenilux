@@ -339,6 +339,14 @@ function ScreenView({ screen, place, src, width, height, hidden, label, text, re
         className="h-full w-full"
         onLoadedMetadata={(e) => onDuration?.(e.currentTarget.duration)}
         onEnded={onEnded}
+        onError={(e) => {
+          // A first load can stumble while the decrypting worker starts;
+          // one more try usually does it.
+          const v = e.currentTarget;
+          if (v.dataset.retried) return;
+          v.dataset.retried = "1";
+          v.load();
+        }}
       />
       {text && (
         <div className="absolute inset-0" aria-label="Text on screen">

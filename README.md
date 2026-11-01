@@ -103,6 +103,10 @@ account and nothing to install.
 You can send the link straight away. Until the upload finishes, the page
 shows how far along it is, then starts playing by itself.
 
+**Only people with the link can watch.** Recordings are encrypted on your
+computer before they are uploaded, and the key is part of the link. Neither
+Screenilux nor your storage provider can watch them.
+
 Choose where recordings go:
 
 - **Screenilux.** Nothing to set up. Links last 7 days, for recordings up
