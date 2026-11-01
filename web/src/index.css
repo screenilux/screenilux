@@ -79,12 +79,12 @@ input[type="range"].scrub {
 input[type="range"].scrub::-webkit-slider-runnable-track {
   height: 4px;
   border-radius: 2px;
-  background: linear-gradient(to right, var(--signal) var(--done, 0%), var(--mist) var(--done, 0%));
+  background: linear-gradient(to right, var(--soft) var(--done, 0%), var(--mist) var(--done, 0%));
 }
 input[type="range"].scrub::-moz-range-track {
   height: 4px;
   border-radius: 2px;
-  background: linear-gradient(to right, var(--signal) var(--done, 0%), var(--mist) var(--done, 0%));
+  background: linear-gradient(to right, var(--soft) var(--done, 0%), var(--mist) var(--done, 0%));
 }
 input[type="range"].scrub::-webkit-slider-thumb {
   appearance: none;
@@ -92,14 +92,14 @@ input[type="range"].scrub::-webkit-slider-thumb {
   height: 14px;
   margin-top: -5px;
   border-radius: 50%;
-  background: var(--signal);
+  background: var(--soft);
   border: 2px solid var(--ground);
 }
 input[type="range"].scrub::-moz-range-thumb {
   width: 12px;
   height: 12px;
   border-radius: 50%;
-  background: var(--signal);
+  background: var(--soft);
   border: 2px solid var(--ground);
 }
 

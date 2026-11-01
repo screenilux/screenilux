@@ -278,7 +278,7 @@ export function Player({ base, manifest, text }: Props) {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="A word you saw on screen"
-            className="h-10 rounded-[10px] border border-mist bg-ground px-3 text-sm placeholder:text-weak focus:border-signal focus:outline-none"
+            className="h-10 rounded-[10px] border border-mist bg-ground px-3 text-sm placeholder:text-weak focus:border-soft focus:outline-none"
           />
           <div className="mt-2 min-h-0 flex-1 overflow-y-auto">
             {query.trim() && !hits.length && <p className="px-1 py-3 text-sm text-weak">Not found in this recording.</p>}
@@ -374,7 +374,7 @@ function ScreenView({ screen, place, src, width, height, hidden, label, text, re
         </div>
       )}
       {label && !hidden && (
-        <span className="pointer-events-none absolute top-2 left-2 rounded-full bg-ink/70 px-2 py-0.5 text-xs text-on-dark">
+        <span className="pointer-events-none absolute top-2 left-2 rounded-full bg-ground/85 px-2 py-0.5 text-xs font-semibold text-ink">
           {label}
         </span>
       )}
@@ -418,7 +418,7 @@ function Controls(p: ControlsProps) {
           type="button"
           onClick={p.onPlay}
           aria-label={p.playing ? "Pause" : "Play"}
-          className="grid size-10 place-items-center rounded-full bg-action text-on-dark hover:bg-signal"
+          className="grid size-10 place-items-center rounded-full bg-mist text-ink hover:bg-soft/50"
         >
           {p.playing ? <PauseIcon /> : <PlayIcon />}
         </button>
@@ -434,14 +434,14 @@ function Controls(p: ControlsProps) {
                   type="button"
                   aria-pressed={p.layout === l.id}
                   onClick={() => p.onLayout(l.id)}
-                  className={`rounded-full px-3 py-1 text-xs font-semibold ${p.layout === l.id ? "bg-ink text-ground" : "text-weak hover:text-ink"}`}
+                  className={`rounded-full px-3 py-1 text-xs font-semibold ${p.layout === l.id ? "bg-mist text-ink" : "text-weak hover:text-ink"}`}
                 >
                   {l.label}
                 </button>
               ))}
             </div>
           )}
-          <button type="button" onClick={p.onRate} className="h-8 min-w-12 rounded-full border border-mist px-2 text-xs font-semibold tabular-nums hover:border-signal">
+          <button type="button" onClick={p.onRate} className="h-8 min-w-12 rounded-full border border-mist px-2 text-xs font-semibold tabular-nums hover:border-soft">
             {p.rate}×
           </button>
           <IconButton label={p.muted ? "Turn sound on" : "Mute"} onClick={p.onMute}>
@@ -463,7 +463,7 @@ function IconButton({ label, onClick, children }: { label: string; onClick: () =
       onClick={onClick}
       aria-label={label}
       title={label}
-      className="grid size-8 place-items-center rounded-full border border-mist hover:border-signal"
+      className="grid size-8 place-items-center rounded-full border border-mist hover:border-soft"
     >
       {children}
     </button>

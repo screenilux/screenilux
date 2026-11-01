@@ -17,8 +17,37 @@ const SIGNED_FOR: Duration = Duration::from_secs(60 * 60);
 /// Encrypted files say nothing about what is inside.
 const KIND: &str = "application/octet-stream";
 
+/// Bytes handed out so far are reported here, so progress moves during a
+/// long request instead of jumping when it ends.
+pub(crate) type Sent<'a> = &'a mut dyn FnMut(usize);
+
+/// Send `body` as the request's body, reporting each piece as it goes out.
+fn send_counted(
+    request: ureq::RequestBuilder<ureq::typestate::WithBody>,
+    body: &[u8],
+    sent: Sent<'_>,
+) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    let mut reader = Counted { rest: body, sent };
+    request
+        .header("Content-Length", body.len().to_string())
+        .send(ureq::SendBody::from_reader(&mut reader))
+}
+
+struct Counted<'a, 'b> {
+    rest: &'a [u8],
+    sent: Sent<'b>,
+}
+
+impl std::io::Read for Counted<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.rest.read(buf)?;
+        (self.sent)(n);
+        Ok(n)
+    }
+}
+
 pub(crate) trait Store: Send {
-    fn put(&self, name: &str, body: &[u8]) -> Result<(), ShareError>;
+    fn put(&self, name: &str, body: &[u8], sent: Sent<'_>) -> Result<(), ShareError>;
     /// Start a file that goes up in parts; returns the upload's id.
     fn start_parts(&self, name: &str) -> Result<String, ShareError>;
     /// One part, numbered from 1; returns its ETag.
@@ -28,6 +57,7 @@ pub(crate) trait Store: Send {
         upload: &str,
         number: u16,
         body: &[u8],
+        sent: Sent<'_>,
     ) -> Result<String, ShareError>;
     fn finish_parts(&self, name: &str, upload: &str, etags: &[String]) -> Result<(), ShareError>;
     fn abort_parts(&self, name: &str, upload: &str) -> Result<(), ShareError>;
@@ -119,12 +149,13 @@ impl Hosted {
 }
 
 impl Store for Hosted {
-    fn put(&self, name: &str, body: &[u8]) -> Result<(), ShareError> {
-        self.agent
+    fn put(&self, name: &str, body: &[u8], sent: Sent<'_>) -> Result<(), ShareError> {
+        let request = self
+            .agent
             .put(format!("{}/{name}", self.recording))
             .header("Authorization", &self.auth)
-            .header("Content-Type", KIND)
-            .send(body)?;
+            .header("Content-Type", KIND);
+        send_counted(request, body, sent)?;
         Ok(())
     }
 
@@ -145,17 +176,16 @@ impl Store for Hosted {
         upload: &str,
         number: u16,
         body: &[u8],
+        sent: Sent<'_>,
     ) -> Result<String, ShareError> {
-        let part: Part = self
+        let request = self
             .agent
             .put(format!(
                 "{}/{name}/uploads/{upload}/{number}",
                 self.recording
             ))
-            .header("Authorization", &self.auth)
-            .send(body)?
-            .body_mut()
-            .read_json()?;
+            .header("Authorization", &self.auth);
+        let part: Part = send_counted(request, body, sent)?.body_mut().read_json()?;
         Ok(part.etag)
     }
 
@@ -267,14 +297,15 @@ impl Own {
 }
 
 impl Store for Own {
-    fn put(&self, name: &str, body: &[u8]) -> Result<(), ShareError> {
+    fn put(&self, name: &str, body: &[u8], sent: Sent<'_>) -> Result<(), ShareError> {
         let key = self.key(name);
         let mut action = self.bucket.put_object(Some(&self.credentials), &key);
         action.headers_mut().insert("content-type", KIND);
-        self.agent
+        let request = self
+            .agent
             .put(action.sign(SIGNED_FOR).as_str())
-            .header("Content-Type", KIND)
-            .send(body)?;
+            .header("Content-Type", KIND);
+        send_counted(request, body, sent)?;
         Ok(())
     }
 
@@ -304,15 +335,13 @@ impl Store for Own {
         upload: &str,
         number: u16,
         body: &[u8],
+        sent: Sent<'_>,
     ) -> Result<String, ShareError> {
         let key = self.key(name);
         let action = self
             .bucket
             .upload_part(Some(&self.credentials), &key, number, upload);
-        let response = self
-            .agent
-            .put(action.sign(SIGNED_FOR).as_str())
-            .send(body)?;
+        let response = send_counted(self.agent.put(action.sign(SIGNED_FOR).as_str()), body, sent)?;
         let etag = response
             .headers()
             .get("etag")

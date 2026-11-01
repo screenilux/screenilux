@@ -231,7 +231,7 @@ function Shared({ link }: { link: Exclude<Link, { kind: "incomplete" }> }) {
                 aria-valuemin={0}
                 aria-valuemax={100}
               >
-                <span className="block h-full rounded-full bg-signal transition-[width] duration-500" style={{ width: `${done}%` }} />
+                <span className="block h-full rounded-full bg-soft transition-[width] duration-500" style={{ width: `${done}%` }} />
               </span>
               <span className="mt-2 block text-sm tabular-nums">{done}% uploaded</span>
             </>
@@ -299,7 +299,7 @@ function Home() {
       </span>
       <a
         href="https://github.com/screenilux/screenilux"
-        className="mt-6 inline-flex h-10 items-center rounded-full bg-action px-5 font-semibold text-on-dark hover:bg-signal"
+        className="mt-6 inline-flex h-10 items-center rounded-full bg-mist px-5 font-semibold text-ink hover:bg-soft/50"
       >
         Get Screenilux
       </a>

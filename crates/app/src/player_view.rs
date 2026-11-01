@@ -12,9 +12,10 @@ use eframe::egui;
 use screenilux_core::playback::{Area, Layout, arrange};
 use screenilux_core::text::{Hit, Page, WordRef};
 use screenilux_player::Player;
-use screenilux_player::open::{Opened, save_text};
+use screenilux_player::open::{Opened, Origin, save_text};
 use screenilux_player::text::{INDEX_INTERVAL, Indexer, TextWorker};
 
+use crate::sharing::{self, Asked, Link};
 use crate::theme::{self, ON_DARK, Palette, icon};
 
 /// Wait this long after the picture stops changing before reading its text,
@@ -87,6 +88,10 @@ pub struct PlayerView {
     hits: Vec<Hit>,
     /// Recordings in the save folder, read when first shown.
     recents: Option<Vec<Recent>>,
+    /// The open recording's link, and whether it can be shared, as the app
+    /// last said; and sharing it, if asked for.
+    link: (Link, bool),
+    asked: Option<Asked>,
 }
 
 impl PlayerView {
@@ -109,6 +114,8 @@ impl PlayerView {
             query: String::new(),
             hits: Vec::new(),
             recents: None,
+            link: (Link::None, false),
+            asked: None,
         }
     }
 
@@ -193,6 +200,25 @@ impl PlayerView {
             .and_then(|l| l.opened.text.as_ref())
             .map(|idx| idx.search(&self.query))
             .unwrap_or_default();
+    }
+
+    /// The file of the open recording, if it is one that can be shared: a
+    /// package or a video, not an unpacked folder.
+    pub fn shareable(&self) -> Option<PathBuf> {
+        match &self.loaded.as_ref()?.opened.origin {
+            Origin::Package(p) | Origin::Video(p) => Some(p.clone()),
+            Origin::Folder(_) => None,
+        }
+    }
+
+    /// Where the open recording's link stands, to show beside its title.
+    pub fn set_link(&mut self, link: Link, can_share: bool) {
+        self.link = (link, can_share);
+    }
+
+    /// Sharing the open recording, if it was asked for since last time.
+    pub fn take_asked(&mut self) -> Option<Asked> {
+        self.asked.take()
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, out_dir: &Path) {
@@ -304,8 +330,14 @@ impl PlayerView {
                         .color(p.weak),
                 );
             });
-            if rec.is_multi() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
+            let multi = rec.is_multi();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // The link first, at the far right, then the layouts.
+                if let Some(asked) = sharing::link_chip(ui, &self.link.0, self.link.1) {
+                    self.asked = Some(asked);
+                }
+                if multi {
+                    ui.add_space(12.0);
                     let labels = ["Follow the pointer", "Side by side", "Stacked"];
                     let chosen = Layout::ALL
                         .iter()
@@ -314,8 +346,8 @@ impl PlayerView {
                     if let Some(i) = theme::segmented(ui, &labels, chosen) {
                         self.layout = Layout::ALL[i];
                     }
-                });
-            }
+                }
+            });
         });
     }
 

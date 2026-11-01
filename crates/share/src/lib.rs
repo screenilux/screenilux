@@ -20,6 +20,7 @@ mod store;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime};
 
 use screenilux_core::session::MANIFEST_NAME;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,9 @@ use store::{Hosted, Own, Store};
 
 /// Where the web player lives. Links point here.
 pub const PLAYER: &str = "https://screenilux.hassen-ben-mbarek.workers.dev";
+
+/// How long the Screenilux storage keeps a shared recording.
+pub const KEPT_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Files bigger than this go up in parts of this size. The Screenilux storage
 /// takes at most 100MB in one request; buckets need parts of at least 5MB.
@@ -129,6 +133,8 @@ pub struct Progress {
     pub uploaded: u64,
     pub total: u64,
     pub state: State,
+    /// When the link stops working, if it does.
+    pub expires: Option<SystemTime>,
 }
 
 /// An upload running on its own thread.
@@ -144,6 +150,7 @@ impl Upload {
             uploaded: 0,
             total: contents.total(),
             state: State::Starting,
+            expires: None,
         }));
         let shared = Arc::clone(&progress);
         let thread = std::thread::Builder::new()
@@ -189,6 +196,7 @@ fn run(
     let (store, link): (Box<dyn Store>, String) = match destination {
         Destination::Screenilux { server, device } => {
             let (hosted, link) = Hosted::create(agent, server, device, total)?;
+            lock(progress).expires = Some(SystemTime::now() + KEPT_FOR);
             (Box::new(hosted), format!("{link}#k={}", key.to_link()))
         }
         Destination::Bucket(bucket) => {
@@ -217,10 +225,11 @@ fn run(
             )?;
             sent.push(item.name.clone());
         }
-        store.put(MANIFEST_NAME, &manifest)?;
+        store.put(MANIFEST_NAME, &manifest, &mut |n| {
+            uploaded += n as u64;
+            lock(progress).uploaded = uploaded;
+        })?;
         sent.push(MANIFEST_NAME.to_string());
-        uploaded += manifest.len() as u64;
-        lock(progress).uploaded = uploaded;
         store.complete()
     })();
 
@@ -269,9 +278,10 @@ fn upload(
         reader
             .read_to_end(&mut body)
             .map_err(|e| ShareError::Read(e.to_string()))?;
-        store.put(name, &body)?;
-        *uploaded += body.len() as u64;
-        lock(progress).uploaded = *uploaded;
+        store.put(name, &body, &mut |n| {
+            *uploaded += n as u64;
+            lock(progress).uploaded = *uploaded;
+        })?;
         return Ok(());
     }
     let upload_id = store.start_parts(name)?;
@@ -284,9 +294,12 @@ fn upload(
                 break;
             }
             let number = etags.len() as u16 + 1;
-            etags.push(store.put_part(name, &upload_id, number, &buf[..n])?);
-            *uploaded += n as u64;
-            lock(progress).uploaded = *uploaded;
+            etags.push(
+                store.put_part(name, &upload_id, number, &buf[..n], &mut |k| {
+                    *uploaded += k as u64;
+                    lock(progress).uploaded = *uploaded;
+                })?,
+            );
         }
         store.finish_parts(name, &upload_id, &etags)
     })();

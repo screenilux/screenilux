@@ -7,12 +7,11 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use screenilux_recorder::{Session, SessionConfig};
-use screenilux_share::{State as ShareState, Upload};
 
 use crate::overlay::Overlay;
 use crate::player_view::{PlayerView, dropped_path, friendly_name, playable};
 use crate::previews::Previews;
-use crate::sharing::{self, Mode, Sharing};
+use crate::sharing::{self, Asked, Link, Mode, Shares, Sharing};
 use crate::sizing::{Fit, Sizer};
 use crate::state::{FPS_CHOICES, Phase, Probes, Runtime, Settings};
 use crate::theme::{self, ON_DARK, icon};
@@ -41,12 +40,8 @@ pub struct App {
     last_save: Option<PathBuf>,
     /// Where finished recordings are shared to.
     sharing: Sharing,
-    /// The last recording's upload, if it is being shared.
-    upload: Option<Upload>,
-    /// Its link has been put on the clipboard.
-    link_copied: bool,
-    /// Why the last recording could not be shared, if it could not start.
-    share_error: Option<String>,
+    /// Every shared recording and its link.
+    shares: Shares,
     started_at: Option<Instant>,
     /// "More options" is open.
     more: bool,
@@ -98,9 +93,7 @@ impl App {
             status: String::new(),
             last_save: None,
             sharing: Sharing::load(),
-            upload: None,
-            link_copied: false,
-            share_error: None,
+            shares: Shares::load(),
             started_at: None,
             more: false,
             hwnd,
@@ -221,19 +214,21 @@ impl App {
         self.started_at = None;
     }
 
-    /// Upload a recording just saved, if sharing is set up. The link is
-    /// copied as soon as it exists, before the upload finishes: the page it
-    /// opens waits for the rest.
+    /// Upload a recording, if sharing is set up. The link is copied as soon
+    /// as it exists, before the upload finishes: the page it opens waits for
+    /// the rest.
     fn share(&mut self, path: &Path) {
-        self.upload = None;
-        self.link_copied = false;
-        self.share_error = None;
-        let Some(destination) = self.sharing.destination() else {
-            return;
-        };
-        match sharing::contents(path) {
-            Ok(contents) => self.upload = Some(Upload::start(destination, contents)),
-            Err(e) => self.share_error = Some(e),
+        if let Some(destination) = self.sharing.destination() {
+            self.shares.start(path, destination);
+        }
+    }
+
+    /// Whether sharing is on and has what it needs.
+    fn can_share(&self) -> bool {
+        match self.sharing.mode {
+            Mode::Off => false,
+            Mode::Screenilux => true,
+            Mode::Bucket => self.sharing.bucket.is_complete(),
         }
     }
 
@@ -426,9 +421,11 @@ impl App {
 
     // -- Record tab --------------------------------------------------------
 
-    fn record_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// The Record tab. Returns how tall it would like to be, to show
+    /// everything without scrolling.
+    fn record_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> f32 {
         let p = theme::palette(ui);
-        egui::Panel::bottom("transport")
+        let transport = egui::Panel::bottom("transport")
             .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
                 left: MARGIN,
                 right: MARGIN,
@@ -436,13 +433,17 @@ impl App {
                 bottom: 20,
             }))
             .show_separator_line(false)
-            .show(ui, |ui| self.transport(ui, ctx));
+            .show(ui, |ui| self.transport(ui, ctx))
+            .response
+            .rect
+            .height();
 
-        egui::CentralPanel::default_margins()
+        let top = 4.0;
+        let column = egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
                 left: MARGIN,
                 right: MARGIN,
-                top: 4,
+                top: top as i8,
                 bottom: 0,
             }))
             .show(ui, |ui| {
@@ -457,8 +458,12 @@ impl App {
                         ui.add_space(4.0);
                         self.more_options(ui);
                         ui.add_space(8.0);
-                    });
-            });
+                    })
+                    .content_size
+                    .y
+            })
+            .inner;
+        transport + top + column
     }
 
     fn warnings(&self, ui: &mut egui::Ui) {
@@ -769,43 +774,88 @@ impl App {
         ui.add_enabled_ui(!self.busy(), |ui| self.sharing_options(ui));
     }
 
-    /// How sharing the last recording is going, and its link.
-    fn share_status(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// After a recording: what was saved, playing it, and its link.
+    fn saved_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, saved: PathBuf) {
         let p = theme::palette(ui);
-        if let Some(e) = &self.share_error {
-            theme::notice(ui, format!("Could not share it: {e}"));
-            return;
-        }
-        let Some(progress) = self.upload.as_ref().map(Upload::progress) else {
-            return;
-        };
-        let line = match &progress.state {
-            ShareState::Starting => "Getting a link…".to_string(),
-            ShareState::Uploading => {
-                let done = (progress.uploaded * 100)
-                    .checked_div(progress.total)
-                    .unwrap_or(0);
-                format!("Link copied. Uploading, {done}%")
-            }
-            ShareState::Ready => "Link copied. Ready to watch".to_string(),
-            ShareState::Failed(e) => {
-                theme::notice(ui, format!("Could not share it: {e}"));
-                return;
-            }
-        };
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(line).size(13.0).color(p.weak));
-            if let Some(link) = progress.link {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.link("Open").clicked() {
-                        ctx.open_url(egui::OpenUrl::new_tab(&link));
-                    }
-                    if ui.link("Copy link").clicked() {
-                        ctx.copy_text(link);
-                    }
+        let name = saved
+            .file_name()
+            .map(|n| friendly_name(&n.to_string_lossy()))
+            .unwrap_or_default();
+        let link = self.shares.of(&saved);
+        let can_share = self.can_share();
+        let mut asked = None;
+        let mut set_up = false;
+        egui::Frame::new()
+            .fill(p.surface)
+            .stroke(egui::Stroke::new(1.0, p.stroke))
+            .corner_radius(16)
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(icon::CHECK).size(16.0).color(p.signal));
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.label(
+                            egui::RichText::new("Saved")
+                                .font(egui::FontId::new(15.0, theme::strong())),
+                        );
+                        ui.label(egui::RichText::new(name).size(13.0).color(p.weak));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let folder =
+                            egui::Button::new(egui::RichText::new(icon::FOLDER).color(p.text))
+                                .fill(p.base)
+                                .stroke(egui::Stroke::new(1.0, p.stroke))
+                                .corner_radius(10)
+                                .min_size(egui::vec2(34.0, 34.0));
+                        if ui.add(folder).on_hover_text("Show in folder").clicked() {
+                            screenilux_platform::reveal(&saved);
+                        }
+                        let play = egui::Button::new(
+                            egui::RichText::new(format!("{}  Play", icon::PLAY))
+                                .color(p.text)
+                                .strong(),
+                        )
+                        .fill(p.base)
+                        .stroke(egui::Stroke::new(1.0, p.stroke))
+                        .corner_radius(10)
+                        .min_size(egui::vec2(0.0, 34.0));
+                        if ui.add(play).clicked() {
+                            self.play(saved.clone(), ctx);
+                        }
+                    });
                 });
-            }
-        });
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+                match link {
+                    Link::None if can_share => {
+                        if ui
+                            .add(theme::outline(format!("{}  Share link", icon::LINK)))
+                            .clicked()
+                        {
+                            asked = Some(Asked::Share);
+                        }
+                    }
+                    Link::None => {
+                        ui.horizontal(|ui| {
+                            theme::hint(ui, "Want a link to send?");
+                            if ui.link("Set up sharing").clicked() {
+                                set_up = true;
+                            }
+                        });
+                    }
+                    link => asked = sharing::link_panel(ui, &link),
+                }
+            });
+        if set_up {
+            self.more = true;
+        }
+        if let Some(Asked::Share) = asked {
+            self.share(&saved);
+        }
     }
 
     /// Where finished recordings are shared, in More options.
@@ -892,26 +942,8 @@ impl App {
                 }
                 ui.add_space(2.0);
                 if let Some(saved) = self.last_save.clone().filter(|_| self.status.is_empty()) {
-                    ui.horizontal(|ui| {
-                        let name = saved
-                            .file_name()
-                            .map(|n| friendly_name(&n.to_string_lossy()))
-                            .unwrap_or_default();
-                        ui.label(
-                            egui::RichText::new(format!("Saved {name}"))
-                                .size(13.0)
-                                .color(p.weak),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.link("Show in folder").clicked() {
-                                screenilux_platform::reveal(&saved);
-                            }
-                            if ui.link("Play it").clicked() {
-                                self.play(saved.clone(), ctx);
-                            }
-                        });
-                    });
-                    self.share_status(ui, ctx);
+                    ui.add_space(8.0);
+                    self.saved_card(ui, ctx, saved);
                 } else {
                     let line = if self.status.is_empty() {
                         "Saved to Videos\\ScreenRec when you stop".to_string()
@@ -1242,11 +1274,8 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.probes.poll();
         self.follow_displays(&ctx);
-        if !self.link_copied
-            && let Some(link) = self.upload.as_ref().and_then(|u| u.progress().link)
-        {
+        if let Some(link) = self.shares.poll() {
             ctx.copy_text(link);
-            self.link_copied = true;
         }
         let areas: Vec<_> = self.settings.monitors.iter().map(|m| m.bounds).collect();
         let watching = self.tab == Tab::Record && !self.compact && self.phase == Phase::Idle;
@@ -1272,9 +1301,10 @@ impl eframe::App for App {
         }
 
         let full = self.tab == Tab::Play && self.player.is_full();
+        let mut header = 0.0;
         if !full {
             let p = theme::palette(ui);
-            egui::Panel::top("header")
+            header = egui::Panel::top("header")
                 .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
                     left: MARGIN,
                     right: MARGIN,
@@ -1282,7 +1312,10 @@ impl eframe::App for App {
                     bottom: 14,
                 }))
                 .show_separator_line(false)
-                .show(ui, |ui| self.header(ui, &ctx));
+                .show(ui, |ui| self.header(ui, &ctx))
+                .response
+                .rect
+                .height();
         }
 
         let fit = match self.tab {
@@ -1292,10 +1325,22 @@ impl eframe::App for App {
         self.sizer.update(&ctx, fit);
 
         match self.tab {
-            Tab::Record => self.record_tab(ui, &ctx),
+            Tab::Record => {
+                let column = self.record_tab(ui, &ctx);
+                self.sizer.fit_height(&ctx, header + column);
+            }
             Tab::Play => {
                 let out_dir = self.settings.out_dir.clone();
+                let open = self.player.shareable();
+                let link = open
+                    .as_deref()
+                    .map_or(Link::None, |path| self.shares.of(path));
+                self.player
+                    .set_link(link, open.is_some() && self.can_share());
                 self.player.ui(ui, &ctx, &out_dir);
+                if let (Some(Asked::Share), Some(path)) = (self.player.take_asked(), open) {
+                    self.share(&path);
+                }
             }
         }
 

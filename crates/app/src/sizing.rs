@@ -1,8 +1,9 @@
 //! The window's size and shape: per tab, and as the recording bar.
 //!
 //! The Record tab is a column of settings, so it gets a window just wide
-//! enough for that column and as tall as the screen allows: everything shows
-//! without scrolling and the desktop beside it stays free. Watching wants
+//! enough for that column and just as tall as what it shows: the window
+//! grows when a section opens and shrinks when it closes, and only once the
+//! column is taller than the screen does it stop growing and scroll. Watching wants
 //! every pixel, so the Play tab maximises. While recording, the window can
 //! shrink to a small borderless bar at the bottom of the screen.
 //!
@@ -57,6 +58,9 @@ pub struct Sizer {
     bar: Option<Shape>,
     /// What the window adds around its content, measured once it exists.
     frame: egui::Vec2,
+    /// The Record tab's height last asked for, so a resize still on its way
+    /// is not asked for again every frame.
+    asked_height: Option<f32>,
 }
 
 impl Sizer {
@@ -67,6 +71,7 @@ impl Sizer {
             stage: None,
             bar: None,
             frame: FRAME_GUESS,
+            asked_height: None,
         }
     }
 
@@ -126,6 +131,45 @@ impl Sizer {
             dress(ctx, true);
         }
         apply(ctx, shape, maximised);
+    }
+
+    /// Make the Record tab's window `content` tall, as far as the screen
+    /// allows, keeping its width and its bottom on the screen.
+    pub fn fit_height(&mut self, ctx: &egui::Context, content: f32) {
+        if self.current != Some(Fit::Settings) {
+            return;
+        }
+        let vp = ctx.input(|i| i.viewport().clone());
+        let (Some(outer), Some(inner)) = (vp.outer_rect, vp.inner_rect) else {
+            return;
+        };
+        if vp.maximized == Some(true) || vp.minimized == Some(true) || vp.fullscreen == Some(true) {
+            return;
+        }
+        let reach = self.reach(work_area(ctx, outer), ctx.pixels_per_point());
+        let height = content
+            .ceil()
+            .clamp(MIN_SIZE.y, (reach.height() - self.frame.y).max(MIN_SIZE.y));
+        if (inner.height() - height).abs() < 1.0 {
+            self.asked_height = None;
+            return;
+        }
+        if self.asked_height == Some(height) {
+            return;
+        }
+        self.asked_height = Some(height);
+        let bottom = outer.top() + self.frame.y + height;
+        if bottom > reach.bottom() {
+            let top = (reach.bottom() - self.frame.y - height).max(reach.top());
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                outer.left(),
+                top,
+            )));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            inner.width(),
+            height,
+        )));
     }
 
     fn slot(&mut self, fit: Fit) -> &mut Option<Shape> {

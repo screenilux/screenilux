@@ -36,6 +36,10 @@ pub mod icon {
     pub const FULL_SCREEN: &str = "\u{E740}";
     pub const LEAVE_FULL_SCREEN: &str = "\u{E73F}";
     pub const CHECK: &str = "\u{E73E}";
+    pub const COPY: &str = "\u{E8C8}";
+    pub const LINK: &str = "\u{E71B}";
+    pub const LOCK: &str = "\u{E72E}";
+    pub const OPEN: &str = "\u{E8A7}";
 }
 
 /// The same icons as symbols in egui's own fonts, which every system has.
@@ -58,6 +62,10 @@ pub mod icon {
     pub const FULL_SCREEN: &str = "\u{26F6}";
     pub const LEAVE_FULL_SCREEN: &str = "\u{1F5D7}";
     pub const CHECK: &str = "\u{2714}";
+    pub const COPY: &str = "\u{29C9}";
+    pub const LINK: &str = "\u{1F517}";
+    pub const LOCK: &str = "\u{1F512}";
+    pub const OPEN: &str = "\u{2197}";
 }
 
 /// The named colours. Two sets, picked by the system theme.
@@ -714,6 +722,18 @@ pub fn notice(ui: &mut egui::Ui, text: impl Into<String>) {
         ui.label(egui::RichText::new(icon::WARNING).color(p.text));
         ui.label(egui::RichText::new(text.into()).color(p.text));
     });
+}
+
+/// A thin bar showing how far along something is, `done` from 0 to 1.
+pub fn progress(ui: &mut egui::Ui, done: f32, width: f32) {
+    let p = palette(ui);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width.max(8.0), 6.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(3), p.stroke);
+    let filled = rect.with_max_x(rect.left() + rect.width() * done.clamp(0.0, 1.0));
+    if filled.width() > 0.5 {
+        painter.rect_filled(filled, CornerRadius::same(3), p.signal);
+    }
 }
 
 /// Weak explanatory text under a control.
