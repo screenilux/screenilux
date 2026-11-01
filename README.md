@@ -32,6 +32,29 @@ in them.
 - **Open recordings your way:** double-click one, drop it on the window, or
   use *Open*.
 
+## How it differs from Loom
+
+Loom is built for sending a quick video as a link. Screenilux is built for
+recording everything you are working on, on your own computer.
+
+|                                | Screenilux                            | Loom                                        |
+| ------------------------------ | ------------------------------------- | ------------------------------------------- |
+| Several screens at once        | Yes, played back together in step     | No, one screen per recording                |
+| Length of a recording          | No limit                              | 5 minutes on the free plan                  |
+| Number of recordings           | No limit                              | 25 per person on the free plan              |
+| Account                        | None                                  | Required                                    |
+| Where recordings are kept      | On your PC                            | On Loom's servers                           |
+| Price                          | Free and open source                  | Free plan with limits, or a monthly fee per person |
+
+Screenilux also reads the text on screen, on your PC and without internet, so
+you can copy it from a paused video or search a recording for a word.
+
+Loom is ahead in sharing: an instant link, comments and reactions, and apps
+for Mac and phones. Screenilux runs on Windows only for now, and a share link
+is next (see below).
+
+Loom's limits are from its help pages and plan listings in November 2026.
+
 ## Getting it
 
 1. Download the latest zip from
@@ -57,6 +80,12 @@ file, which opens in Screenilux.
   still pause on it and copy it.
 - Long multi-screen recordings take a moment to open.
 - Pointer effects do not work over apps running as administrator.
+
+## Upcoming
+
+- **Share a link in seconds.** Stop recording and get a link that anyone can
+  open in their browser to watch, the way Loom does. Keeping recordings only on
+  your PC will stay an option.
 
 ## Building it yourself
 
