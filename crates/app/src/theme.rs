@@ -168,6 +168,23 @@ pub fn install(ctx: &egui::Context) {
             .into();
             let s = &mut style.spacing;
             s.item_spacing = egui::vec2(8.0, 8.0);
+            s.slider_rail_height = 5.0;
+            // A scrollbar that floats over the edge and fades when it is not
+            // wanted, rather than a channel cut out of the content and a bar
+            // sitting on top of the words.
+            s.scroll = egui::style::ScrollStyle {
+                bar_width: 7.0,
+                handle_min_length: 24.0,
+                floating_width: 7.0,
+                floating_allocated_width: 0.0,
+                dormant_background_opacity: 0.0,
+                active_background_opacity: 0.0,
+                interact_background_opacity: 0.0,
+                dormant_handle_opacity: 0.0,
+                active_handle_opacity: 0.55,
+                interact_handle_opacity: 0.85,
+                ..egui::style::ScrollStyle::floating()
+            };
             s.button_padding = egui::vec2(14.0, 6.0);
             s.interact_size.y = 32.0;
             s.combo_height = 240.0;
@@ -341,6 +358,15 @@ fn visuals(theme: Theme, p: Palette) -> Visuals {
     w.open.weak_bg_fill = p.surface;
     w.open.bg_stroke = Stroke::new(1.0, p.stroke);
     w.open.corner_radius = control;
+
+    // A slider's handle is a pill rather than egui's circle on a wire: the
+    // circle reads as a knob from an older kind of interface, and a pill
+    // sits in the track it travels along.
+    v.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.46 };
+    // What is chosen is tinted rather than outlined, so a row of choices
+    // shows its answer at a glance.
+    v.selection.bg_fill = blend(p.signal, p.base, 0.76);
+    v.selection.stroke = Stroke::new(1.0, p.signal);
     v
 }
 

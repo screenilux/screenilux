@@ -47,6 +47,11 @@ pub const TIMELINE_H: f32 = TRACK_H + 26.0;
 
 /// The least list worth scrolling, when the panel is short.
 const LIST_MIN: f32 = 120.0;
+
+/// The effect menu: wide enough for a name and what it does on one line
+/// each, and tall enough to show six without scrolling.
+const MENU_W: f32 = 420.0;
+const MENU_LIST_H: f32 = 330.0;
 /// A drag shorter than this is a click: move the playhead, do not select.
 const TAP: f64 = 0.35;
 /// How close to a block's edge counts as grabbing that edge.
@@ -359,14 +364,17 @@ impl EditView {
         while mark <= dur {
             let x = x_of(mark);
             painter.line_segment(
-                [egui::pos2(x, rect.top()), egui::pos2(x, rect.top() + 9.0)],
-                egui::Stroke::new(1.0, p.stroke),
+                [
+                    egui::pos2(x, rect.top() + 3.0),
+                    egui::pos2(x, rect.top() + 9.0),
+                ],
+                egui::Stroke::new(1.0, theme::blend(p.stroke, p.surface, 0.3)),
             );
             painter.text(
-                egui::pos2(x + 3.0, rect.top() + 2.0),
+                egui::pos2(x + 5.0, rect.top() + 2.0),
                 egui::Align2::LEFT_TOP,
                 stamp_short(mark),
-                egui::FontId::monospace(9.0),
+                egui::FontId::new(9.5, theme::strong()),
                 p.weak,
             );
             mark += 10.0;
@@ -401,23 +409,24 @@ impl EditView {
             );
             let tint = tool_colour(&m.tool, p);
             let on = self.opened == Some(m.id);
-            painter.rect_filled(
-                r,
-                egui::CornerRadius::same(5),
-                theme::blend(tint, p.surface, 0.72),
-            );
+            let round = egui::CornerRadius::same(7);
+            painter.rect_filled(r, round, theme::blend(tint, p.surface, 0.68));
+            // A bar of full colour down the leading edge, so a block says
+            // which effect it is even when it is too narrow for its name.
+            let edge = egui::Rect::from_min_size(r.min, egui::vec2(3.0, r.height()));
+            painter.rect_filled(edge, egui::CornerRadius::same(2), tint);
             painter.rect_stroke(
                 r,
-                egui::CornerRadius::same(5),
-                egui::Stroke::new(if on { 2.0 } else { 1.0 }, tint),
+                round,
+                egui::Stroke::new(if on { 1.6 } else { 1.0 }, tint),
                 egui::StrokeKind::Inside,
             );
-            if r.width() > 46.0 {
+            if r.width() > 52.0 {
                 painter.text(
-                    r.left_center() + egui::vec2(6.0, 0.0),
+                    r.left_center() + egui::vec2(11.0, 0.0),
                     egui::Align2::LEFT_CENTER,
                     m.tool.label(),
-                    egui::FontId::proportional(10.5),
+                    egui::FontId::new(11.0, theme::strong()),
                     p.text,
                 );
             }
@@ -558,15 +567,23 @@ impl EditView {
 
                     egui::Frame::NONE
                         .fill(if live {
-                            theme::blend(tint, p.surface, 0.82)
+                            theme::blend(tint, p.base, 0.9)
                         } else {
-                            p.surface
+                            p.base
                         })
-                        .stroke(egui::Stroke::new(1.0, if open { tint } else { p.stroke }))
-                        .corner_radius(8)
-                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .stroke(egui::Stroke::new(
+                            if open { 1.5 } else { 1.0 },
+                            if open { tint } else { p.stroke },
+                        ))
+                        .corner_radius(12)
+                        .inner_margin(egui::Margin::symmetric(12, 10))
                         .show(ui, |ui| {
                             let head = ui.horizontal(|ui| {
+                                let (dot, _) = ui.allocate_exact_size(
+                                    egui::vec2(8.0, 8.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(dot.center(), 4.0, tint);
                                 ui.label(
                                     egui::RichText::new(m.tool.label())
                                         .family(theme::strong())
@@ -652,6 +669,7 @@ impl EditView {
                     egui::DragValue::new(&mut start)
                         .speed(0.05)
                         .range(0.0..=duration)
+                        .fixed_decimals(2)
                         .suffix("s"),
                 )
                 .changed()
@@ -667,6 +685,7 @@ impl EditView {
                     egui::DragValue::new(&mut end)
                         .speed(0.05)
                         .range(0.0..=duration)
+                        .fixed_decimals(2)
                         .suffix("s"),
                 )
                 .changed()
@@ -683,28 +702,18 @@ impl EditView {
                 scale,
             } => {
                 let (area, mut follow, mut scale) = (*area, *follow, *scale);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Closeness").size(11.0).color(p.weak));
-                    if ui
-                        .add(egui::Slider::new(&mut scale, 1.4..=3.2).show_value(false))
-                        .changed()
-                    {
-                        l.edits.update(id, |m| {
-                            m.tool = Tool::Zoom {
-                                area,
-                                follow,
-                                scale,
-                            };
-                        });
-                        self.saved = false;
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("×{scale:.1}"))
-                            .monospace()
-                            .size(11.0)
-                            .color(p.weak),
-                    );
-                });
+                if dial(ui, p, "Closeness", &mut scale, 1.4..=3.2, |v| {
+                    format!("×{v:.1}")
+                }) {
+                    l.edits.update(id, |m| {
+                        m.tool = Tool::Zoom {
+                            area,
+                            follow,
+                            scale,
+                        };
+                    });
+                    self.saved = false;
+                }
                 if theme::setting(ui, &mut follow, "Follow the pointer").changed() {
                     l.edits.update(id, |m| {
                         m.tool = Tool::Zoom {
@@ -739,32 +748,20 @@ impl EditView {
             Tool::Blur { area, strength } => {
                 let area = *area;
                 let mut strength = *strength;
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Softness").size(11.0).color(p.weak));
-                    if ui
-                        .add(egui::Slider::new(&mut strength, 0.2..=1.0).show_value(false))
-                        .changed()
-                    {
-                        l.edits
-                            .update(id, |m| m.tool = Tool::Blur { area, strength });
-                        self.saved = false;
-                    }
-                });
+                if dial(ui, p, "Softness", &mut strength, 0.2..=1.0, percent) {
+                    l.edits
+                        .update(id, |m| m.tool = Tool::Blur { area, strength });
+                    self.saved = false;
+                }
             }
             Tool::Spotlight { area, dim } => {
                 let area = *area;
                 let mut dim = *dim;
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Dim the rest").size(11.0).color(p.weak));
-                    if ui
-                        .add(egui::Slider::new(&mut dim, 0.1..=0.9).show_value(false))
-                        .changed()
-                    {
-                        l.edits
-                            .update(id, |m| m.tool = Tool::Spotlight { area, dim });
-                        self.saved = false;
-                    }
-                });
+                if dial(ui, p, "Dim the rest", &mut dim, 0.1..=0.9, percent) {
+                    l.edits
+                        .update(id, |m| m.tool = Tool::Spotlight { area, dim });
+                    self.saved = false;
+                }
             }
             Tool::Caption { text, place } => {
                 let mut text = text.clone();
@@ -803,17 +800,11 @@ impl EditView {
             Tool::Backdrop { pad, style } => {
                 let mut pad = *pad;
                 let mut style = *style;
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Inset").size(11.0).color(p.weak));
-                    if ui
-                        .add(egui::Slider::new(&mut pad, 0.0..=0.2).show_value(false))
-                        .changed()
-                    {
-                        l.edits
-                            .update(id, |m| m.tool = Tool::Backdrop { pad, style });
-                        self.saved = false;
-                    }
-                });
+                if dial(ui, p, "Inset", &mut pad, 0.0..=0.2, percent) {
+                    l.edits
+                        .update(id, |m| m.tool = Tool::Backdrop { pad, style });
+                    self.saved = false;
+                }
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Behind").size(11.0).color(p.weak));
                     for (option, label) in [
@@ -919,10 +910,11 @@ impl EditView {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.set_max_width(320.0);
+                ui.set_width(MENU_W);
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut self.find)
                         .hint_text(format!("{}  Search effects", icon::SEARCH))
+                        .margin(egui::Margin::symmetric(12, 8))
                         .desired_width(f32::INFINITY),
                 );
                 // The menu opens ready to be typed into, so reaching for an
@@ -934,17 +926,25 @@ impl EditView {
                 ui.add_space(6.0);
 
                 if shown.is_empty() {
+                    ui.add_space(6.0);
                     theme::hint(ui, "Nothing by that name.");
+                    ui.add_space(6.0);
                 }
                 egui::ScrollArea::vertical()
-                    .max_height(300.0)
+                    .max_height(MENU_LIST_H)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
+                        // The rows carry their own spacing, so the style's
+                        // does not stack on top and push the last one out.
+                        ui.spacing_mut().item_spacing.y = 0.0;
                         for (i, c) in shown.iter().enumerate() {
                             if item(ui, p, &c.name, &c.hint) {
                                 chosen = Some(i);
                             }
                         }
                     });
+                ui.add_space(4.0);
+                ui.separator();
 
                 // Enter takes the first match, which is what the typing was
                 // narrowing towards.
@@ -1157,21 +1157,75 @@ fn span_choices(from: f64, to: f64, duration: f64, screens: &[String]) -> Vec<Ch
     out
 }
 
-fn item(ui: &mut egui::Ui, p: &theme::Palette, title: &str, sub: &str) -> bool {
-    let clicked = ui
-        .vertical(|ui| {
+/// A labelled slider that shows where it is. egui's own puts a number box
+/// beside the rail, which reads as a form field; this keeps the label, the
+/// rail and the reading on one line and gives the rail the room it needs to
+/// be worth dragging.
+fn percent(v: f32) -> String {
+    format!("{:.0}%", v * 100.0)
+}
+
+fn dial(
+    ui: &mut egui::Ui,
+    p: &theme::Palette,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    read: impl Fn(f32) -> String,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).size(11.0).color(p.weak));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
-                egui::RichText::new(title)
+                egui::RichText::new(read(*value))
                     .family(theme::strong())
+                    .size(11.5)
                     .color(p.text),
             );
-            ui.label(egui::RichText::new(sub).size(11.0).color(p.weak));
-        })
-        .response
-        .interact(egui::Sense::click())
-        .clicked();
-    ui.add_space(6.0);
-    clicked
+            ui.spacing_mut().slider_width = (ui.available_width() - 10.0).max(60.0);
+            changed = ui
+                .add(egui::Slider::new(value, range).show_value(false))
+                .changed();
+        });
+    });
+    changed
+}
+
+/// One row of a chooser: a name, what it does, and the whole width of the
+/// list as its target. It lights up under the pointer, so the list reads as
+/// something to pick from rather than something to read.
+fn item(ui: &mut egui::Ui, p: &theme::Palette, title: &str, sub: &str) -> bool {
+    let width = ui.available_width();
+    let height = 50.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let on = response.hovered();
+    if on {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(10), p.surface);
+    }
+    let text = rect.shrink2(egui::vec2(12.0, 8.0));
+    ui.painter().text(
+        text.left_top(),
+        egui::Align2::LEFT_TOP,
+        title,
+        egui::FontId::new(14.0, theme::strong()),
+        p.text,
+    );
+    ui.painter().text(
+        text.left_bottom(),
+        egui::Align2::LEFT_BOTTOM,
+        sub,
+        egui::FontId::proportional(11.5),
+        p.weak,
+    );
+    if on {
+        response
+            .clone()
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+    }
+    ui.add_space(2.0);
+    response.clicked()
 }
 
 fn tool_colour(tool: &Tool, p: &theme::Palette) -> egui::Color32 {
