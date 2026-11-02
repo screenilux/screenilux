@@ -1,0 +1,15 @@
+[package]
+name = "screenilux-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Writing a recording out: a GIF of a demo, through its edit list."
+
+[dependencies]
+screenilux-core = { path = "../core" }
+screenilux-platform = { path = "../platform" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+gif = "0.13.3"

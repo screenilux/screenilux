@@ -35,6 +35,7 @@ pub mod icon {
     pub const LEAVE_FULL_SCREEN: &str = "\u{E73F}";
     pub const CHECK: &str = "\u{E73E}";
     pub const COPY: &str = "\u{E8C8}";
+    pub const EXPORT: &str = "\u{E896}";
     pub const LINK: &str = "\u{E71B}";
     pub const LOCK: &str = "\u{E72E}";
     pub const OPEN: &str = "\u{E8A7}";

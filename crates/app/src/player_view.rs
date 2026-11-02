@@ -147,6 +147,13 @@ impl PlayerView {
     }
 
     /// The screens' files in display order, for an edit that names one.
+    /// The file a screen was decoded from, which for a package is wherever
+    /// it was unpacked to. What an export actually reads.
+    pub fn track_file(&self, track: usize) -> Option<PathBuf> {
+        let l = self.loaded.as_ref()?;
+        l.opened.recording.tracks.get(track).map(|t| t.path.clone())
+    }
+
     pub fn screen_names(&self) -> Vec<String> {
         self.loaded.as_ref().map_or_else(Vec::new, |l| {
             l.opened

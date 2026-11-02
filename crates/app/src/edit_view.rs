@@ -25,12 +25,17 @@
 //! the click that placed it says which picture it landed on.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, channel};
+use std::time::Duration;
 
 use eframe::egui;
 use screenilux_core::edit::{
     Area, Backdrop, EditList, Effect, MIN_SPAN, Place, Problem, Tool, trim_zero,
 };
 use screenilux_core::session::{MANIFEST_NAME, Manifest};
+use screenilux_export::{Gif, Written};
 use screenilux_player::SharedClock;
 
 use crate::player_view::PlayerView;
@@ -76,6 +81,14 @@ enum Grab {
     },
 }
 
+/// A GIF on its way to disk, written off the interface's thread so the
+/// picture keeps playing while it is made.
+struct Writing {
+    done: Arc<AtomicU32>,
+    result: Receiver<Result<Written, String>>,
+    to: PathBuf,
+}
+
 /// A menu waiting to be answered.
 enum Asking {
     /// Placed on the picture: spatial tools, at a point on a named screen.
@@ -104,6 +117,9 @@ pub struct EditView {
     wants_close: bool,
     /// Where the timeline was drawn last frame, for the tour to point at.
     track_at: Option<egui::Rect>,
+    /// A GIF being written: how far along, and what came of it.
+    writing: Option<Writing>,
+    wrote: Option<Result<String, String>>,
     /// What is typed into the effect menu's search box.
     find: String,
     /// Whether that box has been given focus since the menu opened.
@@ -138,6 +154,8 @@ impl EditView {
             wants_save: false,
             wants_close: false,
             track_at: None,
+            writing: None,
+            wrote: None,
             find: String::new(),
             found_focus: false,
         }
@@ -246,16 +264,130 @@ impl EditView {
             theme::notice(ui, e);
             ui.add_space(6.0);
         }
-        let Some(clock) = player.clock() else {
+        if player.clock().is_none() {
             self.empty(ui, p);
             return;
-        };
+        }
 
         self.save_row(ui, p);
         ui.add_space(14.0);
-        let rest = ui.available_height().max(LIST_MIN);
+        // The way out sits at the foot of the panel, where what you do when
+        // you are finished belongs. Drawn before the list so the list can
+        // be told what is left, and before the clock is held so the player
+        // is still free to be handed over.
+        let foot = egui::Panel::bottom("effects-foot")
+            .frame(egui::Frame::new().inner_margin(egui::Margin {
+                left: 0,
+                right: 0,
+                top: 10,
+                bottom: 0,
+            }))
+            .show_separator_line(false)
+            .show(ui, |ui| self.export_row(ui, p, player))
+            .response
+            .rect
+            .height();
+
+        let Some(clock) = player.clock() else { return };
+        let rest = (ui.available_height() - foot).max(LIST_MIN);
         self.list(ui, p, clock, rest);
-        let _ = player;
+    }
+
+    /// Writing the demo out as a GIF, and how that is going.
+    fn export_row(&mut self, ui: &mut egui::Ui, p: &theme::Palette, player: &mut PlayerView) {
+        if let Some(w) = &self.writing {
+            match w.result.try_recv() {
+                Ok(Ok(done)) => {
+                    self.wrote = Ok(format!(
+                        "Wrote {} · {}×{} · {}",
+                        w.to.file_name().unwrap_or_default().to_string_lossy(),
+                        done.width,
+                        done.height,
+                        weight(done.bytes),
+                    ))
+                    .into();
+                    self.writing = None;
+                }
+                Ok(Err(e)) => {
+                    self.wrote = Some(Err(e));
+                    self.writing = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.writing = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        if let Some(w) = &self.writing {
+            let done = w.done.load(Ordering::Relaxed) as f32 / 1000.0;
+            ui.add(
+                egui::ProgressBar::new(done)
+                    .desired_height(28.0)
+                    .corner_radius(10)
+                    .text(
+                        egui::RichText::new(format!("Writing the GIF… {:.0}%", done * 100.0))
+                            .size(12.0),
+                    ),
+            );
+            ui.ctx().request_repaint_after(Duration::from_millis(120));
+            return;
+        }
+
+        let ready = player.track_file(0).is_some();
+        let button = egui::Button::new(
+            egui::RichText::new(format!("{}  Export as GIF", icon::EXPORT))
+                .family(theme::strong())
+                .color(theme::ON_DARK),
+        )
+        .fill(p.action)
+        .corner_radius(10)
+        .min_size(egui::vec2(ui.available_width(), 36.0));
+        if ui
+            .add_enabled(ready, button)
+            .on_hover_text("A looping picture with no sound: small enough for a README or a chat")
+            .clicked()
+        {
+            self.start_gif(player);
+        }
+
+        match &self.wrote {
+            Some(Ok(text)) => {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(text.clone()).size(11.0).color(p.weak));
+            }
+            Some(Err(e)) => {
+                ui.add_space(6.0);
+                theme::hint(ui, &format!("The GIF could not be written: {e}"));
+            }
+            None => {}
+        }
+    }
+
+    /// Start writing the GIF, off this thread.
+    fn start_gif(&mut self, player: &mut PlayerView) {
+        let (Some(video), Some(l)) = (player.track_file(0), self.loaded.as_ref()) else {
+            return;
+        };
+        // Beside the recording, not beside whatever the package unpacked
+        // to: the scratch folder is cleared when the recording is closed.
+        let to = screenilux_export::beside(&l.path);
+        let edits = l.edits.clone();
+        let done = Arc::new(AtomicU32::new(0));
+        let (tx, rx) = channel();
+        let ticker = Arc::clone(&done);
+        let out = to.clone();
+        std::thread::spawn(move || {
+            let result = screenilux_export::gif(&video, &out, &edits, Gif::default(), |at| {
+                ticker.store((at * 1000.0) as u32, Ordering::Relaxed);
+            })
+            .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.wrote = None;
+        self.writing = Some(Writing {
+            done,
+            result: rx,
+            to,
+        });
     }
 
     /// The timeline, under the picture and as wide as it is. Click to move
@@ -1178,6 +1310,17 @@ fn span_choices(from: f64, to: f64, duration: f64, screens: &[String]) -> Vec<Ch
 /// beside the rail, which reads as a form field; this keeps the label, the
 /// rail and the reading on one line and gives the rail the room it needs to
 /// be worth dragging.
+/// A file size someone can hold in their head.
+fn weight(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    let mb = bytes as f64 / MB;
+    if mb >= 1.0 {
+        format!("{mb:.1} MB")
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
+}
+
 fn percent(v: f32) -> String {
     format!("{:.0}%", v * 100.0)
 }
