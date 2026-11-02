@@ -705,6 +705,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "color_quant"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+
+[[package]]
 name = "combine"
 version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1567,6 +1573,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2eecf2d5dc9b66b732b97707a0210906b1d30523eb773193ab777c0c84b3e8d5"
 dependencies = [
  "polyval",
+]
+
+[[package]]
+name = "gif"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ae047235e33e2829703574b54fdec96bfbad892062d97fed2f76022287de61b"
+dependencies = [
+ "color_quant",
+ "weezl",
 ]
 
 [[package]]
@@ -3816,6 +3832,7 @@ dependencies = [
  "raw-window-handle",
  "rfd",
  "screenilux-core",
+ "screenilux-export",
  "screenilux-platform",
  "screenilux-player",
  "screenilux-recorder",
@@ -3838,6 +3855,17 @@ dependencies = [
  "thiserror 2.0.21",
  "tiny-skia 0.12.0",
  "zip",
+]
+
+[[package]]
+name = "screenilux-export"
+version = "0.1.0"
+dependencies = [
+ "gif",
+ "screenilux-core",
+ "screenilux-platform",
+ "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
