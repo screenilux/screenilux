@@ -1097,20 +1097,30 @@ impl App {
         // is showing, and nobody else's while it is not.
         player.set_editing(true);
 
-        // Full screen is the picture and nothing else, so the strip stands
+        // Full screen is the picture and nothing else, so the panel stands
         // down rather than floating over the thing being watched.
         if !player.is_full() {
-            let room = ui.available_height();
-            egui::Panel::bottom("edit-strip")
-                .exact_size(editor.wants(room))
+            egui::Panel::right("edit-side")
+                .exact_size(crate::player_view::SIDE_WIDTH)
+                .resizable(false)
                 .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
-                    left: MARGIN,
+                    left: 0,
                     right: MARGIN,
-                    top: 8,
-                    bottom: 14,
+                    top: 0,
+                    bottom: MARGIN,
                 }))
                 .show_separator_line(false)
-                .show(ui, |ui| editor.strip(ui, ctx, player));
+                .show(ui, |ui| {
+                    egui::Frame::new()
+                        .stroke(egui::Stroke::new(1.0, p.stroke))
+                        .corner_radius(20)
+                        .inner_margin(20)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.set_height(ui.available_height());
+                            editor.side_panel(ui, ctx, player);
+                        });
+                });
         }
 
         let open = player.shareable();

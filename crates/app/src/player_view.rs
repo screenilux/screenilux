@@ -26,6 +26,9 @@ const GAP: f32 = 16.0;
 const MARGIN: i8 = 24;
 /// The text panel's width.
 const PANEL: f32 = 360.0;
+
+/// The side panel's width, including the margin beside it.
+pub const SIDE_WIDTH: f32 = PANEL + MARGIN as f32;
 /// In full screen, the controls hide after the pointer rests this long.
 const IDLE: f32 = 2.5;
 
@@ -320,27 +323,32 @@ impl PlayerView {
             return;
         }
 
-        egui::Panel::right("play-text")
-            .exact_size(PANEL + MARGIN as f32)
-            .resizable(false)
-            .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
-                left: 0,
-                right: MARGIN,
-                top: 0,
-                bottom: MARGIN,
-            }))
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                egui::Frame::new()
-                    .stroke(egui::Stroke::new(1.0, p.stroke))
-                    .corner_radius(20)
-                    .inner_margin(20)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.set_height(ui.available_height());
-                        self.text_panel(ui);
-                    });
-            });
+        // The editor hosts the side panel while it is showing, so that the
+        // text and the moments share one set of tabs instead of fighting
+        // for the same edge.
+        if !self.editing {
+            egui::Panel::right("play-text")
+                .exact_size(PANEL + MARGIN as f32)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
+                    left: 0,
+                    right: MARGIN,
+                    top: 0,
+                    bottom: MARGIN,
+                }))
+                .show_separator_line(false)
+                .show(ui, |ui| {
+                    egui::Frame::new()
+                        .stroke(egui::Stroke::new(1.0, p.stroke))
+                        .corner_radius(20)
+                        .inner_margin(20)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.set_height(ui.available_height());
+                            self.text_panel(ui);
+                        });
+                });
+        }
 
         egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
@@ -474,7 +482,10 @@ impl PlayerView {
 
     /// The text panel: make the recording searchable, then search it and
     /// jump to what was found.
-    fn text_panel(&mut self, ui: &mut egui::Ui) {
+    /// The text read off the screen: search it, select it, copy it. Public
+    /// because the Edit tab hosts it as one tab of its side panel rather
+    /// than letting the player put up a panel of its own.
+    pub fn text_panel(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui);
         let Some(loaded) = &self.loaded else { return };
         let indexed = loaded.opened.text.is_some();

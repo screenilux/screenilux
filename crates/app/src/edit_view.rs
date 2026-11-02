@@ -1,10 +1,11 @@
 //! The Edit tab: shape a demo without a track for every kind of thing.
 //!
 //! Playing and editing are one thing here, not two. The tab is the player —
-//! its picture, its controls, its searchable text — with an editing strip
-//! along the bottom, so there is one recording open, one decoder, one clock
-//! and one picture, and no second window to arrange. The editor never opens
-//! a recording of its own; it follows whatever the player has.
+//! its picture and its controls — with a side panel that carries the text
+//! read off the screen and the moments on one set of tabs. So there is one
+//! recording open, one decoder, one clock and one picture, and no second
+//! window to arrange. The editor never opens a recording of its own; it
+//! follows whatever the player has.
 //!
 //! Two surfaces, split by what a tool needs to know. Tools that need a *where*
 //! — zoom, hide, point at — are placed by clicking the picture, which is the
@@ -36,13 +37,8 @@ use crate::theme;
 /// How tall the timeline track is.
 const TRACK_H: f32 = 58.0;
 
-/// The row above the track: Save, and anything wrong with the edits.
-const SAVE_H: f32 = 34.0;
-
-/// Enough list to read two moments without scrolling, and the most of the
-/// window the strip may take: past that the picture is being squeezed.
-const LIST_MIN: f32 = 150.0;
-const STRIP_SHARE: f32 = 0.42;
+/// The least list worth scrolling, when the panel is short.
+const LIST_MIN: f32 = 120.0;
 /// A drag shorter than this is a click: move the playhead, do not select.
 const TAP: f64 = 0.35;
 /// How close to a block's edge counts as grabbing that edge.
@@ -65,6 +61,15 @@ enum Grab {
         id: u32,
         start_side: bool,
     },
+}
+
+/// Which of the side panel's tabs is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// The text read off the screen, which is the player's.
+    Text,
+    /// The moments, which are the editor's.
+    Moments,
 }
 
 /// A menu waiting to be answered.
@@ -93,6 +98,7 @@ pub struct EditView {
     /// released.
     wants_save: bool,
     wants_close: bool,
+    side: Side,
 }
 
 struct Loaded {
@@ -122,6 +128,7 @@ impl EditView {
             saved: true,
             wants_save: false,
             wants_close: false,
+            side: Side::Moments,
         }
     }
 
@@ -190,38 +197,19 @@ impl EditView {
         }
     }
 
-    // -- the strip ---------------------------------------------------------
+    // -- the side panel ----------------------------------------------------
 
-    /// How tall the editing strip wants to be in a window of `room` points:
-    /// enough for the track and a few moments, and never most of the window.
-    pub fn wants(&self, room: f32) -> f32 {
-        if self.loaded.is_none() {
-            return SAVE_H + 16.0;
-        }
-        // The gaps between the three rows, plus the panel's own margins.
-        let want = SAVE_H + TRACK_H + LIST_MIN + 40.0;
-        want.min((room * STRIP_SHARE).max(SAVE_H + TRACK_H + 20.0))
-    }
-
-    /// The editing strip: what to save, the timeline, and the moments on it.
-    /// The picture above it belongs to the player, which is also where a
-    /// click lands that places a spatial edit.
-    pub fn strip(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, player: &mut PlayerView) {
+    /// The panel beside the picture: the text read off the screen, and the
+    /// moments, on one set of tabs. Both are about the recording that is
+    /// open, so they share an edge rather than each taking one.
+    pub fn side_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, player: &mut PlayerView) {
         let p = theme::palette(ui);
-        if let Some(e) = self.error.clone() {
-            theme::notice(ui, e);
-            ui.add_space(6.0);
-        }
-        // A click on the paused picture is an edit placed where it landed.
-        // Taken before the clock is borrowed, so the player is free.
-        let placed = player.take_placed();
-        let Some(clock) = player.clock() else {
-            self.empty(ui, &p);
-            return;
-        };
 
-        if let Some(spot) = placed {
-            let at = clock.position();
+        // A click on the paused picture is an edit placed where it landed,
+        // and it is the editor being asked for, so bring it forward. Taken
+        // before the clock is borrowed, so the player is free.
+        if let Some(spot) = player.take_placed() {
+            let at = player.clock().map_or(0.0, |c| c.position());
             // A click means "around here", not a pixel: give it a region.
             let area = Area::new(spot.x - 0.13, spot.y - 0.11, 0.26, 0.22);
             // The screen it was clicked on, so the edit belongs to that
@@ -231,15 +219,50 @@ impl EditView {
                 .as_ref()
                 .and_then(|l| l.screens.get(spot.track).cloned());
             self.asking = Some(Asking::Spot { at, area, screen });
+            self.side = Side::Moments;
         }
 
-        self.save_row(ui, &p);
-        ui.add_space(8.0);
-        self.track(ui, &p, clock);
+        let chosen = match self.side {
+            Side::Text => 0,
+            Side::Moments => 1,
+        };
+        match theme::segmented(ui, &["Text on screen", "Moments"], chosen) {
+            Some(0) => self.side = Side::Text,
+            Some(1) => self.side = Side::Moments,
+            _ => {}
+        }
+        ui.add_space(12.0);
+
+        match self.side {
+            Side::Text => player.text_panel(ui),
+            Side::Moments => self.moments(ui, ctx, &p, player),
+        }
+    }
+
+    /// The moments tab: what to save, the timeline, and what is on it.
+    fn moments(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        p: &theme::Palette,
+        player: &mut PlayerView,
+    ) {
+        if let Some(e) = self.error.clone() {
+            theme::notice(ui, e);
+            ui.add_space(6.0);
+        }
+        let Some(clock) = player.clock() else {
+            self.empty(ui, p);
+            return;
+        };
+
+        self.save_row(ui, p);
         ui.add_space(10.0);
+        self.track(ui, p, clock);
+        ui.add_space(12.0);
         let rest = ui.available_height().max(LIST_MIN);
-        self.list(ui, &p, clock, rest);
-        self.menu(ctx, &p);
+        self.list(ui, p, clock, rest);
+        self.menu(ctx, p);
         if std::mem::take(&mut self.wants_save) {
             self.save();
         }
