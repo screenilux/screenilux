@@ -4,8 +4,11 @@
 //! enough for that column and just as tall as what it shows: the window
 //! grows when a section opens and shrinks when it closes, and only once the
 //! column is taller than the screen does it stop growing and scroll. Watching wants
-//! every pixel, so the Play tab maximises. While recording, the window can
-//! shrink to a small borderless bar at the bottom of the screen.
+//! every pixel, so the Play tab maximises. Editing is the other way around
+//! from the column: the picture, the track and the list all want to be on
+//! screen together, so Edit opens a wide window and fits its contents to
+//! that, rather than the window to its contents. While recording, the
+//! window can shrink to a small borderless bar at the bottom of the screen.
 //!
 //! Each shape remembers what the window looked like when it was left, so
 //! resizing the window on a tab, or moving the bar, sticks.
@@ -20,6 +23,16 @@ pub const RECORD_WIDTH: f32 = 420.0;
 /// the column's rows start to wrap; it can be short, for a short page such as
 /// Settings, since it fits itself to what it shows.
 pub const MIN_SIZE: egui::Vec2 = egui::vec2(400.0, 320.0);
+
+/// The Edit tab's window when it is first opened: room for the picture at a
+/// size worth clicking into, with the track and a few moments below it.
+/// Clamped to the work area, so a small screen simply gets what it has.
+const EDIT_SIZE: egui::Vec2 = egui::vec2(880.0, 720.0);
+
+/// The smallest the Edit tab can be made. Below this the picture and the
+/// list start fighting over the same pixels, so the window stops rather
+/// than letting the editor fold up.
+const MIN_EDIT: egui::Vec2 = egui::vec2(560.0, 460.0);
 
 /// The recording bar: stop, the clock, pause and expand in a row.
 pub const BAR_SIZE: egui::Vec2 = egui::vec2(268.0, 56.0);
@@ -46,13 +59,24 @@ enum Shape {
 pub enum Fit {
     /// The column: Record, Recordings and Settings.
     Settings,
+    /// The Edit tab: wide, and as tall as the screen allows.
+    Edit,
     /// The recording bar.
     Bar,
+}
+
+/// The smallest window `fit` may be made into.
+fn floor(fit: Fit) -> egui::Vec2 {
+    match fit {
+        Fit::Edit => MIN_EDIT,
+        _ => MIN_SIZE,
+    }
 }
 
 pub struct Sizer {
     current: Option<Fit>,
     settings: Option<Shape>,
+    edit: Option<Shape>,
     bar: Option<Shape>,
     /// What the window adds around its content, measured once it exists.
     frame: egui::Vec2,
@@ -66,6 +90,7 @@ impl Sizer {
         Self {
             current: None,
             settings: None,
+            edit: None,
             bar: None,
             frame: FRAME_GUESS,
             asked: None,
@@ -118,14 +143,21 @@ impl Sizer {
                 ),
             ),
             (_, Some(Shape::Maximised)) => Shape::Maximised,
-            (_, Some(Shape::Normal { pos, size })) => self.within(reach, pos, size),
+            (_, Some(Shape::Normal { pos, size })) => self.within(reach, fit, pos, size),
             (Fit::Settings, None) => self.column(reach, outer),
+            (Fit::Edit, None) => self.stage(reach, outer),
         };
 
         if fit == Fit::Bar {
             dress(ctx, false);
-        } else if left == Some(Fit::Bar) {
-            dress(ctx, true);
+        } else {
+            if left == Some(Fit::Bar) {
+                dress(ctx, true);
+            }
+            // The floor differs per tab, so it travels with the shape: a
+            // window squeezed down to the column's width on Record must not
+            // hold the editor at that width once Edit is showing.
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(floor(fit)));
         }
         apply(ctx, shape, maximised);
     }
@@ -170,6 +202,7 @@ impl Sizer {
     fn slot(&mut self, fit: Fit) -> &mut Option<Shape> {
         match fit {
             Fit::Settings => &mut self.settings,
+            Fit::Edit => &mut self.edit,
             Fit::Bar => &mut self.bar,
         }
     }
@@ -193,14 +226,26 @@ impl Sizer {
         let width = size.x + self.frame.x;
         let x = (outer.center().x - width / 2.0)
             .clamp(reach.left(), (reach.right() - width).max(reach.left()));
-        self.within(reach, egui::pos2(x, reach.top()), size)
+        self.within(reach, Fit::Settings, egui::pos2(x, reach.top()), size)
+    }
+
+    /// The Edit tab's default: a wide window grown out from where the
+    /// window already is, so the jump from the column reads as the window
+    /// opening up rather than leaping across the screen.
+    fn stage(&self, reach: egui::Rect, outer: egui::Rect) -> Shape {
+        let room = (reach.size() - self.frame).max(MIN_EDIT);
+        let size = EDIT_SIZE.min(room);
+        let outer_size = size + self.frame;
+        let pos = outer.center() - outer_size / 2.0;
+        self.within(reach, Fit::Edit, pos, size)
     }
 
     /// `pos` and `size`, pulled onto the screen: a remembered shape can be
     /// off-screen after a display is unplugged or the taskbar moves.
-    fn within(&self, reach: egui::Rect, pos: egui::Pos2, size: egui::Vec2) -> Shape {
-        let room = (reach.size() - self.frame).max(MIN_SIZE);
-        let size = size.min(room).max(MIN_SIZE);
+    fn within(&self, reach: egui::Rect, fit: Fit, pos: egui::Pos2, size: egui::Vec2) -> Shape {
+        let min = floor(fit);
+        let room = (reach.size() - self.frame).max(min);
+        let size = size.min(room).max(min);
         Shape::Normal {
             pos: clamp_onto(reach, pos, size + self.frame),
             size,
@@ -246,7 +291,6 @@ fn dress(ctx: &egui::Context, normal: bool) {
         ctx.send_viewport_cmd(C::Decorations(true));
         ctx.send_viewport_cmd(C::Resizable(true));
         ctx.send_viewport_cmd(C::WindowLevel(egui::WindowLevel::Normal));
-        ctx.send_viewport_cmd(C::MinInnerSize(MIN_SIZE));
     } else {
         ctx.send_viewport_cmd(C::MinInnerSize(egui::Vec2::ZERO));
         ctx.send_viewport_cmd(C::Decorations(false));
@@ -269,5 +313,48 @@ fn apply(ctx: &egui::Context, shape: Shape, maximised: bool) {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editing_may_be_made_smaller_than_it_opens_but_not_crushed() {
+        const { assert!(MIN_EDIT.x < EDIT_SIZE.x && MIN_EDIT.y < EDIT_SIZE.y) };
+        // Wider than the column, or the editor gains nothing by having its
+        // own shape at all.
+        const { assert!(MIN_EDIT.x > RECORD_WIDTH) };
+        assert_eq!(floor(Fit::Edit), MIN_EDIT);
+        assert_eq!(floor(Fit::Settings), MIN_SIZE);
+    }
+
+    #[test]
+    fn a_shape_left_on_one_tab_is_not_handed_to_another() {
+        let mut sizer = Sizer::new();
+        let shape = Shape::Normal {
+            pos: egui::pos2(10.0, 10.0),
+            size: egui::vec2(900.0, 700.0),
+        };
+        *sizer.slot(Fit::Edit) = Some(shape);
+        assert_eq!(*sizer.slot(Fit::Settings), None);
+        assert_eq!(*sizer.slot(Fit::Bar), None);
+        assert_eq!(*sizer.slot(Fit::Edit), Some(shape));
+    }
+
+    #[test]
+    fn a_window_too_big_for_the_screen_is_brought_back_onto_it() {
+        let sizer = Sizer::new();
+        let work = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1366.0, 768.0));
+        let reach = sizer.reach(work, 1.0);
+        let Shape::Normal { pos, size } = sizer.stage(reach, work) else {
+            panic!("the editor does not open maximised");
+        };
+        assert!(size.x <= EDIT_SIZE.x && size.y <= EDIT_SIZE.y);
+        assert!(size.x >= MIN_EDIT.x && size.y >= MIN_EDIT.y);
+        assert!(pos.x >= reach.left() && pos.y >= reach.top());
+        assert!(pos.x + size.x + FRAME_GUESS.x <= reach.right() + 1.0);
+        assert!(pos.y + size.y + FRAME_GUESS.y <= reach.bottom() + 1.0);
     }
 }

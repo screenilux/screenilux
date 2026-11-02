@@ -4,6 +4,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod edit_view;
 mod icon;
 mod overlay;
 mod player_view;

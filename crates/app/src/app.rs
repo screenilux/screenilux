@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use screenilux_recorder::{Session, SessionConfig};
 
+use crate::edit_view::EditView;
 use crate::overlay::Overlay;
 use crate::player_view::{PlayerView, dropped_path, friendly_name, playable};
 use crate::previews::Previews;
@@ -22,6 +23,7 @@ const MARGIN: i8 = 24;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Record,
+    Edit,
     Recordings,
     Settings,
 }
@@ -30,6 +32,7 @@ pub struct App {
     tab: Tab,
     sizer: Sizer,
     player: PlayerView,
+    editor: EditView,
     previews: Previews,
     settings: Settings,
     probes: Probes,
@@ -95,6 +98,7 @@ impl App {
             tab: Tab::Record,
             sizer: Sizer::new(),
             player: PlayerView::new(),
+            editor: EditView::new(),
             previews: Previews::start(ctx),
             settings: Settings::new(),
             probes,
@@ -1116,16 +1120,40 @@ impl App {
                 ui.add_space(4.0);
                 let chosen = match self.tab {
                     Tab::Record => 0,
-                    Tab::Recordings => 1,
-                    Tab::Settings => 2,
+                    Tab::Edit => 1,
+                    Tab::Recordings => 2,
+                    Tab::Settings => 3,
                 };
-                match theme::segmented(ui, &["Record", "Recordings"], chosen) {
+                match theme::segmented(ui, &["Record", "Edit", "Recordings"], chosen) {
                     Some(0) => self.tab = Tab::Record,
-                    Some(1) => self.tab = Tab::Recordings,
+                    Some(1) => self.tab = Tab::Edit,
+                    Some(2) => self.tab = Tab::Recordings,
                     _ => {}
                 }
             });
         });
+    }
+
+    /// The Edit tab: shape a demo without a track for every kind of thing.
+    /// It keeps the Record tab's height, so moving between tabs does not
+    /// resize the window.
+    fn edit_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Edit works on whatever is open to play, so choosing a recording
+        // stays one job done in one place.
+        if !self.editor.has_recording()
+            && let Some(path) = self.player.shareable()
+        {
+            self.editor.open(&path, ctx);
+        }
+        let p = theme::palette(ui);
+        egui::CentralPanel::default_margins()
+            .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
+                left: MARGIN,
+                right: MARGIN,
+                top: 4,
+                bottom: 14,
+            }))
+            .show(ui, |ui| self.editor.ui(ui, ctx));
     }
 
     /// The Recordings tab: open a file, or one saved here. Either plays in
@@ -1501,9 +1529,25 @@ impl eframe::App for App {
                 .height()
         };
 
-        self.sizer.update(&ctx, Fit::Settings);
+        // The editor only earns the wide window once it has something in
+        // it: an empty one would just be a large blank asking to be closed.
+        self.sizer.update(
+            &ctx,
+            if self.tab == Tab::Edit && self.editor.has_recording() {
+                Fit::Edit
+            } else {
+                Fit::Settings
+            },
+        );
         let column = match self.tab {
             Tab::Record => self.record_tab(ui, &ctx),
+            Tab::Edit => {
+                self.edit_tab(ui, &ctx);
+                // Edit fills the window it was given rather than sizing it,
+                // so this height is never asked for; passing the column's
+                // keeps it waiting for whichever column tab comes back.
+                self.record_height
+            }
             Tab::Recordings => {
                 self.recordings_tab(ui, &ctx);
                 self.record_height
