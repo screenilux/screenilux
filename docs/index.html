@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Screenilux — record every screen, cut it into a demo</title>
+<meta name="description" content="A screen recorder for people who work across more than one screen. Records every monitor at once, cuts the recording into a demo, and sends it as a GIF or an encrypted link. Free and open source for Windows and Linux.">
+<link rel="icon" href="logo.svg" type="image/svg+xml">
+
+<meta property="og:title" content="Screenilux">
+<meta property="og:description" content="Record every screen at once. Cut it into a demo. Send it as a GIF or a link only your recipients can open.">
+<meta property="og:image" content="https://screenilux.github.io/screenilux/play.png">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100..125,400..800&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+:root {
+  /* Screenilux's own dark palette, from crates/app/src/theme.rs. */
+  --ink:   #012625;
+  --panel: #0D3332;
+  --line:  #165452;
+  --paper: #E1F7F7;
+  --mute:  #99B4B4;
+  --deep:  #04736F;
+  --live:  #36CBC9;
+  --signal:#2DA8A4;
+
+  --measure: 62ch;
+  --rail: 148px;
+  --gutter: clamp(20px, 5vw, 56px);
+
+  /* A fourth, from 17px. */
+  --t-0:  1.0625rem;
+  --t-1:  1.35rem;
+  --t-2:  1.8rem;
+  --t-3:  2.4rem;
+  --t-4:  clamp(2.6rem, 7.2vw, 5.4rem);
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+body {
+  margin: 0;
+  background: var(--ink);
+  color: var(--paper);
+  font: 400 var(--t-0)/1.65 "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1, h2, h3, .wide {
+  font-family: "Archivo", ui-sans-serif, system-ui, sans-serif;
+  font-variation-settings: "wdth" 118;
+  font-weight: 700;
+  letter-spacing: -0.012em;
+  line-height: 1.04;
+  margin: 0;
+}
+
+a { color: var(--live); text-underline-offset: 3px; text-decoration-thickness: 1px; }
+a:hover { color: var(--paper); }
+
+:focus-visible {
+  outline: 2px solid var(--live);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+img { max-width: 100%; display: block; }
+
+/* ---- the rail: the page laid out as one timeline ------------------- */
+
+.rail {
+  position: fixed;
+  inset: 0 auto 0 0;
+  width: var(--rail);
+  padding: 104px 0 64px;
+  border-right: 1px solid var(--line);
+  background: var(--ink);
+  z-index: 4;
+}
+.rail ol { list-style: none; margin: 0; padding: 0; height: 100%; position: relative; }
+.rail li { position: absolute; left: 0; right: 0; }
+.rail a {
+  display: grid;
+  grid-template-columns: 46px 1fr;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 16px 4px 18px;
+  color: var(--mute);
+  text-decoration: none;
+  font-size: 0.8rem;
+}
+.rail a:hover, .rail a:focus-visible { color: var(--paper); }
+.rail .at {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+  color: var(--line);
+  font-size: 0.74rem;
+}
+.rail li[aria-current="true"] a { color: var(--paper); }
+.rail li[aria-current="true"] .at { color: var(--live); }
+
+/* The playhead travels the rail as the page scrolls. */
+.playhead {
+  position: absolute;
+  left: -1px;
+  width: 3px;
+  height: 46px;
+  background: var(--live);
+  border-radius: 2px;
+  transform: translateY(var(--y, 0px));
+  box-shadow: 0 0 18px 0 rgba(54, 203, 201, .45);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .playhead { transition: transform .22s cubic-bezier(.2,.7,.3,1); }
+}
+
+/* ---- page frame ----------------------------------------------------- */
+
+.page { margin-left: var(--rail); }
+.band { padding: 0 var(--gutter); }
+.hold { max-width: 1180px; margin: 0 auto; }
+.say  { max-width: var(--measure); }
+
+.top {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px var(--gutter);
+  background: color-mix(in srgb, var(--ink) 86%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid transparent;
+}
+.top.lifted { border-bottom-color: var(--line); }
+.mark { display: flex; align-items: center; gap: 11px; text-decoration: none; color: var(--paper); }
+.mark svg { width: 28px; height: 28px; }
+.mark b {
+  font-family: "Archivo", sans-serif;
+  font-variation-settings: "wdth" 112;
+  font-weight: 700;
+  font-size: 1.12rem;
+  letter-spacing: -0.015em;
+}
+.top nav { display: flex; align-items: center; gap: 22px; font-size: 0.95rem; }
+.top nav a { color: var(--mute); text-decoration: none; }
+.top nav a:hover { color: var(--paper); }
+
+/* ---- hero ----------------------------------------------------------- */
+
+.hero { padding-top: clamp(56px, 9vw, 112px); padding-bottom: 8px; }
+.hero h1 {
+  font-size: var(--t-4);
+  font-variation-settings: "wdth" 124;
+  font-weight: 800;
+  max-width: 17ch;
+}
+.hero h1 .second {
+  display: block;
+  font-variation-settings: "wdth" 98;
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  color: var(--paper);
+}
+.hero p.lede {
+  margin: 26px 0 0;
+  font-size: var(--t-1);
+  line-height: 1.5;
+  color: var(--mute);
+  max-width: 54ch;
+}
+.hero p.lede strong { color: var(--paper); font-weight: 500; }
+
+.get { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 34px; }
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 22px;
+  border-radius: 12px;
+  font: 500 var(--t-0)/1 "IBM Plex Sans", sans-serif;
+  text-decoration: none;
+  border: 1px solid var(--line);
+  color: var(--paper);
+  background: var(--panel);
+}
+.btn.main { background: var(--deep); border-color: var(--deep); color: #F3FFFE; font-weight: 600; }
+.btn.main:hover { background: var(--signal); border-color: var(--signal); color: var(--ink); }
+.btn:hover { border-color: var(--signal); color: var(--paper); }
+.get .note { color: var(--mute); font-size: 0.92rem; }
+
+/* ---- the stage card: the app's own surface -------------------------- */
+
+.stage {
+  margin-top: clamp(40px, 6vw, 72px);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 16px 16px 0;
+  overflow: hidden;
+}
+.stage img { border-radius: 10px 10px 0 0; width: 100%; }
+.stage .groove {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 56px;
+  margin: 14px -16px 0;
+  padding: 0 20px;
+  border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent);
+  color: var(--mute);
+  font-size: 0.86rem;
+}
+.dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--live);
+  flex: none;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .dot { animation: beat 2.4s ease-in-out infinite; }
+}
+@keyframes beat { 0%, 100% { opacity: 1 } 50% { opacity: .35 } }
+.groove .blocks { display: flex; gap: 5px; flex: 1; }
+.groove .blocks i {
+  display: block; height: 20px; border-radius: 5px;
+  background: color-mix(in srgb, var(--signal) 26%, transparent);
+  border-left: 2px solid var(--signal);
+}
+
+/* ---- sections ------------------------------------------------------- */
+
+section.moment { padding-top: clamp(84px, 11vw, 148px); }
+section.moment > .hold > h2 {
+  font-size: var(--t-3);
+  max-width: 26ch;
+}
+section.moment p { margin: 18px 0 0; }
+section.moment p + p { margin-top: 14px; }
+.sub { color: var(--mute); }
+
+.pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: clamp(28px, 5vw, 64px);
+  align-items: start;
+  margin-top: 40px;
+}
+.pair.narrow { grid-template-columns: minmax(0, 360px) minmax(0, 1fr); }
+.shot {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--panel);
+}
+.pair.narrow .shot img { max-height: 620px; width: auto; }
+
+/* Effects, drawn as the blocks they are in the app. */
+.effects { list-style: none; margin: 30px 0 0; padding: 0; display: grid; gap: 10px; }
+.effects li {
+  display: grid;
+  grid-template-columns: 158px 1fr;
+  gap: 16px;
+  align-items: baseline;
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: var(--panel);
+  border-left: 3px solid var(--signal);
+}
+.effects b { font-weight: 600; font-size: 0.98rem; }
+.effects span { color: var(--mute); font-size: 0.95rem; }
+.effects li.time { border-left-color: var(--live); }
+
+/* The weight of a GIF, said with the two numbers. */
+.weigh {
+  margin-top: 34px;
+  display: flex;
+  align-items: flex-end;
+  gap: clamp(20px, 4vw, 44px);
+  flex-wrap: wrap;
+}
+.weigh div { line-height: 1; }
+.weigh .n {
+  font-family: "Archivo", sans-serif;
+  font-variation-settings: "wdth" 125;
+  font-weight: 800;
+  font-size: clamp(2.2rem, 5.4vw, 3.4rem);
+  letter-spacing: -0.02em;
+  display: block;
+}
+.weigh .was .n { color: var(--line); text-decoration: line-through; text-decoration-thickness: 3px; }
+.weigh .now .n { color: var(--live); }
+.weigh small { display: block; margin-top: 10px; color: var(--mute); font-size: 0.9rem; }
+
+/* ---- install -------------------------------------------------------- */
+
+.grabs { display: grid; gap: 12px; margin-top: 34px; max-width: 560px; }
+.grab {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+  text-decoration: none;
+  color: var(--paper);
+}
+.grab:hover { border-color: var(--signal); }
+.grab b { font-weight: 600; }
+.grab span { color: var(--mute); font-size: 0.9rem; }
+
+pre {
+  margin: 22px 0 0;
+  padding: 18px 20px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow-x: auto;
+  font: 400 0.92rem/1.75 ui-monospace, "IBM Plex Mono", SFMono-Regular, Menlo, monospace;
+  color: var(--paper);
+}
+pre .c { color: var(--mute); }
+
+/* ---- foot ----------------------------------------------------------- */
+
+.foot {
+  margin-top: clamp(96px, 12vw, 160px);
+  border-top: 1px solid var(--line);
+  padding-top: 34px;
+  padding-bottom: 72px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px 36px;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--mute);
+  font-size: 0.92rem;
+}
+.foot nav { display: flex; gap: 22px; flex-wrap: wrap; }
+.foot a { color: var(--mute); text-decoration: none; }
+.foot a:hover { color: var(--paper); }
+
+/* ---- narrower ------------------------------------------------------- */
+
+@media (max-width: 980px) {
+  .rail { display: none; }
+  .page { margin-left: 0; }
+  .pair, .pair.narrow { grid-template-columns: 1fr; }
+  .top nav a.hide-sm { display: none; }
+}
+@media (max-width: 560px) {
+  .effects li { grid-template-columns: 1fr; gap: 3px; }
+  .top nav { gap: 14px; }
+}
+</style>
+</head>
+<body>
+
+<aside class="rail" aria-hidden="true">
+  <div class="playhead" id="playhead"></div>
+  <ol id="ticks">
+    <li data-for="record"><a href="#record"><span class="at">0:00</span><span>Record</span></a></li>
+    <li data-for="edit"><a href="#edit"><span class="at">0:21</span><span>Edit</span></a></li>
+    <li data-for="send"><a href="#send"><span class="at">0:48</span><span>Send</span></a></li>
+    <li data-for="install"><a href="#install"><span class="at">1:06</span><span>Install</span></a></li>
+  </ol>
+</aside>
+
+<div class="page">
+
+  <header class="top" id="top">
+    <a class="mark" href="#top">
+      <svg viewBox="0 0 64 64" role="img" aria-label="Screenilux">
+        <defs><mask id="gap"><rect width="64" height="64" fill="#fff"/><circle cx="32" cy="32" r="10.5" fill="#000"/></mask></defs>
+        <g mask="url(#gap)">
+          <rect x="3" y="7" width="40" height="29" rx="8" fill="#07beb8"/>
+          <rect x="21" y="28" width="40" height="29" rx="8" fill="#e1f7f7"/>
+        </g>
+        <circle cx="32" cy="32" r="6.5" fill="#2da8a4"/>
+      </svg>
+      <b>Screenilux</b>
+    </a>
+    <nav>
+      <a href="#edit" class="hide-sm">Edit</a>
+      <a href="#send" class="hide-sm">Send</a>
+      <a href="https://github.com/screenilux/screenilux">Source</a>
+      <a href="#install">Download</a>
+    </nav>
+  </header>
+
+  <main class="band">
+
+    <!-- hero -->
+    <div class="hold hero">
+      <h1>Record every screen.<span class="second">Cut it into a demo.</span></h1>
+      <p class="lede">
+        Screenilux records all your monitors at once, each as its own sharp video, and
+        plays them back in step. Then you shape what you caught into something worth
+        sending — <strong>without a track for every kind of thing</strong>.
+      </p>
+      <div class="get">
+        <a class="btn main" href="https://github.com/screenilux/screenilux/releases/latest">Download for Windows</a>
+        <a class="btn" href="https://github.com/screenilux/screenilux/releases/latest">Linux</a>
+        <span class="note">Free and open source. No account, no limits.</span>
+      </div>
+
+      <figure class="stage">
+        <img src="play.png" width="1800" height="1013"
+             alt="Two screens of a recording playing side by side in Screenilux.">
+        <figcaption class="groove">
+          <span class="dot" aria-hidden="true"></span>
+          <span>Two screens, one clock</span>
+          <span class="blocks" aria-hidden="true">
+            <i style="flex:2"></i><i style="flex:1"></i><i style="flex:3"></i><i style="flex:1"></i>
+          </span>
+        </figcaption>
+      </figure>
+    </div>
+
+    <!-- record -->
+    <section class="moment" id="record">
+      <div class="hold">
+        <h2>Every screen, in step</h2>
+        <div class="pair narrow">
+          <div class="shot">
+            <img src="record.png" width="720" height="1180"
+                 alt="Screenilux ready to record two screens, with the camera and microphone switches.">
+          </div>
+          <div class="say">
+            <p>
+              Most recorders capture one screen, or squeeze several into one wide, blurry
+              video. Screenilux records each screen at its full size and keeps them on one
+              clock, so playback can follow your pointer from one to the next.
+            </p>
+            <p class="sub">
+              Your voice and what the computer plays, mixed or separate. A camera bubble you
+              can drag anywhere, even mid-recording. Pause and the paused time never reaches
+              the file. Plug a screen in and the list finds it.
+            </p>
+            <p class="sub">
+              While you record, the window shrinks to a small bar that stays out of the
+              video.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- edit -->
+    <section class="moment" id="edit">
+      <div class="hold">
+        <h2>Two ways to change it, and no more</h2>
+        <div class="say">
+          <p>
+            Editing a demo is two questions: <em>where</em> and <em>when</em>. So there are two
+            places to answer them. Click the picture to put an effect where you are pointing.
+            Drag the timeline to pick a stretch and say what happens to it.
+          </p>
+          <p class="sub">
+            Nothing is written into the recording. Effects are kept beside it and drawn on the
+            way out, so any of them comes off again by deleting it.
+          </p>
+        </div>
+
+        <ul class="effects">
+          <li><b>Click the picture</b><span>Zoom, spotlight, blur, hide, or point at something</span></li>
+          <li class="time"><b>Drag the track</b><span>Cut, speed up, hold a frame, caption, or mute the stretch</span></li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- send -->
+    <section class="moment" id="send">
+      <div class="hold">
+        <h2>Send it as a picture or a link</h2>
+        <div class="say">
+          <p>
+            A GIF plays by itself, needs no player, and survives being pasted into a README, a
+            pull request or a chat. Screenilux writes one that only carries what moved between
+            frames, which is most of why it stays small.
+          </p>
+        </div>
+
+        <div class="weigh">
+          <div class="was"><span class="n">5.97 MB</span><small>Writing every frame in full</small></div>
+          <div class="now"><span class="n">486 KB</span><small>The same seven seconds, only what moved</small></div>
+        </div>
+
+        <div class="say">
+          <p style="margin-top:38px">
+            Or share a link. The recording is encrypted on your computer first and the key is
+            part of the link, so neither Screenilux nor whoever stores the file can open it.
+            The people you send it to watch every screen in a browser, with nothing to install.
+          </p>
+        </div>
+
+        <figure class="stage">
+          <img src="full-screen.png" width="1800" height="1013"
+               alt="A two-screen recording filling the display, with the controls floating over it.">
+          <figcaption class="groove">
+            <span class="dot" aria-hidden="true"></span>
+            <span>Full screen, controls out of the way</span>
+          </figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <!-- install -->
+    <section class="moment" id="install">
+      <div class="hold">
+        <h2>Get it</h2>
+        <div class="say">
+          <p class="sub">
+            One file to unzip and run. Recordings are ordinary MP4s you can keep, move and open
+            anywhere.
+          </p>
+        </div>
+
+        <div class="grabs">
+          <a class="grab" href="https://github.com/screenilux/screenilux/releases/latest">
+            <b>Windows</b><span>64-bit · .zip</span>
+          </a>
+          <a class="grab" href="https://github.com/screenilux/screenilux/releases/latest">
+            <b>Linux</b><span>64-bit · .tar.gz</span>
+          </a>
+        </div>
+
+        <div class="say">
+          <p style="margin-top:40px">Or build it yourself:</p>
+        </div>
+<pre><span class="c"># Rust 1.95 or newer</span>
+git clone https://github.com/screenilux/screenilux
+cd screenilux
+cargo run --release -p screenilux</pre>
+      </div>
+    </section>
+
+    <footer class="foot hold">
+      <span>Free software under the GPL-3.0. Windows and Linux.</span>
+      <nav>
+        <a href="https://github.com/screenilux/screenilux">Source</a>
+        <a href="https://github.com/screenilux/screenilux/releases">Releases</a>
+        <a href="https://github.com/screenilux/screenilux/issues">Report a problem</a>
+        <a href="https://github.com/screenilux/screenilux/blob/main/LICENSE">Licence</a>
+      </nav>
+    </footer>
+
+  </main>
+</div>
+
+<script>
+(function () {
+  var ticks = Array.prototype.slice.call(document.querySelectorAll('#ticks li'));
+  var head = document.getElementById('playhead');
+  var top = document.getElementById('top');
+  if (!ticks.length || !head) return;
+
+  // Lay the ticks out down the rail, evenly, once fonts have settled.
+  function place() {
+    var list = document.getElementById('ticks');
+    var room = list.clientHeight - 46;
+    ticks.forEach(function (li, i) {
+      li.style.top = Math.round((room / (ticks.length - 1)) * i) + 'px';
+    });
+  }
+
+  var marks = ticks.map(function (li) {
+    return document.getElementById(li.dataset.for);
+  });
+
+  function run() {
+    top.classList.toggle('lifted', window.scrollY > 8);
+
+    // Which moment the page is on: the last one whose top has passed the
+    // middle of the window, so the playhead reads like a position.
+    var line = window.scrollY + window.innerHeight * 0.42;
+    var at = -1;
+    marks.forEach(function (el, i) {
+      if (el && el.offsetTop <= line) at = i;
+    });
+
+    ticks.forEach(function (li, i) {
+      li.setAttribute('aria-current', i === at ? 'true' : 'false');
+    });
+
+    var list = document.getElementById('ticks');
+    var room = list.clientHeight - 46;
+    var doc = document.documentElement.scrollHeight - window.innerHeight;
+    var through = doc > 0 ? Math.min(1, Math.max(0, window.scrollY / doc)) : 0;
+    head.style.setProperty('--y', Math.round(list.offsetTop + through * room) + 'px');
+  }
+
+  place();
+  run();
+  var waiting = false;
+  window.addEventListener('scroll', function () {
+    if (waiting) return;
+    waiting = true;
+    requestAnimationFrame(function () { run(); waiting = false; });
+  }, { passive: true });
+  window.addEventListener('resize', function () { place(); run(); });
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(function () { place(); run(); });
+})();
+</script>
+</body>
+</html>
