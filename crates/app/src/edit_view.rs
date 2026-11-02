@@ -20,7 +20,8 @@
 //!
 //! One limit worth knowing: a zoom cannot follow the pointer until the
 //! recorder keeps a pointer track, so "follow" currently holds on the area
-//! it was placed on.
+//! it was placed on. A spatial edit does know which screen it belongs to:
+//! the click that placed it says which picture it landed on.
 
 use std::path::{Path, PathBuf};
 
@@ -68,8 +69,12 @@ enum Grab {
 
 /// A menu waiting to be answered.
 enum Asking {
-    /// Placed on the picture: spatial tools, at a point on a screen.
-    Spot { at: f64, area: Area },
+    /// Placed on the picture: spatial tools, at a point on a named screen.
+    Spot {
+        at: f64,
+        area: Area,
+        screen: Option<String>,
+    },
     /// Dragged on the timeline: tools that change time.
     Span { from: f64, to: f64 },
 }
@@ -219,7 +224,13 @@ impl EditView {
             let at = clock.position();
             // A click means "around here", not a pixel: give it a region.
             let area = Area::new(spot.x - 0.13, spot.y - 0.11, 0.26, 0.22);
-            self.asking = Some(Asking::Spot { at, area });
+            // The screen it was clicked on, so the edit belongs to that
+            // picture rather than to whichever one it lands over later.
+            let screen = self
+                .loaded
+                .as_ref()
+                .and_then(|l| l.screens.get(spot.track).cloned());
+            self.asking = Some(Asking::Spot { at, area, screen });
         }
 
         self.save_row(ui, &p);
@@ -756,6 +767,8 @@ impl EditView {
         };
         let mut close = false;
         let mut placed: Option<(f64, f64, Tool)> = None;
+        // Which screen the spot was clicked on, if it came from the picture.
+        let mut on_screen: Option<String> = None;
 
         let title = match asking {
             Asking::Spot { at, .. } => format!("Here, at {}", stamp(*at)),
@@ -769,8 +782,9 @@ impl EditView {
             .show(ctx, |ui| {
                 ui.set_max_width(290.0);
                 match asking {
-                    Asking::Spot { at, area } => {
+                    Asking::Spot { at, area, screen } => {
                         let (at, area) = (*at, *area);
+                        on_screen = screen.clone();
                         let end = (at + 6.0).min(l.duration);
                         if item(
                             ui,
@@ -849,7 +863,7 @@ impl EditView {
             });
 
         if let Some((a, b, tool)) = placed {
-            let id = l.edits.add(a, b, tool);
+            let id = l.edits.add_on(a, b, tool, on_screen);
             self.opened = Some(id);
             self.saved = false;
             self.selection = None;

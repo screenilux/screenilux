@@ -153,6 +153,12 @@ pub struct Moment {
     /// Seconds into the original recording.
     pub start: f64,
     pub end: f64,
+    /// Which screen this happens on, by the file it was recorded to. A
+    /// moment placed on the picture knows its screen; one dragged out of
+    /// the timeline changes time rather than pixels, so it has none and
+    /// applies to the recording as a whole.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub screen: Option<String>,
     #[serde(flatten)]
     pub tool: Tool,
 }
@@ -168,6 +174,7 @@ impl Moment {
             id,
             start: a.max(0.0),
             end: b.max(a + MIN_SPAN),
+            screen: None,
             tool,
         }
     }
@@ -232,9 +239,18 @@ impl EditList {
     /// Add a moment and return its id. Kept in start order, which everything
     /// else in this module relies on.
     pub fn add(&mut self, start: f64, end: f64, tool: Tool) -> u32 {
+        self.add_on(start, end, tool, None)
+    }
+
+    /// Add a moment that happens on one screen, named by its file. A
+    /// spatial edit placed on a multi-screen recording belongs to the
+    /// picture it was clicked on, not to whichever one it lands over.
+    pub fn add_on(&mut self, start: f64, end: f64, tool: Tool, screen: Option<String>) -> u32 {
         self.next_id += 1;
         let id = self.next_id;
-        self.moments.push(Moment::new(id, start, end, tool));
+        let mut m = Moment::new(id, start, end, tool);
+        m.screen = screen;
+        self.moments.push(m);
         self.sort();
         id
     }
@@ -417,6 +433,35 @@ impl EditList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_moment_placed_on_a_screen_remembers_which_one() {
+        let mut edits = EditList::default();
+        let zoom = Tool::Zoom {
+            area: Area::new(0.1, 0.1, 0.2, 0.2),
+            follow: false,
+            scale: 2.0,
+        };
+        let on = edits.add_on(1.0, 3.0, zoom, Some("screen-1.mp4".into()));
+        let anywhere = edits.add(4.0, 5.0, Tool::Mute);
+        assert_eq!(
+            edits.get(on).unwrap().screen.as_deref(),
+            Some("screen-1.mp4")
+        );
+        assert_eq!(
+            edits.get(anywhere).unwrap().screen,
+            None,
+            "a moment that changes time belongs to no one screen"
+        );
+
+        // The screen is only written when there is one, so an edit list
+        // from before this existed reads back unchanged.
+        let json = serde_json::to_string(edits.get(anywhere).unwrap()).unwrap();
+        assert!(!json.contains("screen"), "{json}");
+        let back: Moment =
+            serde_json::from_str(r#"{"id":9,"start":0.0,"end":2.0,"tool":"mute"}"#).unwrap();
+        assert_eq!(back.screen, None);
+    }
 
     fn list(moments: &[(f64, f64, Tool)]) -> EditList {
         let mut l = EditList::new();
