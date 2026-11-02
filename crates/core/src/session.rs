@@ -9,7 +9,9 @@
 use serde::{Deserialize, Serialize};
 
 pub const SESSION_FORMAT: &str = "screenrec-session";
-pub const SESSION_VERSION: u32 = 2;
+/// 3 added the edit list. A version 2 manifest still opens: it simply has no
+/// edits, which is what an unedited recording looks like anyway.
+pub const SESSION_VERSION: u32 = 3;
 pub const MANIFEST_NAME: &str = "recording.json";
 
 /// Whether a screen is the OS primary. Serialises as `"primary"`/`"secondary"`.
@@ -97,6 +99,10 @@ pub struct Manifest {
     pub screens: Vec<Screen>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub focus: Option<Focus>,
+    /// Edits placed in the Edit tab. Absent until the recording is edited, so
+    /// an untouched recording writes the same manifest it always did.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub edits: Option<crate::edit::EditList>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -123,6 +129,7 @@ impl Manifest {
             camera,
             screens: Vec::new(),
             focus: None,
+            edits: None,
         }
     }
 
@@ -276,6 +283,20 @@ mod tests {
     }
 
     #[test]
+    fn edits_round_trip_and_stay_out_of_an_unedited_manifest() {
+        let mut m = sample();
+        assert!(
+            !m.to_json().unwrap().contains("edits"),
+            "an unedited recording writes the manifest it always did"
+        );
+        let mut list = crate::edit::EditList::new();
+        list.add(4.0, 9.0, crate::edit::Tool::Cut);
+        m.edits = Some(list);
+        let back = Manifest::from_json(&m.to_json().unwrap()).unwrap();
+        assert_eq!(back.edits.map(|e| e.len()), Some(1));
+    }
+
+    #[test]
     fn foreign_and_future_manifests_are_rejected() {
         let mut m = sample();
         m.format = "something-else".into();
@@ -347,7 +368,11 @@ mod tests {
   }
 }"#;
         let m = Manifest::from_json(text).expect("python manifest must parse");
-        assert_eq!(m.version, SESSION_VERSION);
+        assert_eq!(m.version, 2, "an older manifest keeps its own version");
+        assert!(
+            m.edits.is_none(),
+            "nothing written before edits existed is edited"
+        );
         assert_eq!(m.screens.len(), 2);
         assert_eq!(m.by_order()[0].file, "screen2.mp4");
         assert_eq!(m.screens[1].role, Role::Primary);

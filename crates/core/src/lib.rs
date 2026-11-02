@@ -10,6 +10,7 @@
 pub mod camera;
 pub mod click;
 pub mod compositor;
+pub mod edit;
 pub mod focus;
 pub mod geometry;
 pub mod mix;

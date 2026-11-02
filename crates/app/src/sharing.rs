@@ -320,31 +320,11 @@ impl Shares {
     }
 }
 
-impl Shares {
-    /// A recording shared earlier has just been made searchable: add its text
-    /// to the link, in the background, so the people with the link can search
-    /// and copy it too.
-    pub fn add_text(&self, path: &Path, index: TextIndex, bucket: &Bucket) {
-        let Some(kept) = self.kept.get(&key(path)) else {
-            return;
-        };
-        let (Some(rights), Some(json)) = (kept.rights.clone(), shared_text(path, index)) else {
-            return;
-        };
-        let link = kept.link.clone();
-        let bucket = bucket.clone();
-        std::thread::spawn(move || {
-            let bucket = matches!(rights, Rights::Bucket { .. }).then_some(&bucket);
-            if let Err(e) = screenilux_share::add_text(&rights, bucket, &link, &json) {
-                tracing::warn!(error = %e, "could not add the text to the shared link");
-            }
-        });
-    }
-}
-
 /// What the person asked of a link.
 pub enum Asked {
     Share,
+    /// Write the recording out as a GIF.
+    Export,
 }
 
 /// How long "Copied" shows after copying.

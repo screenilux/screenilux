@@ -17,6 +17,7 @@ screenilux-player = { path = "../player" }
 screenilux-recorder = { path = "../recorder" }
 screenilux-platform = { path = "../platform" }
 screenilux-share = { path = "../share" }
+screenilux-export = { path = "../export" }
 eframe = "0.37"
 egui = "0.37"
 raw-window-handle = "0.6"

@@ -1,25 +1,30 @@
-//! The window's size and shape: per tab, and as the recording bar.
+//! The window's shape while recording, and getting it back afterwards.
 //!
-//! The Record tab is a column of settings, so it gets a window just wide
-//! enough for that column and just as tall as what it shows: the window
-//! grows when a section opens and shrinks when it closes, and only once the
-//! column is taller than the screen does it stop growing and scroll. Watching wants
-//! every pixel, so the Play tab maximises. While recording, the window can
-//! shrink to a small borderless bar at the bottom of the screen.
+//! The window belongs to whoever is using it. Where it sits, how big it is
+//! and whether it is maximised are theirs to set, and nothing in the app
+//! changes any of that while they work: switching tabs changes what is
+//! inside the window, never the window itself.
 //!
-//! Each shape remembers what the window looked like when it was left, so
-//! resizing the window on a tab, or moving the bar, sticks.
+//! Recording is the one exception, and it is one the user asks for. The
+//! window shrinks to a small borderless bar at the bottom of the screen so
+//! it is not sitting on top of whatever is being recorded, and stopping
+//! puts the window back exactly as it was found, down to the maximised
+//! state. Drag the bar somewhere better and it stays there.
 
 use eframe::egui;
 
-/// The Record tab's width: two screen tiles side by side plus margins, the
-/// width of a compact launcher.
-pub const RECORD_WIDTH: f32 = 420.0;
+/// The width content is laid out at on the column tabs. Wider than this and
+/// a settings row turns into a long reach between its label and its switch,
+/// so on a wide window the column is centred rather than stretched.
+pub const COLUMN: f32 = 460.0;
 
-/// The smallest the window can be made, other than as the bar. Narrower and
-/// the column's rows start to wrap; it can be short, for a short page such as
-/// Settings, since it fits itself to what it shows.
-pub const MIN_SIZE: egui::Vec2 = egui::vec2(400.0, 320.0);
+/// The smallest the window can be made, other than as the bar.
+pub const MIN_SIZE: egui::Vec2 = egui::vec2(560.0, 420.0);
+
+/// The window at its first ever launch, before there is anything of the
+/// user's own to restore. It opens maximised over this, so this is the size
+/// restoring down gives.
+pub const FIRST_RUN: egui::Vec2 = egui::vec2(1180.0, 760.0);
 
 /// The recording bar: stop, the clock, pause and expand in a row.
 pub const BAR_SIZE: egui::Vec2 = egui::vec2(268.0, 56.0);
@@ -27,53 +32,43 @@ pub const BAR_SIZE: egui::Vec2 = egui::vec2(268.0, 56.0);
 /// The bar's gap above the taskbar.
 const BAR_MARGIN: f32 = 12.0;
 
-/// Title bar and borders on Windows 11 at any scale, until the real ones can
-/// be measured from a window that is not maximised.
-const FRAME_GUESS: egui::Vec2 = egui::vec2(16.0, 39.0);
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Shape {
-    Maximised,
-    /// Outer position and inner size, in points.
-    Normal {
-        pos: egui::Pos2,
-        size: egui::Vec2,
-    },
-}
-
 /// What the window is shaped for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fit {
-    /// The column: Record, Recordings and Settings.
-    Settings,
+    /// An ordinary window, shaped by whoever is using it.
+    Window,
     /// The recording bar.
     Bar,
 }
 
+/// A whole geometry: enough to put a window back exactly as it was.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Shape {
+    /// Outer position, in points.
+    pos: egui::Pos2,
+    /// Inner size, in points.
+    size: egui::Vec2,
+    maximised: bool,
+}
+
 pub struct Sizer {
-    current: Option<Fit>,
-    settings: Option<Shape>,
-    bar: Option<Shape>,
-    /// What the window adds around its content, measured once it exists.
-    frame: egui::Vec2,
-    /// The Record tab's size last asked for, so a resize still on its way is
-    /// not asked for again every frame.
-    asked: Option<egui::Vec2>,
+    current: Fit,
+    /// The window as it was before it became the bar, to be put back.
+    before: Option<Shape>,
+    /// Where the bar was last left, so dragging it somewhere sticks.
+    bar_pos: Option<egui::Pos2>,
 }
 
 impl Sizer {
     pub fn new() -> Self {
         Self {
-            current: None,
-            settings: None,
-            bar: None,
-            frame: FRAME_GUESS,
-            asked: None,
+            current: Fit::Window,
+            before: None,
+            bar_pos: None,
         }
     }
 
-    /// Shape the window for `fit` when it changes, remembering the shape the
-    /// window had for the previous one.
+    /// Shape the window for `fit`, if it is not already.
     pub fn update(&mut self, ctx: &egui::Context, fit: Fit) {
         let vp = ctx.input(|i| i.viewport().clone());
         let (Some(outer), Some(inner)) = (vp.outer_rect, vp.inner_rect) else {
@@ -83,136 +78,53 @@ impl Sizer {
             return;
         }
         let maximised = vp.maximized == Some(true);
-        let frame = outer.size() - inner.size();
-        // The bar has no frame to measure, and for a frame or two after it
-        // the title bar is still on its way back.
-        if !maximised && self.current != Some(Fit::Bar) && frame.y > 0.0 {
-            self.frame = frame.max(egui::Vec2::ZERO);
-        }
-        if self.current == Some(fit) {
-            return;
-        }
 
-        let now = if maximised {
-            Shape::Maximised
-        } else {
-            Shape::Normal {
-                pos: outer.min,
-                size: inner.size(),
+        if self.current == fit {
+            // The bar can be dragged anywhere; remember where it was left.
+            if fit == Fit::Bar {
+                self.bar_pos = Some(outer.min);
             }
-        };
-        let left = self.current.replace(fit);
-        if let Some(left) = left {
-            *self.slot(left) = Some(now);
+            return;
         }
+        self.current = fit;
 
-        let work = work_area(ctx, outer);
-        let reach = self.reach(work, ctx.pixels_per_point());
-        let shape = match (fit, *self.slot(fit)) {
-            (Fit::Bar, Some(Shape::Normal { pos, .. })) => bar_within(work, pos),
-            (Fit::Bar, _) => bar_within(
-                work,
-                egui::pos2(
-                    work.center().x - BAR_SIZE.x / 2.0,
-                    work.bottom() - BAR_SIZE.y - BAR_MARGIN,
-                ),
-            ),
-            (_, Some(Shape::Maximised)) => Shape::Maximised,
-            (_, Some(Shape::Normal { pos, size })) => self.within(reach, pos, size),
-            (Fit::Settings, None) => self.column(reach, outer),
-        };
-
-        if fit == Fit::Bar {
-            dress(ctx, false);
-        } else if left == Some(Fit::Bar) {
-            dress(ctx, true);
-        }
-        apply(ctx, shape, maximised);
-    }
-
-    /// Make the Record tab's window `content` tall, as far as the screen
-    /// allows, keeping its bottom on the screen. It also stays at least as
-    /// wide as the column, which can be lost when the window moves to a
-    /// screen with another scale: narrower, the rows overlap.
-    pub fn fit_height(&mut self, ctx: &egui::Context, content: f32) {
-        if self.current != Some(Fit::Settings) {
-            return;
-        }
-        let vp = ctx.input(|i| i.viewport().clone());
-        let (Some(outer), Some(inner)) = (vp.outer_rect, vp.inner_rect) else {
-            return;
-        };
-        if vp.maximized == Some(true) || vp.minimized == Some(true) || vp.fullscreen == Some(true) {
-            return;
-        }
-        let reach = self.reach(work_area(ctx, outer), ctx.pixels_per_point());
-        let height = content
-            .ceil()
-            .clamp(MIN_SIZE.y, (reach.height() - self.frame.y).max(MIN_SIZE.y));
-        let width = inner.width().max(RECORD_WIDTH);
-        let wanted = egui::vec2(width, height);
-        if (inner.size() - wanted).abs().max_elem() < 1.0 {
-            self.asked = None;
-            return;
-        }
-        if self.asked == Some(wanted) {
-            return;
-        }
-        self.asked = Some(wanted);
-        let outer_size = wanted + self.frame;
-        let pos = clamp_onto(reach, outer.min, outer_size);
-        if pos != outer.min {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
-    }
-
-    fn slot(&mut self, fit: Fit) -> &mut Option<Shape> {
         match fit {
-            Fit::Settings => &mut self.settings,
-            Fit::Bar => &mut self.bar,
+            Fit::Bar => {
+                self.before = Some(Shape {
+                    pos: outer.min,
+                    size: inner.size(),
+                    maximised,
+                });
+                let work = work_area(ctx, outer);
+                let pos = self.bar_pos.unwrap_or_else(|| {
+                    egui::pos2(
+                        work.center().x - BAR_SIZE.x / 2.0,
+                        work.bottom() - BAR_SIZE.y - BAR_MARGIN,
+                    )
+                });
+                dress(ctx, false);
+                apply(
+                    ctx,
+                    Shape {
+                        pos: clamp_onto(work, pos, BAR_SIZE),
+                        size: BAR_SIZE,
+                        maximised: false,
+                    },
+                    maximised,
+                );
+            }
+            Fit::Window => {
+                dress(ctx, true);
+                // Nothing to put back on the first frame, when the window
+                // has never been the bar: it is already an ordinary window.
+                if let Some(mut shape) = self.before.take() {
+                    // A screen may have been unplugged while recording.
+                    let work = work_area(ctx, outer);
+                    shape.pos = clamp_onto(work, shape.pos, shape.size);
+                    apply(ctx, shape, maximised);
+                }
+            }
         }
-    }
-
-    /// Where the window's outer rectangle may go on `work`.
-    ///
-    /// Windows draws a one-pixel border and leaves the rest of the resize
-    /// border invisible, on the left, right and bottom. Snapped windows let
-    /// that invisible part hang past the work area; without it, a window
-    /// sized to the work area stops seven pixels short of the taskbar.
-    fn reach(&self, work: egui::Rect, ppp: f32) -> egui::Rect {
-        let invisible = (self.frame.x / 2.0 - 1.0 / ppp).max(0.0);
-        work.expand2(egui::vec2(invisible, 0.0))
-            .with_max_y(work.bottom() + invisible)
-    }
-
-    /// The Record tab's default: the full height of the work area, centred
-    /// where the window already is.
-    fn column(&self, reach: egui::Rect, outer: egui::Rect) -> Shape {
-        let size = egui::vec2(RECORD_WIDTH, reach.height() - self.frame.y);
-        let width = size.x + self.frame.x;
-        let x = (outer.center().x - width / 2.0)
-            .clamp(reach.left(), (reach.right() - width).max(reach.left()));
-        self.within(reach, egui::pos2(x, reach.top()), size)
-    }
-
-    /// `pos` and `size`, pulled onto the screen: a remembered shape can be
-    /// off-screen after a display is unplugged or the taskbar moves.
-    fn within(&self, reach: egui::Rect, pos: egui::Pos2, size: egui::Vec2) -> Shape {
-        let room = (reach.size() - self.frame).max(MIN_SIZE);
-        let size = size.min(room).max(MIN_SIZE);
-        Shape::Normal {
-            pos: clamp_onto(reach, pos, size + self.frame),
-            size,
-        }
-    }
-}
-
-/// The bar at `pos`, kept on the work area.
-fn bar_within(work: egui::Rect, pos: egui::Pos2) -> Shape {
-    Shape::Normal {
-        pos: clamp_onto(work, pos, BAR_SIZE),
-        size: BAR_SIZE,
     }
 }
 
@@ -256,18 +168,54 @@ fn dress(ctx: &egui::Context, normal: bool) {
 }
 
 fn apply(ctx: &egui::Context, shape: Shape, maximised: bool) {
-    match shape {
-        Shape::Maximised => {
-            if !maximised {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
-            }
+    use egui::ViewportCommand as C;
+    if shape.maximised {
+        if !maximised {
+            ctx.send_viewport_cmd(C::Maximized(true));
         }
-        Shape::Normal { pos, size } => {
-            if maximised {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
-            }
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-        }
+        return;
+    }
+    if maximised {
+        ctx.send_viewport_cmd(C::Maximized(false));
+    }
+    ctx.send_viewport_cmd(C::InnerSize(shape.size));
+    ctx.send_viewport_cmd(C::OuterPosition(shape.pos));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_column_fits_the_smallest_window() {
+        const { assert!(COLUMN <= MIN_SIZE.x) };
+        const { assert!(FIRST_RUN.x >= MIN_SIZE.x && FIRST_RUN.y >= MIN_SIZE.y) };
+    }
+
+    #[test]
+    fn a_window_is_pulled_back_onto_a_screen_it_no_longer_fits() {
+        let work = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1366.0, 768.0));
+        // Left on a second screen that has since been unplugged.
+        let pos = clamp_onto(work, egui::pos2(2400.0, 900.0), egui::vec2(800.0, 600.0));
+        assert_eq!(pos, egui::pos2(566.0, 168.0));
+        // One that already fits is not nudged.
+        let same = clamp_onto(work, egui::pos2(40.0, 30.0), egui::vec2(800.0, 600.0));
+        assert_eq!(same, egui::pos2(40.0, 30.0));
+    }
+
+    #[test]
+    fn stopping_a_recording_puts_the_window_back_as_it_was() {
+        let mut sizer = Sizer::new();
+        assert_eq!(sizer.current, Fit::Window);
+        // Standing in for the frames the real `update` would run: becoming
+        // the bar banks the shape, and becoming a window again spends it.
+        let was = Shape {
+            pos: egui::pos2(120.0, 80.0),
+            size: egui::vec2(900.0, 700.0),
+            maximised: true,
+        };
+        sizer.before = Some(was);
+        assert_eq!(sizer.before.take(), Some(was));
+        assert_eq!(sizer.before, None, "the shape is put back once, not twice");
     }
 }

@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use screenilux_recorder::{Session, SessionConfig};
 
+use crate::edit_view::EditView;
 use crate::overlay::Overlay;
 use crate::player_view::{PlayerView, dropped_path, friendly_name, playable};
 use crate::previews::Previews;
 use crate::sharing::{self, Asked, Link, Mode, Shares, Sharing};
-use crate::sizing::{Fit, Sizer};
+use crate::sizing::{self, Fit, Sizer};
 use crate::state::{FPS_CHOICES, Phase, Prefs, Probes, Runtime, Settings};
 use crate::theme::{self, ON_DARK, icon};
 
@@ -22,6 +23,7 @@ const MARGIN: i8 = 24;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Record,
+    Edit,
     Recordings,
     Settings,
 }
@@ -29,7 +31,11 @@ enum Tab {
 pub struct App {
     tab: Tab,
     sizer: Sizer,
+    /// The window title as last set, so it is only sent when it changes.
+    titled: String,
+    tour: crate::tour::Tour,
     player: PlayerView,
+    editor: EditView,
     previews: Previews,
     settings: Settings,
     probes: Probes,
@@ -48,9 +54,7 @@ pub struct App {
     prefs: Prefs,
     /// How tall the Record tab last wanted to be; the Recordings tab keeps
     /// to it.
-    record_height: f32,
     /// The player window's icon, made once.
-    player_icon: Arc<egui::IconData>,
     started_at: Option<Instant>,
     /// "More options" is open.
     more: bool,
@@ -74,9 +78,6 @@ pub struct App {
 /// the final state once.
 const DISPLAY_SETTLE: Duration = Duration::from_millis(400);
 
-/// The smallest the player window can be made before its controls overlap.
-const PLAYER_MIN_SIZE: egui::Vec2 = egui::vec2(640.0, 420.0);
-
 /// The recording bar's opacity when the pointer is elsewhere: there, but out
 /// of the way of what is being recorded behind it.
 const BAR_ALPHA: u8 = 190;
@@ -94,7 +95,10 @@ impl App {
         let mut app = Self {
             tab: Tab::Record,
             sizer: Sizer::new(),
+            titled: String::new(),
+            tour: crate::tour::Tour::new(),
             player: PlayerView::new(),
+            editor: EditView::new(),
             previews: Previews::start(ctx),
             settings: Settings::new(),
             probes,
@@ -107,12 +111,6 @@ impl App {
             sharing: Sharing::load(),
             shares: Shares::load(),
             prefs: Prefs::default(),
-            record_height: 0.0,
-            player_icon: Arc::new(egui::IconData {
-                rgba: crate::icon::rgba(64),
-                width: 64,
-                height: 64,
-            }),
             started_at: None,
             more: false,
             hwnd,
@@ -130,6 +128,11 @@ impl App {
     /// Open `path` in the player window.
     pub fn play(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.player.open(path, ctx);
+        // Edit is where a recording is watched now, so opening one goes
+        // there. Without this, Play on the saved card and a recording
+        // double-clicked in Explorer both opened it somewhere nobody was
+        // looking.
+        self.tab = Tab::Edit;
     }
 
     /// Where recordings go and whether a copy stays here, as last chosen.
@@ -459,9 +462,9 @@ impl App {
 
     /// The Record tab. Returns how tall it would like to be, to show
     /// everything without scrolling.
-    fn record_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> f32 {
+    fn record_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = theme::palette(ui);
-        let transport = egui::Panel::bottom("transport")
+        egui::Panel::bottom("transport")
             .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
                 left: MARGIN,
                 right: MARGIN,
@@ -469,44 +472,38 @@ impl App {
                 bottom: 20,
             }))
             .show_separator_line(false)
-            .show(ui, |ui| self.transport(ui, ctx))
-            .response
-            .rect
-            .height();
+            .show(ui, |ui| column(ui, |ui| self.transport(ui, ctx)));
 
-        let top = 4.0;
-        let column = egui::CentralPanel::default_margins()
+        egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
                 left: MARGIN,
                 right: MARGIN,
-                top: top as i8,
+                top: 4,
                 bottom: 0,
             }))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 10.0;
-                        self.warnings(ui);
-                        if self.phase == Phase::Idle
-                            && let Some(saved) =
-                                self.last_save.clone().filter(|_| self.status.is_empty())
-                        {
-                            self.saved_card(ui, ctx, saved);
+                        column(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 10.0;
+                            self.warnings(ui);
+                            if self.phase == Phase::Idle
+                                && let Some(saved) =
+                                    self.last_save.clone().filter(|_| self.status.is_empty())
+                            {
+                                self.saved_card(ui, ctx, saved);
+                                ui.add_space(4.0);
+                            }
+                            self.screens(ui);
+                            ui.add_space(6.0);
+                            self.sources(ui);
                             ui.add_space(4.0);
-                        }
-                        self.screens(ui);
-                        ui.add_space(6.0);
-                        self.sources(ui);
-                        ui.add_space(4.0);
-                        self.more_options(ui);
-                        ui.add_space(8.0);
-                    })
-                    .content_size
-                    .y
-            })
-            .inner;
-        transport + top + column
+                            self.more_options(ui);
+                            ui.add_space(8.0);
+                        });
+                    });
+            });
     }
 
     fn warnings(&self, ui: &mut egui::Ui) {
@@ -898,58 +895,6 @@ impl App {
         }
     }
 
-    /// The player, in a window of its own while a recording is open. Closing
-    /// the window closes the recording.
-    fn player_window(&mut self, ctx: &egui::Context) {
-        if !self.player.has_window() {
-            return;
-        }
-        let title = self
-            .player
-            .title()
-            .map_or_else(|| "Screenilux".to_string(), |t| format!("{t} - Screenilux"));
-        let builder = egui::ViewportBuilder::default()
-            .with_title(title)
-            .with_icon(Arc::clone(&self.player_icon))
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size(PLAYER_MIN_SIZE)
-            .with_maximized(true);
-        let out_dir = self.settings.out_dir.clone();
-        let mut closed = false;
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("player"),
-            builder,
-            |ui, _| {
-                let ctx = ui.ctx().clone();
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    closed = true;
-                }
-                // A recording dropped onto the player opens in it.
-                if let Some(path) = dropped_path(&ctx)
-                    && playable(&path)
-                {
-                    self.player.open(path, &ctx);
-                }
-                let open = self.player.shareable();
-                let link = open
-                    .as_deref()
-                    .map_or(Link::None, |path| self.shares.of(path));
-                self.player
-                    .set_link(link, open.is_some() && self.can_share());
-                self.player.ui(ui, &ctx, &out_dir);
-                if let (Some(Asked::Share), Some(path)) = (self.player.take_asked(), open) {
-                    self.share(&path);
-                }
-                if let Some((path, index)) = self.player.take_indexed() {
-                    self.shares.add_text(&path, index, &self.sharing.bucket);
-                }
-            },
-        );
-        if closed {
-            self.player.close();
-        }
-    }
-
     /// Where finished recordings are shared, in Settings.
     fn sharing_options(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui);
@@ -1116,16 +1061,141 @@ impl App {
                 ui.add_space(4.0);
                 let chosen = match self.tab {
                     Tab::Record => 0,
-                    Tab::Recordings => 1,
-                    Tab::Settings => 2,
+                    Tab::Edit => 1,
+                    Tab::Recordings => 2,
+                    Tab::Settings => 3,
                 };
-                match theme::segmented(ui, &["Record", "Recordings"], chosen) {
+                match theme::segmented(ui, &["Record", "Edit", "Recordings"], chosen) {
                     Some(0) => self.tab = Tab::Record,
-                    Some(1) => self.tab = Tab::Recordings,
+                    Some(1) => self.tab = Tab::Edit,
+                    Some(2) => self.tab = Tab::Recordings,
                     _ => {}
                 }
             });
         });
+    }
+
+    /// The Edit tab: play a recording and shape it, in one place. The player
+    /// draws the picture and its controls; the editor adds a strip of
+    /// timeline and an effects panel beside it.
+    fn edit_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = theme::palette(ui);
+        let out_dir = self.settings.out_dir.clone();
+        let can_share = self.can_share();
+        // Disjoint fields, so both can be held at once.
+        let App {
+            player,
+            editor,
+            shares,
+            titled,
+            ..
+        } = self;
+
+        editor.follow(player);
+        editor.poll_export(player);
+        // The timeline belongs in the picture's card, as its bottom band,
+        // not in a panel of its own under it.
+        player.set_footer(if player.is_full() {
+            0.0
+        } else {
+            crate::edit_view::TIMELINE_H
+        });
+        // One window, so its title is whatever is open in it.
+        let want = player
+            .title()
+            .map_or_else(|| "Screenilux".to_string(), |t| format!("{t} - Screenilux"));
+        if *titled != want {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(want.clone()));
+            *titled = want;
+        }
+        // Plain clicks on the paused picture are the editor's while this tab
+        // is showing, and nobody else's while it is not.
+        player.set_editing(true);
+
+        // Full screen is the picture and nothing else, so the panel stands
+        // down rather than floating over the thing being watched.
+        let mut side = None;
+        if !player.is_full() {
+            side = Some(
+                egui::Panel::right("edit-side")
+                    .exact_size(crate::player_view::SIDE_WIDTH)
+                    .resizable(false)
+                    .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
+                        left: 0,
+                        right: MARGIN,
+                        top: 0,
+                        bottom: MARGIN,
+                    }))
+                    .show_separator_line(false)
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .stroke(egui::Stroke::new(1.0, p.stroke))
+                            .corner_radius(20)
+                            .inner_margin(20)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.set_height(ui.available_height());
+                                editor.side_panel(ui, player);
+                            });
+                    })
+                    .response
+                    .rect,
+            );
+        }
+
+        let open = player.shareable();
+        let link = open.as_deref().map_or(Link::None, |path| shares.of(path));
+        player.set_link(link, open.is_some() && can_share);
+        player.ui(ui, ctx, &out_dir);
+        if let Some(band) = player.footer_at() {
+            let mut band_ui = ui.new_child(egui::UiBuilder::new().max_rect(band));
+            editor.timeline(&mut band_ui, ctx, player);
+        }
+        match (player.take_asked(), open) {
+            (Some(Asked::Share), Some(path)) => self.share(&path),
+            (Some(Asked::Export), _) => self.editor.start_gif(&mut self.player),
+            _ => {}
+        }
+        self.guide(ctx, side);
+    }
+
+    /// The tour, on the first visit to the Edit tab with something open. It
+    /// points at the real panels, so it is drawn after them, once they have
+    /// said where they are.
+    fn guide(&mut self, ctx: &egui::Context, side: Option<egui::Rect>) {
+        let ready = self.player.clock().is_some() && !self.player.is_full();
+        if !self.prefs.toured && !self.tour.running() && ready {
+            self.tour.start();
+        }
+        if !ready {
+            return;
+        }
+        let stops = vec![
+            crate::tour::Stop {
+                spot: None,
+                title: "This is where a recording becomes a demo",
+                body: "Nothing you do here changes the recording. Effects are kept beside it and drawn on the way out, so you can undo any of it by deleting it.",
+            },
+            crate::tour::Stop {
+                spot: self.player.stage(),
+                title: "Click the picture to put an effect there",
+                body: "Zoom, spotlight, blur, hide, or point at something. Where you click is what the effect is about, and on a two-screen recording it remembers which screen.",
+            },
+            crate::tour::Stop {
+                spot: self.editor.track_at(),
+                title: "Drag the timeline to pick a stretch",
+                body: "Then cut it, speed it up, hold on a frame, caption it or mute it. Click it instead to move the playhead, and drag an effect's edge to re-time it.",
+            },
+            crate::tour::Stop {
+                spot: side,
+                title: "Everything you add lands here",
+                body: "Click one to open it and change it. Save when you are happy — the effects are written beside the recording, not into it.",
+            },
+        ];
+        if self.tour.show(ctx, &stops) {
+            self.prefs.toured = true;
+            self.prefs.save();
+        }
     }
 
     /// The Recordings tab: open a file, or one saved here. Either plays in
@@ -1134,6 +1204,7 @@ impl App {
     fn recordings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = theme::palette(ui);
         let out_dir = self.settings.out_dir.clone();
+        let open_before = self.player.has_window();
         egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
                 left: MARGIN,
@@ -1142,32 +1213,35 @@ impl App {
                 bottom: 20,
             }))
             .show(ui, |ui| self.player.library(ui, ctx, &out_dir));
+        // Picking a recording here is picking the thing to work on, so it
+        // opens where it can be watched and edited. Only when one was just
+        // picked: otherwise the tab could never be looked at with a
+        // recording already open.
+        if !open_before && self.player.has_window() {
+            self.tab = Tab::Edit;
+        }
     }
 
     /// Settings: only what is set once and left. Recording options stay on
     /// the Record tab, by the button they change.
-    fn settings_tab(&mut self, ui: &mut egui::Ui) -> f32 {
+    fn settings_tab(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui);
-        let top = 4.0;
-        let bottom = 20.0;
-        let column = egui::CentralPanel::default_margins()
+        egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
                 left: MARGIN,
                 right: MARGIN,
-                top: top as i8,
-                bottom: bottom as i8,
+                top: 4,
+                bottom: 20,
             }))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
-                        ui.add_enabled_ui(!self.busy(), |ui| self.settings_page(ui));
-                    })
-                    .content_size
-                    .y
-            })
-            .inner;
-        top + column + bottom
+                        column(ui, |ui| {
+                            ui.add_enabled_ui(!self.busy(), |ui| self.settings_page(ui));
+                        });
+                    });
+            });
     }
 
     fn settings_page(&mut self, ui: &mut egui::Ui) {
@@ -1501,20 +1575,14 @@ impl eframe::App for App {
                 .height()
         };
 
-        self.sizer.update(&ctx, Fit::Settings);
-        let column = match self.tab {
+        self.sizer.update(&ctx, Fit::Window);
+        let _ = header;
+        match self.tab {
             Tab::Record => self.record_tab(ui, &ctx),
-            Tab::Recordings => {
-                self.recordings_tab(ui, &ctx);
-                self.record_height
-            }
+            Tab::Edit => self.edit_tab(ui, &ctx),
+            Tab::Recordings => self.recordings_tab(ui, &ctx),
             Tab::Settings => self.settings_tab(ui),
-        };
-        if self.tab == Tab::Record {
-            self.record_height = column;
         }
-        self.sizer.fit_height(&ctx, header + column);
-        self.player_window(&ctx);
 
         self.show_overlay(&ctx);
 
@@ -1527,6 +1595,24 @@ impl eframe::App for App {
         };
         ctx.request_repaint_after(Duration::from_millis(tick));
     }
+}
+
+/// Lay `add` out as a column of at most `sizing::COLUMN` points, centred in
+/// whatever width there is. A full-screen window should not stretch a row of
+/// settings across a metre of desk: the reach from a label to the switch it
+/// belongs to is the thing being kept short.
+fn column<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let width = ui.available_width().min(sizing::COLUMN);
+    let side = ((ui.available_width() - width) / 2.0).max(0.0);
+    let rect = egui::Rect::from_min_size(
+        ui.max_rect().min + egui::vec2(side, 0.0),
+        egui::vec2(width, ui.available_height()),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+        ui.set_width(width);
+        add(ui)
+    })
+    .inner
 }
 
 #[cfg(test)]

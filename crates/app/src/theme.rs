@@ -28,15 +28,14 @@ pub mod icon {
     pub const MIC: &str = "\u{E720}";
     pub const SPEAKER: &str = "\u{E767}";
     pub const WARNING: &str = "\u{E7BA}";
-    pub const REFRESH: &str = "\u{E72C}";
     pub const MONITOR: &str = "\u{E7F4}";
-    pub const TEXT: &str = "\u{E8D2}";
     pub const CHEVRON_DOWN: &str = "\u{E70D}";
     pub const CHEVRON_UP: &str = "\u{E70E}";
     pub const FULL_SCREEN: &str = "\u{E740}";
     pub const LEAVE_FULL_SCREEN: &str = "\u{E73F}";
     pub const CHECK: &str = "\u{E73E}";
     pub const COPY: &str = "\u{E8C8}";
+    pub const EXPORT: &str = "\u{E896}";
     pub const LINK: &str = "\u{E71B}";
     pub const LOCK: &str = "\u{E72E}";
     pub const OPEN: &str = "\u{E8A7}";
@@ -55,9 +54,7 @@ pub mod icon {
     pub const MIC: &str = "\u{1F3A4}";
     pub const SPEAKER: &str = "\u{1F50A}";
     pub const WARNING: &str = "\u{26A0}";
-    pub const REFRESH: &str = "\u{1F504}";
     pub const MONITOR: &str = "\u{1F5B5}";
-    pub const TEXT: &str = "\u{1F5DB}";
     pub const CHEVRON_DOWN: &str = "\u{23F7}";
     pub const CHEVRON_UP: &str = "\u{23F6}";
     pub const FULL_SCREEN: &str = "\u{26F6}";
@@ -130,8 +127,10 @@ pub fn palette(ui: &egui::Ui) -> Palette {
     if ui.visuals().dark_mode { DARK } else { LIGHT }
 }
 
-pub fn palette_of(ctx: &egui::Context) -> Palette {
-    if ctx.theme() == Theme::Dark {
+/// The palette where there is no `Ui` to hand, as when painting over the
+/// whole window.
+pub fn palette_for(ctx: &egui::Context) -> Palette {
+    if ctx.theme() == egui::Theme::Dark {
         DARK
     } else {
         LIGHT
@@ -170,6 +169,23 @@ pub fn install(ctx: &egui::Context) {
             .into();
             let s = &mut style.spacing;
             s.item_spacing = egui::vec2(8.0, 8.0);
+            s.slider_rail_height = 5.0;
+            // A scrollbar that floats over the edge and fades when it is not
+            // wanted, rather than a channel cut out of the content and a bar
+            // sitting on top of the words.
+            s.scroll = egui::style::ScrollStyle {
+                bar_width: 7.0,
+                handle_min_length: 24.0,
+                floating_width: 7.0,
+                floating_allocated_width: 0.0,
+                dormant_background_opacity: 0.0,
+                active_background_opacity: 0.0,
+                interact_background_opacity: 0.0,
+                dormant_handle_opacity: 0.0,
+                active_handle_opacity: 0.55,
+                interact_handle_opacity: 0.85,
+                ..egui::style::ScrollStyle::floating()
+            };
             s.button_padding = egui::vec2(14.0, 6.0);
             s.interact_size.y = 32.0;
             s.combo_height = 240.0;
@@ -343,6 +359,15 @@ fn visuals(theme: Theme, p: Palette) -> Visuals {
     w.open.weak_bg_fill = p.surface;
     w.open.bg_stroke = Stroke::new(1.0, p.stroke);
     w.open.corner_radius = control;
+
+    // A slider's handle is a pill rather than egui's circle on a wire: the
+    // circle reads as a knob from an older kind of interface, and a pill
+    // sits in the track it travels along.
+    v.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.46 };
+    // What is chosen is tinted rather than outlined, so a row of choices
+    // shows its answer at a glance.
+    v.selection.bg_fill = blend(p.signal, p.base, 0.76);
+    v.selection.stroke = Stroke::new(1.0, p.signal);
     v
 }
 

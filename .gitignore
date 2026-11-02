@@ -1,1 +1,44 @@
+# Build output
 /target
+**/*.rs.bk
+*.pdb
+
+# The web page's build, if it ever grows one
+/web/node_modules
+/web/dist
+
+# Recordings, and anything a test or a run left behind. A .screenilux file
+# is a recording someone made; it belongs in their Videos folder, not here.
+*.screenilux
+*.mp4
+*.mkv
+/recordings
+
+# Editors and tools, each of which keeps its own scratch in the repo.
+# `.claude/launch.json` is checked in: it is how a contributor runs the app.
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+.idea/
+*.iml
+.claude/*
+!.claude/launch.json
+.zed/
+.helix/
+
+# Secrets. Nothing here should ever be committed, so it is named rather
+# than left to a .gitignore someone remembers to write.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Windows and macOS leave these in every folder they are opened in.
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+._*
