@@ -1121,6 +1121,22 @@ impl App {
                             editor.side_panel(ui, ctx, player);
                         });
                 });
+
+            // The timeline spans the picture, not the panel: it is dragged
+            // and grabbed by the edges, so it needs the width. Added after
+            // the side panel, so it takes what that leaves.
+            if player.clock().is_some() {
+                egui::Panel::bottom("edit-timeline")
+                    .exact_size(crate::edit_view::TIMELINE_H)
+                    .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
+                        left: MARGIN,
+                        right: MARGIN,
+                        top: 4,
+                        bottom: 18,
+                    }))
+                    .show_separator_line(false)
+                    .show(ui, |ui| editor.timeline(ui, ctx, player));
+            }
         }
 
         let open = player.shareable();

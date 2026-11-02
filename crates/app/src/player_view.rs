@@ -1175,23 +1175,30 @@ impl PlayerView {
 
         // Right to left from the edge: full screen, the layouts when they
         // float in full screen, the screens' key; the timeline takes the rest.
-        let right = ui.available_width();
-        let mut tail = 54.0;
-        if multi {
-            tail += labels.len() as f32 * 76.0;
-        }
-        if self.full && multi {
-            tail += 124.0;
-        }
-        let seek = scrubber(
-            ui,
-            (right - tail).max(80.0),
-            pos,
-            duration,
-            &spans,
-            &marks,
-            &p,
-        );
+        // While the editor is showing it puts a timeline under the picture,
+        // and that timeline is a scrubber with the moments drawn on it. One
+        // time axis, not two stacked bars saying the same thing.
+        let seek = if self.editing && !self.full {
+            None
+        } else {
+            let right = ui.available_width();
+            let mut tail = 54.0;
+            if multi {
+                tail += labels.len() as f32 * 76.0;
+            }
+            if self.full && multi {
+                tail += 124.0;
+            }
+            scrubber(
+                ui,
+                (right - tail).max(80.0),
+                pos,
+                duration,
+                &spans,
+                &marks,
+                &p,
+            )
+        };
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;

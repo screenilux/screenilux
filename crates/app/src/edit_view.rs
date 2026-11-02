@@ -34,8 +34,14 @@ use screenilux_player::SharedClock;
 use crate::player_view::PlayerView;
 use crate::theme;
 
-/// How tall the timeline track is.
-const TRACK_H: f32 = 58.0;
+/// How tall the timeline is. It carries a ruler, the moments as blocks and
+/// the playhead, and its edges are grabbed to re-time a moment, so it wants
+/// more than a scrubber's few pixels.
+const TRACK_H: f32 = 64.0;
+
+/// The timeline with the room around it: what the panel under the picture
+/// asks for.
+pub const TIMELINE_H: f32 = TRACK_H + 26.0;
 
 /// The least list worth scrolling, when the panel is short.
 const LIST_MIN: f32 = 120.0;
@@ -257,12 +263,25 @@ impl EditView {
         };
 
         self.save_row(ui, p);
-        ui.add_space(10.0);
-        self.track(ui, p, clock);
         ui.add_space(12.0);
         let rest = ui.available_height().max(LIST_MIN);
         self.list(ui, p, clock, rest);
-        self.menu(ctx, p);
+        let _ = (ctx, player);
+    }
+
+    /// The timeline, under the picture and as wide as it is. Click to move
+    /// the playhead, drag to mark a stretch to cut or speed up, and drag a
+    /// block or either of its edges to re-time it — none of which fits in
+    /// the width of a side panel.
+    pub fn timeline(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, player: &mut PlayerView) {
+        let p = theme::palette(ui);
+        let Some(clock) = player.clock() else {
+            return;
+        };
+        self.track(ui, &p, clock);
+        // Drawn after both panels, so a stretch marked here is answered on
+        // the same frame it was marked.
+        self.menu(ctx, &p);
         if std::mem::take(&mut self.wants_save) {
             self.save();
         }
