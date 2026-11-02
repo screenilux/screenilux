@@ -15,56 +15,51 @@ use eframe::egui::{
     Theme, Visuals,
 };
 
-/// Glyphs from Segoe Fluent Icons (Windows 11), which keeps the codepoints of
-/// Segoe MDL2 Assets (Windows 10), so either font serves.
-#[cfg(windows)]
-pub mod icon {
-    pub const PLAY: &str = "\u{E768}";
-    pub const PAUSE: &str = "\u{E769}";
-    pub const FOLDER: &str = "\u{ED25}";
-    pub const EXPAND: &str = "\u{E740}";
-    pub const SEARCH: &str = "\u{E721}";
-    pub const CAMERA: &str = "\u{E714}";
-    pub const MIC: &str = "\u{E720}";
-    pub const SPEAKER: &str = "\u{E767}";
-    pub const WARNING: &str = "\u{E7BA}";
-    pub const MONITOR: &str = "\u{E7F4}";
-    pub const CHEVRON_DOWN: &str = "\u{E70D}";
-    pub const CHEVRON_UP: &str = "\u{E70E}";
-    pub const FULL_SCREEN: &str = "\u{E740}";
-    pub const LEAVE_FULL_SCREEN: &str = "\u{E73F}";
-    pub const CHECK: &str = "\u{E73E}";
-    pub const COPY: &str = "\u{E8C8}";
-    pub const EXPORT: &str = "\u{E896}";
-    pub const LINK: &str = "\u{E71B}";
-    pub const LOCK: &str = "\u{E72E}";
-    pub const OPEN: &str = "\u{E8A7}";
-    pub const SETTINGS: &str = "\u{E713}";
+/// The icons, as a glyph for Windows and a symbol for everywhere else.
+///
+/// One list rather than two, because two drifted: an icon added to the
+/// Windows side alone built there and broke the Linux build. Naming each
+/// icon once makes that impossible rather than something to be caught.
+///
+/// The Windows glyphs are Segoe Fluent Icons (Windows 11), which keeps the
+/// codepoints of Segoe MDL2 Assets (Windows 10), so either font serves.
+/// Everywhere else they are symbols from egui's own fonts, which every
+/// system has.
+macro_rules! icons {
+    ($($name:ident => $windows:expr, $elsewhere:expr;)*) => {
+        pub mod icon {
+            $(
+                #[cfg(windows)]
+                pub const $name: &str = $windows;
+                #[cfg(not(windows))]
+                pub const $name: &str = $elsewhere;
+            )*
+        }
+    };
 }
 
-/// The same icons as symbols in egui's own fonts, which every system has.
-#[cfg(not(windows))]
-pub mod icon {
-    pub const PLAY: &str = "\u{25B6}";
-    pub const PAUSE: &str = "\u{23F8}";
-    pub const FOLDER: &str = "\u{1F4C2}";
-    pub const EXPAND: &str = "\u{26F6}";
-    pub const SEARCH: &str = "\u{1F50D}";
-    pub const CAMERA: &str = "\u{1F4F7}";
-    pub const MIC: &str = "\u{1F3A4}";
-    pub const SPEAKER: &str = "\u{1F50A}";
-    pub const WARNING: &str = "\u{26A0}";
-    pub const MONITOR: &str = "\u{1F5B5}";
-    pub const CHEVRON_DOWN: &str = "\u{23F7}";
-    pub const CHEVRON_UP: &str = "\u{23F6}";
-    pub const FULL_SCREEN: &str = "\u{26F6}";
-    pub const LEAVE_FULL_SCREEN: &str = "\u{1F5D7}";
-    pub const CHECK: &str = "\u{2714}";
-    pub const COPY: &str = "\u{29C9}";
-    pub const LINK: &str = "\u{1F517}";
-    pub const LOCK: &str = "\u{1F512}";
-    pub const OPEN: &str = "\u{2197}";
-    pub const SETTINGS: &str = "\u{2699}";
+icons! {
+    PLAY => "\u{E768}", "\u{25B6}";
+    PAUSE => "\u{E769}", "\u{23F8}";
+    FOLDER => "\u{ED25}", "\u{1F4C2}";
+    EXPAND => "\u{E740}", "\u{26F6}";
+    SEARCH => "\u{E721}", "\u{1F50D}";
+    CAMERA => "\u{E714}", "\u{1F4F7}";
+    MIC => "\u{E720}", "\u{1F3A4}";
+    SPEAKER => "\u{E767}", "\u{1F50A}";
+    WARNING => "\u{E7BA}", "\u{26A0}";
+    MONITOR => "\u{E7F4}", "\u{1F5B5}";
+    CHEVRON_DOWN => "\u{E70D}", "\u{23F7}";
+    CHEVRON_UP => "\u{E70E}", "\u{23F6}";
+    FULL_SCREEN => "\u{E740}", "\u{26F6}";
+    LEAVE_FULL_SCREEN => "\u{E73F}", "\u{1F5D7}";
+    CHECK => "\u{E73E}", "\u{2714}";
+    COPY => "\u{E8C8}", "\u{29C9}";
+    EXPORT => "\u{E896}", "\u{2B07}";
+    LINK => "\u{E71B}", "\u{1F517}";
+    LOCK => "\u{E72E}", "\u{1F512}";
+    OPEN => "\u{E8A7}", "\u{2197}";
+    SETTINGS => "\u{E713}", "\u{2699}";
 }
 
 /// The named colours. Two sets, picked by the system theme.
