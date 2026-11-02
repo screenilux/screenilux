@@ -1,5 +1,11 @@
 //! The Edit tab: shape a demo without a track for every kind of thing.
 //!
+//! Playing and editing are one thing here, not two. The tab is the player —
+//! its picture, its controls, its searchable text — with an editing strip
+//! along the bottom, so there is one recording open, one decoder, one clock
+//! and one picture, and no second window to arrange. The editor never opens
+//! a recording of its own; it follows whatever the player has.
+//!
 //! Two surfaces, split by what a tool needs to know. Tools that need a *where*
 //! — zoom, hide, point at — are placed by clicking the picture, which is the
 //! only place that question has an answer. Tools that need a *when* — cut,
@@ -12,32 +18,30 @@
 //! anything permanently; the edit list is saved beside the recording and the
 //! picture is drawn through it while playing.
 //!
-//! Two limits worth knowing. A spatial edit does not yet name which screen it
-//! belongs to, so on a multi-screen recording it applies wherever it lands;
-//! that needs a screen on [`Tool`](screenilux_core::edit::Tool). And a zoom
-//! cannot follow the pointer until the recorder keeps a pointer track, so
-//! "follow" currently holds on the area it was placed on.
+//! One limit worth knowing: a zoom cannot follow the pointer until the
+//! recorder keeps a pointer track, so "follow" currently holds on the area
+//! it was placed on.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use eframe::egui;
 use screenilux_core::edit::{Area, EditList, MIN_SPAN, Moment, Problem, Tool};
 use screenilux_core::session::{MANIFEST_NAME, Manifest};
-use screenilux_player::{Opened, Player, open};
+use screenilux_player::SharedClock;
 
+use crate::player_view::PlayerView;
 use crate::theme;
 
 /// How tall the timeline track is.
 const TRACK_H: f32 = 58.0;
 
-/// The transport row: the play button, the clocks and Save.
-const TRANSPORT_H: f32 = 38.0;
+/// The row above the track: Save, and anything wrong with the edits.
+const SAVE_H: f32 = 34.0;
 
-/// The least picture worth clicking into, and the least list worth
-/// scrolling. Below these the window has run out of room and stops.
-const PICTURE_MIN: f32 = 150.0;
+/// Enough list to read two moments without scrolling, and the most of the
+/// window the strip may take: past that the picture is being squeezed.
 const LIST_MIN: f32 = 150.0;
+const STRIP_SHARE: f32 = 0.42;
 /// A drag shorter than this is a click: move the playhead, do not select.
 const TAP: f64 = 0.35;
 /// How close to a block's edge counts as grabbing that edge.
@@ -79,16 +83,16 @@ pub struct EditView {
     /// Which moment is open in the list, which is also the one highlighted on
     /// the track: selecting in one place selects in the other.
     opened: Option<u32>,
-    textures: Vec<Option<(u64, egui::TextureHandle)>>,
     saved: bool,
-    /// Set by the Save button, acted on once the borrows are released.
+    /// Set by the Save and Close buttons, acted on once the borrows are
+    /// released.
     wants_save: bool,
+    wants_close: bool,
 }
 
 struct Loaded {
     path: PathBuf,
     manifest: Manifest,
-    player: Player,
     edits: EditList,
     duration: f64,
     /// Screen files in display order, for the screen-override menu.
@@ -110,62 +114,51 @@ impl EditView {
             selection: None,
             asking: None,
             opened: None,
-            textures: Vec::new(),
             saved: true,
             wants_save: false,
+            wants_close: false,
         }
     }
 
-    pub fn has_recording(&self) -> bool {
-        self.loaded.is_some()
+    /// Follow whatever the player has open. The editor never opens a
+    /// recording of its own: one decoder, one clock, one picture, and
+    /// nothing to keep in step.
+    pub fn follow(&mut self, player: &PlayerView) {
+        let path = player.shareable();
+        if self.loaded.as_ref().map(|l| &l.path) == path.as_ref() {
+            return;
+        }
+        match path {
+            None => {
+                self.loaded = None;
+                self.opened = None;
+                self.selection = None;
+                self.grab = Grab::None;
+                self.asking = None;
+            }
+            Some(path) => self.adopt(&path, player),
+        }
     }
 
-    /// Open a recording to edit. Any edits already saved beside it come back.
-    pub fn open(&mut self, path: &Path, ctx: &egui::Context) {
+    /// Read the edits saved beside `path`, if there are any. A recording
+    /// with none is simply one nobody has edited yet.
+    fn adopt(&mut self, path: &Path, player: &PlayerView) {
         self.error = None;
         self.opened = None;
         self.selection = None;
-        self.textures.clear();
-        match open(path) {
-            Ok(opened) => self.adopt(path, opened, ctx),
-            Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-
-    fn adopt(&mut self, path: &Path, opened: Opened, ctx: &egui::Context) {
-        let Opened { recording, fps, .. } = opened;
-        let duration = recording.duration.max(MIN_SPAN);
-        let screens: Vec<String> = recording
-            .tracks
-            .iter()
-            .map(|t| {
-                t.path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            })
-            .collect();
-        let manifest = read_manifest(path).unwrap_or_else(|| {
-            Manifest::new(
-                String::new(),
-                duration,
-                fps.round() as u32,
-                String::new(),
-                false,
-            )
-        });
+        self.grab = Grab::None;
+        self.asking = None;
+        let duration = player
+            .clock()
+            .map_or(MIN_SPAN, |c| c.duration())
+            .max(MIN_SPAN);
+        let screens = player.screen_names();
+        let manifest = read_manifest(path)
+            .unwrap_or_else(|| Manifest::new(String::new(), duration, 30, String::new(), false));
         let edits = manifest.edits.clone().unwrap_or_default();
-        let repaint = {
-            let ctx = ctx.clone();
-            Arc::new(move || ctx.request_repaint())
-        };
-        let player = Player::start(recording, fps, repaint);
-        player.clock().pause();
-        self.textures = vec![None; screens.len()];
         self.loaded = Some(Loaded {
             path: path.to_path_buf(),
             manifest,
-            player,
             edits,
             duration,
             screens,
@@ -192,210 +185,99 @@ impl EditView {
         }
     }
 
-    // -- the tab -----------------------------------------------------------
+    // -- the strip ---------------------------------------------------------
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// How tall the editing strip wants to be in a window of `room` points:
+    /// enough for the track and a few moments, and never most of the window.
+    pub fn wants(&self, room: f32) -> f32 {
+        if self.loaded.is_none() {
+            return SAVE_H + 16.0;
+        }
+        // The gaps between the three rows, plus the panel's own margins.
+        let want = SAVE_H + TRACK_H + LIST_MIN + 40.0;
+        want.min((room * STRIP_SHARE).max(SAVE_H + TRACK_H + 20.0))
+    }
+
+    /// The editing strip: what to save, the timeline, and the moments on it.
+    /// The picture above it belongs to the player, which is also where a
+    /// click lands that places a spatial edit.
+    pub fn strip(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, player: &mut PlayerView) {
         let p = theme::palette(ui);
         if let Some(e) = self.error.clone() {
             theme::notice(ui, e);
-            ui.add_space(8.0);
+            ui.add_space(6.0);
         }
-        if self.loaded.is_none() {
+        // A click on the paused picture is an edit placed where it landed.
+        // Taken before the clock is borrowed, so the player is free.
+        let placed = player.take_placed();
+        let Some(clock) = player.clock() else {
             self.empty(ui, &p);
             return;
+        };
+
+        if let Some(spot) = placed {
+            let at = clock.position();
+            // A click means "around here", not a pixel: give it a region.
+            let area = Area::new(spot.x - 0.13, spot.y - 0.11, 0.26, 0.22);
+            self.asking = Some(Asking::Spot { at, area });
         }
 
-        // Share the height out before drawing. The transport, the track and
-        // a readable stretch of list are served first and the picture takes
-        // what is left, so a short window loses picture instead of pushing
-        // the moments off the bottom of it.
-        let width = ui.available_width();
-        let spare = ui.available_height() - (TRANSPORT_H + TRACK_H + LIST_MIN + 26.0);
-        let tall = spare.clamp(PICTURE_MIN, width * 9.0 / 16.0);
-
-        self.picture(ui, ctx, &p, tall);
+        self.save_row(ui, &p);
         ui.add_space(8.0);
-        self.transport(ui, &p);
-        ui.add_space(8.0);
-        self.track(ui, &p);
+        self.track(ui, &p, clock);
         ui.add_space(10.0);
-        // Measured rather than budgeted: the transport grows when an edit
-        // has a problem to report, and the list gives up the room.
         let rest = ui.available_height().max(LIST_MIN);
-        self.list(ui, &p, rest);
+        self.list(ui, &p, clock, rest);
         self.menu(ctx, &p);
         if std::mem::take(&mut self.wants_save) {
             self.save();
+        }
+        if std::mem::take(&mut self.wants_close) {
+            player.close();
         }
     }
 
     fn empty(&mut self, ui: &mut egui::Ui, p: &theme::Palette) {
         ui.vertical_centered(|ui| {
-            ui.add_space(26.0);
-            ui.label(
-                egui::RichText::new("Nothing open to edit")
-                    .size(15.0)
-                    .color(p.text),
-            );
-            ui.add_space(4.0);
-            theme::hint(ui, "Pick a recording in Recordings, then come back here.");
-            ui.add_space(26.0);
+            ui.add_space(6.0);
+            theme::hint(ui, "Open a recording in Recordings to play and edit it.");
         });
+        let _ = p;
     }
 
-    /// The picture, and the click that places a spatial edit on it.
-    fn picture(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &theme::Palette, tall: f32) {
-        let Some(l) = self.loaded.as_mut() else {
+    /// Save, and anything wrong with the edits as they stand.
+    fn save_row(&mut self, ui: &mut egui::Ui, p: &theme::Palette) {
+        let Some(l) = self.loaded.as_ref() else {
             return;
         };
-        let at = l.player.clock().position();
-
-        let width = ui.available_width();
-        let (band, response) =
-            ui.allocate_exact_size(egui::vec2(width, tall), egui::Sense::click());
-        ui.painter()
-            .rect_filled(band, egui::CornerRadius::same(10), p.stage);
-        // The picture itself keeps the shape it will be watched in, whatever
-        // shape the window is, so an edit placed on it lands where the
-        // viewer will see it. The stage shows through on either side.
-        let rect = fit_inside(band, 16.0 / 9.0);
-
-        // Which screen is on: an override wins, otherwise the first track.
-        let forced = l.edits.forced_screen(at);
-        let shown = forced
-            .and_then(|f| l.screens.iter().position(|s| s == f))
-            .unwrap_or(0);
-
-        if let Some(feed) = l.player.feed(shown) {
-            let serial = feed.serial();
-            let stale = self
-                .textures
-                .get(shown)
-                .and_then(|t| t.as_ref())
-                .is_none_or(|(s, _)| *s != serial);
-            if stale && let Some(frame) = feed.frame() {
-                let image = egui::ColorImage::from_rgba_premultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.rgba,
-                );
-                let slot = &mut self.textures[shown];
-                match slot {
-                    Some((s, handle)) => {
-                        handle.set(image, egui::TextureOptions::LINEAR);
-                        *s = serial;
-                    }
-                    None => {
-                        *slot = Some((
-                            serial,
-                            ctx.load_texture(
-                                format!("edit-{shown}"),
-                                image,
-                                egui::TextureOptions::LINEAR,
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-        if let Some(Some((_, tex))) = self.textures.get(shown) {
-            let inner = rect.shrink(1.0);
-            ui.painter().image(
-                tex.id(),
-                inner,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-        }
-
-        // What is on this frame right now, drawn over it.
-        let painter = ui.painter_at(rect);
-        for m in l.edits.active_at(at) {
-            let Some(area) = m.tool.area() else { continue };
-            let r = egui::Rect::from_min_size(
-                rect.min + egui::vec2(area.x * rect.width(), area.y * rect.height()),
-                egui::vec2(area.w * rect.width(), area.h * rect.height()),
-            );
-            match &m.tool {
-                Tool::Hide { .. } => {
-                    painter.rect_filled(r, egui::CornerRadius::same(4), p.bar);
-                    painter.text(
-                        r.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "hidden",
-                        egui::FontId::proportional(11.0),
-                        p.weak,
-                    );
-                }
-                Tool::Callout { text, .. } => {
-                    painter.rect_stroke(
-                        r,
-                        egui::CornerRadius::same(5),
-                        egui::Stroke::new(2.0, p.signal),
-                        egui::StrokeKind::Inside,
-                    );
-                    if !text.is_empty() {
-                        painter.text(
-                            r.left_top() + egui::vec2(0.0, -14.0),
-                            egui::Align2::LEFT_CENTER,
-                            text,
-                            egui::FontId::proportional(12.0),
-                            p.signal,
-                        );
-                    }
-                }
-                Tool::Zoom { .. } => {
-                    painter.rect_stroke(
-                        r,
-                        egui::CornerRadius::same(5),
-                        egui::Stroke::new(1.5, p.soft),
-                        egui::StrokeKind::Inside,
-                    );
-                }
-                _ => {}
-            }
-        }
-
-        if response.clicked()
-            && let Some(pos) = response.interact_pointer_pos()
-            && rect.contains(pos)
-        {
-            let fx = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-            let fy = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-            // A click means "around here", not a pixel: give it a region.
-            let area = Area::new(fx - 0.13, fy - 0.11, 0.26, 0.22);
-            self.asking = Some(Asking::Spot { at, area });
-        }
-    }
-
-    fn transport(&mut self, ui: &mut egui::Ui, p: &theme::Palette) {
-        let Some(l) = self.loaded.as_mut() else {
-            return;
-        };
-        let at = l.player.clock().position();
         let out = l.edits.output_duration(l.duration);
-        let saved = l.edits.time_saved(l.duration);
-        let playing = l.player.clock().is_playing();
+        let saved_time = l.edits.time_saved(l.duration);
+        let problems: Vec<Problem> = l.edits.problems(l.duration);
 
         ui.horizontal(|ui| {
-            let glyph = if playing { "❚❚" } else { "▶" };
-            if theme::round_button(ui, glyph, 34.0, p.action, p.base, "Play").clicked() {
-                l.player.clock().toggle();
-            }
-            ui.add_space(6.0);
+            let n = l.edits.moments.len();
+            let count = match n {
+                0 => "Nothing changed yet".to_string(),
+                1 => "1 moment".to_string(),
+                n => format!("{n} moments"),
+            };
             ui.label(
-                egui::RichText::new(format!("{}  /  {}", clock(at), clock(l.duration)))
+                egui::RichText::new(count)
                     .family(theme::strong())
                     .color(p.text),
             );
-            if saved > 0.05 {
+            if saved_time > 0.05 {
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new(format!("exports as {}", clock(out)))
+                    egui::RichText::new(format!("exports as {}", stamp(out)))
                         .color(p.signal)
                         .size(12.0),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(theme::outline("Close")).clicked() {
+                    self.wants_close = true;
+                }
                 let label = if self.saved { "Saved" } else { "Save edits" };
                 if ui.add_enabled(!self.saved, theme::outline(label)).clicked() {
                     self.wants_save = true;
@@ -403,7 +285,7 @@ impl EditView {
             });
         });
 
-        for problem in l.edits.problems(l.duration) {
+        for problem in problems {
             let text = match problem {
                 Problem::Overlap { .. } => "Two edits change the same stretch of time.",
                 Problem::PastEnd { .. } => "An edit runs past the end of the recording.",
@@ -414,7 +296,7 @@ impl EditView {
     }
 
     /// One track: moments as blocks, with what happened kept faint behind.
-    fn track(&mut self, ui: &mut egui::Ui, p: &theme::Palette) {
+    fn track(&mut self, ui: &mut egui::Ui, p: &theme::Palette, clock: &SharedClock) {
         let Some(l) = self.loaded.as_mut() else {
             return;
         };
@@ -445,7 +327,7 @@ impl EditView {
             painter.text(
                 egui::pos2(x + 3.0, rect.top() + 2.0),
                 egui::Align2::LEFT_TOP,
-                clock_short(mark),
+                stamp_short(mark),
                 egui::FontId::monospace(9.0),
                 p.weak,
             );
@@ -513,7 +395,7 @@ impl EditView {
         }
 
         // playhead
-        let hx = x_of(l.player.clock().position());
+        let hx = x_of(clock.position());
         painter.line_segment(
             [egui::pos2(hx, rect.top()), egui::pos2(hx, rect.bottom())],
             egui::Stroke::new(2.0, p.text),
@@ -584,7 +466,7 @@ impl EditView {
                 let (lo, hi) = (a.min(b), a.max(b));
                 if hi - lo < TAP {
                     self.selection = None;
-                    l.player.clock().seek(lo);
+                    clock.seek(lo);
                 } else {
                     self.asking = Some(Asking::Span { from: lo, to: hi });
                 }
@@ -599,25 +481,21 @@ impl EditView {
                 Some((id, _, _)) => self.opened = Some(id),
                 None => {
                     self.selection = None;
-                    l.player.clock().seek(t_of(pos.x));
+                    clock.seek(t_of(pos.x));
                 }
             }
         }
     }
 
     /// Moments, each opening where it sits.
-    fn list(&mut self, ui: &mut egui::Ui, p: &theme::Palette, tall: f32) {
+    fn list(&mut self, ui: &mut egui::Ui, p: &theme::Palette, clock: &SharedClock, tall: f32) {
         // Read what the list needs, then let go: the scroll closure needs the
         // whole view, so nothing may still be borrowed out of it.
         let (at, duration, moments) = {
             let Some(l) = self.loaded.as_ref() else {
                 return;
             };
-            (
-                l.player.clock().position(),
-                l.duration,
-                l.edits.moments.clone(),
-            )
+            (clock.position(), l.duration, l.edits.moments.clone())
         };
         if moments.is_empty() {
             theme::hint(
@@ -662,8 +540,8 @@ impl EditView {
                                         ui.label(
                                             egui::RichText::new(format!(
                                                 "{} → {}",
-                                                clock(m.start),
-                                                clock(m.end)
+                                                stamp(m.start),
+                                                stamp(m.end)
                                             ))
                                             .monospace()
                                             .size(11.0)
@@ -699,7 +577,7 @@ impl EditView {
             }
         }
         if let Some(t) = seek {
-            l.player.clock().seek(t);
+            clock.seek(t);
         }
         if let Some(id) = remove {
             l.edits.remove(id);
@@ -880,8 +758,8 @@ impl EditView {
         let mut placed: Option<(f64, f64, Tool)> = None;
 
         let title = match asking {
-            Asking::Spot { at, .. } => format!("Here, at {}", clock(*at)),
-            Asking::Span { from, to } => format!("{} → {}", clock(*from), clock(*to)),
+            Asking::Spot { at, .. } => format!("Here, at {}", stamp(*at)),
+            Asking::Span { from, to } => format!("{} → {}", stamp(*from), stamp(*to)),
         };
 
         egui::Window::new(title)
@@ -1000,12 +878,6 @@ fn item(ui: &mut egui::Ui, p: &theme::Palette, title: &str, sub: &str) -> bool {
     clicked
 }
 
-/// The largest rectangle of `aspect` that fits inside `outer`, centred on it.
-fn fit_inside(outer: egui::Rect, aspect: f32) -> egui::Rect {
-    let w = outer.width().min(outer.height() * aspect);
-    egui::Rect::from_center_size(outer.center(), egui::vec2(w, w / aspect))
-}
-
 fn tool_colour(tool: &Tool, p: &theme::Palette) -> egui::Color32 {
     match tool {
         Tool::Zoom { .. } | Tool::MarkClicks => p.signal,
@@ -1015,11 +887,11 @@ fn tool_colour(tool: &Tool, p: &theme::Palette) -> egui::Color32 {
     }
 }
 
-fn clock(t: f64) -> String {
+fn stamp(t: f64) -> String {
     let m = (t / 60.0).floor() as i64;
     format!("{m}:{:04.1}", t - m as f64 * 60.0)
 }
-fn clock_short(t: f64) -> String {
+fn stamp_short(t: f64) -> String {
     let m = (t / 60.0).floor() as i64;
     format!("{m}:{:02}", (t - m as f64 * 60.0).floor() as i64)
 }
@@ -1052,17 +924,18 @@ mod tests {
 
     #[test]
     fn clocks_read_the_way_the_editor_shows_them() {
-        assert_eq!(clock(0.0), "0:00.0");
-        assert_eq!(clock(9.25), "0:09.2");
-        assert_eq!(clock(75.5), "1:15.5");
-        assert_eq!(clock_short(0.0), "0:00");
-        assert_eq!(clock_short(90.0), "1:30");
+        assert_eq!(stamp(0.0), "0:00.0");
+        assert_eq!(stamp(9.25), "0:09.2");
+        assert_eq!(stamp(75.5), "1:15.5");
+        assert_eq!(stamp_short(0.0), "0:00");
+        assert_eq!(stamp_short(90.0), "1:30");
     }
 
     #[test]
     fn a_fresh_view_has_nothing_open() {
         let v = EditView::new();
-        assert!(!v.has_recording());
+        assert!(v.loaded.is_none());
         assert!(v.saved, "nothing to save before anything is open");
+        assert!(!v.wants_save && !v.wants_close);
     }
 }

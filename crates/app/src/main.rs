@@ -46,9 +46,12 @@ fn main() -> eframe::Result<()> {
                 width: 64,
                 height: 64,
             })
-            // Reshaped on the first frame, once the screen it opened on is
-            // known; see `sizing`.
-            .with_inner_size([sizing::RECORD_WIDTH, 780.0])
+            // Full screen to start with, since every tab has something to
+            // do with the room. Restoring down, resizing or moving it is
+            // the user's business from then on: nothing in the app reshapes
+            // the window again except the recording bar. See `sizing`.
+            .with_maximized(true)
+            .with_inner_size(sizing::FIRST_RUN)
             .with_min_inner_size(sizing::MIN_SIZE),
         ..Default::default()
     };

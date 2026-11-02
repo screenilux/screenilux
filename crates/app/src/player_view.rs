@@ -62,6 +62,17 @@ struct Selection {
     words: Option<(WordRef, WordRef)>,
 }
 
+/// A click on the paused picture while the editor is showing: which screen
+/// it landed on, and where on that screen as a fraction of it. Knowing the
+/// screen is what lets an edit on a multi-screen recording say which picture
+/// it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placed {
+    pub track: usize,
+    pub x: f32,
+    pub y: f32,
+}
+
 pub struct PlayerView {
     loaded: Option<Loaded>,
     opening: Option<(String, Receiver<Result<Opened, String>>)>,
@@ -95,6 +106,10 @@ pub struct PlayerView {
     /// A recording just made searchable, and its text, for the app to add
     /// to the recording's link if it has one.
     indexed: Option<(PathBuf, TextIndex)>,
+    /// The editor is showing, so a plain click on the paused picture places
+    /// an edit instead of clearing the text selection.
+    editing: bool,
+    placed: Option<Placed>,
 }
 
 impl PlayerView {
@@ -120,7 +135,48 @@ impl PlayerView {
             link: (Link::None, false),
             asked: None,
             indexed: None,
+            editing: false,
+            placed: None,
         }
+    }
+
+    /// Let the editor take plain clicks on the paused picture. Dragging
+    /// still selects text either way, so reading a recording and editing it
+    /// do not fight over the same gesture.
+    pub fn set_editing(&mut self, on: bool) {
+        self.editing = on;
+    }
+
+    pub fn take_placed(&mut self) -> Option<Placed> {
+        self.placed.take()
+    }
+
+    /// The picture fills the display, with the controls floating over it.
+    pub fn is_full(&self) -> bool {
+        self.full
+    }
+
+    /// The open recording's clock, which is the only clock: an editor reads
+    /// and moves the position through this rather than decoding its own.
+    pub fn clock(&self) -> Option<&screenilux_player::SharedClock> {
+        self.loaded.as_ref().map(|l| l.player.clock())
+    }
+
+    /// The screens' files in display order, for an edit that names one.
+    pub fn screen_names(&self) -> Vec<String> {
+        self.loaded.as_ref().map_or_else(Vec::new, |l| {
+            l.opened
+                .recording
+                .tracks
+                .iter()
+                .map(|t| {
+                    t.path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
     }
 
     /// Open a file off the UI thread. A package is unpacked first, which
@@ -854,12 +910,24 @@ impl PlayerView {
             let to = !self.full;
             self.set_full(ctx, to);
         }
-        // Clicking the picture while it plays pauses it, ready for selecting.
-        if response.clicked()
-            && !paused
-            && let Some(l) = &self.loaded
-        {
-            l.player.clock().pause();
+        if response.clicked() {
+            if !paused {
+                // Clicking while it plays pauses it, ready for selecting
+                // text or for placing an edit on what is on screen.
+                if let Some(l) = &self.loaded {
+                    l.player.clock().pause();
+                }
+            } else if self.editing
+                && let Some(pos) = response.interact_pointer_pos()
+                && let Some(p) = placements.iter().find(|p| to_rect(p.area).contains(pos))
+            {
+                let r = to_rect(p.area);
+                self.placed = Some(Placed {
+                    track: p.track,
+                    x: (pos.x - r.left()) / r.width(),
+                    y: (pos.y - r.top()) / r.height(),
+                });
+            }
         }
     }
 
