@@ -1,6 +1,6 @@
 //! Edits to a recording, kept as data rather than baked into pixels.
 //!
-//! A demo is edited by placing *moments*: a zoom that follows the pointer, a
+//! A demo is edited by placing *effects*: a zoom that follows the pointer, a
 //! region to hide, a dull stretch to cut or speed up. Each one names a span of
 //! the original recording and what to do with it. Nothing is rendered here —
 //! the player draws them while playing and export renders them once — so an
@@ -59,7 +59,32 @@ impl Area {
     }
 }
 
-/// What a moment does.
+/// What a effect does.
+/// Where a caption sits on the picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Place {
+    /// Along the bottom, out of the way of what is being shown.
+    #[default]
+    Bottom,
+    Top,
+    /// Across the middle, for a title rather than a subtitle.
+    Centre,
+}
+
+/// What a backdrop is filled with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Backdrop {
+    /// A soft gradient, which is what most demos use.
+    #[default]
+    Gradient,
+    /// One flat colour.
+    Solid,
+    /// The recording itself, blown up and blurred behind.
+    Blurred,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "tool", rename_all = "kebab-case")]
 pub enum Tool {
@@ -74,6 +99,20 @@ pub enum Tool {
     },
     /// Cover a region, for anything that should not have been on screen.
     Hide { area: Area },
+    /// Soften a region rather than covering it, so the shape of what was
+    /// there still reads. The usual way a demo redacts a name or a key.
+    Blur {
+        area: Area,
+        #[serde(default = "default_blur")]
+        strength: f32,
+    },
+    /// Keep a region lit and dim everything around it. A callout without
+    /// the label, for walking through one part of a crowded screen.
+    Spotlight {
+        area: Area,
+        #[serde(default = "default_dim")]
+        dim: f32,
+    },
     /// Point at a region and dim the rest.
     Callout { area: Area, text: String },
     /// Draw a ring wherever a click was recorded.
@@ -90,12 +129,34 @@ pub enum Tool {
     },
     /// Silence this stretch; the picture keeps playing.
     Mute,
+    /// Words over the picture for this stretch. A caption carries the
+    /// narration a silent demo would otherwise need a voice for.
+    Caption {
+        text: String,
+        #[serde(default)]
+        place: Place,
+    },
+    /// Inset the picture on a background with rounded corners and a shadow.
+    /// The look most demos are published in, and the reason a raw recording
+    /// reads as a screenshot while an edited one reads as a product video.
+    Backdrop {
+        #[serde(default = "default_pad")]
+        pad: f32,
+        #[serde(default)]
+        style: Backdrop,
+    },
+    /// Hold on one frame, so a point has time to land before moving on.
+    /// The stretch keeps its length and the frame at its start is shown
+    /// throughout, so the recording still runs for as long as it did and
+    /// the time mapping is untouched.
+    Freeze,
     /// Show a particular screen, overriding the pointer-driven choice.
     Screen { file: String },
 }
 
 /// `4.0` reads as "4", `2.5` stays "2.5".
-fn trim_zero(v: f32) -> String {
+/// A rate without a pointless trailing zero: 4 rather than 4.0.
+pub fn trim_zero(v: f32) -> String {
     if (v - v.round()).abs() < 1e-3 {
         format!("{}", v.round() as i64)
     } else {
@@ -113,6 +174,18 @@ fn default_rate() -> f32 {
     4.0
 }
 
+fn default_blur() -> f32 {
+    0.6
+}
+
+fn default_dim() -> f32 {
+    0.55
+}
+
+fn default_pad() -> f32 {
+    0.06
+}
+
 impl Tool {
     /// A short name for the editor's list.
     pub fn label(&self) -> String {
@@ -120,12 +193,17 @@ impl Tool {
             Tool::Zoom { follow: true, .. } => "Zoom & follow".into(),
             Tool::Zoom { .. } => "Zoom, held".into(),
             Tool::Hide { .. } => "Hide region".into(),
+            Tool::Blur { .. } => "Blur region".into(),
+            Tool::Spotlight { .. } => "Spotlight".into(),
             Tool::Callout { .. } => "Callout".into(),
             Tool::MarkClicks => "Mark every click".into(),
             Tool::Cut => "Cut".into(),
             Tool::Trim => "Trim".into(),
             Tool::Speed { rate } => format!("Speed up {}×", trim_zero(*rate)),
             Tool::Mute => "Mute".into(),
+            Tool::Caption { .. } => "Caption".into(),
+            Tool::Backdrop { .. } => "Backdrop".into(),
+            Tool::Freeze => "Hold the frame".into(),
             Tool::Screen { .. } => "Show one screen".into(),
         }
     }
@@ -138,9 +216,11 @@ impl Tool {
     /// The region it applies to, if it has one.
     pub fn area(&self) -> Option<Area> {
         match self {
-            Tool::Zoom { area, .. } | Tool::Hide { area } | Tool::Callout { area, .. } => {
-                Some(*area)
-            }
+            Tool::Zoom { area, .. }
+            | Tool::Hide { area }
+            | Tool::Blur { area, .. }
+            | Tool::Spotlight { area, .. }
+            | Tool::Callout { area, .. } => Some(*area),
             _ => None,
         }
     }
@@ -148,13 +228,13 @@ impl Tool {
 
 /// One edit: a span of the original recording and what to do with it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Moment {
+pub struct Effect {
     pub id: u32,
     /// Seconds into the original recording.
     pub start: f64,
     pub end: f64,
     /// Which screen this happens on, by the file it was recorded to. A
-    /// moment placed on the picture knows its screen; one dragged out of
+    /// effect placed on the picture knows its screen; one dragged out of
     /// the timeline changes time rather than pixels, so it has none and
     /// applies to the recording as a whole.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -163,7 +243,7 @@ pub struct Moment {
     pub tool: Tool,
 }
 
-impl Moment {
+impl Effect {
     pub fn new(id: u32, start: f64, end: f64, tool: Tool) -> Self {
         let (a, b) = if start <= end {
             (start, end)
@@ -188,7 +268,7 @@ impl Moment {
     }
 }
 
-/// The shortest an edit may be. Below this a moment is impossible to grab on
+/// The shortest an edit may be. Below this a effect is impossible to grab on
 /// the timeline and rounds away in the time arithmetic.
 pub const MIN_SPAN: f64 = 0.1;
 
@@ -197,7 +277,7 @@ pub const MIN_SPAN: f64 = 0.1;
 pub enum Problem {
     /// Two stretches that both remove or retime the same footage.
     Overlap { a: u32, b: u32 },
-    /// A moment that runs past the end of the recording.
+    /// A effect that runs past the end of the recording.
     PastEnd { id: u32 },
     /// A cut or trim that would leave nothing at all.
     RemovesEverything,
@@ -217,7 +297,7 @@ impl std::fmt::Display for Problem {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EditList {
     #[serde(default)]
-    pub moments: Vec<Moment>,
+    pub effects: Vec<Effect>,
     /// Highest id handed out, so ids stay unique across sessions.
     #[serde(default)]
     next_id: u32,
@@ -229,44 +309,44 @@ impl EditList {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.moments.is_empty()
+        self.effects.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.moments.len()
+        self.effects.len()
     }
 
-    /// Add a moment and return its id. Kept in start order, which everything
+    /// Add a effect and return its id. Kept in start order, which everything
     /// else in this module relies on.
     pub fn add(&mut self, start: f64, end: f64, tool: Tool) -> u32 {
         self.add_on(start, end, tool, None)
     }
 
-    /// Add a moment that happens on one screen, named by its file. A
+    /// Add a effect that happens on one screen, named by its file. A
     /// spatial edit placed on a multi-screen recording belongs to the
     /// picture it was clicked on, not to whichever one it lands over.
     pub fn add_on(&mut self, start: f64, end: f64, tool: Tool, screen: Option<String>) -> u32 {
         self.next_id += 1;
         let id = self.next_id;
-        let mut m = Moment::new(id, start, end, tool);
+        let mut m = Effect::new(id, start, end, tool);
         m.screen = screen;
-        self.moments.push(m);
+        self.effects.push(m);
         self.sort();
         id
     }
 
     pub fn remove(&mut self, id: u32) {
-        self.moments.retain(|m| m.id != id);
+        self.effects.retain(|m| m.id != id);
     }
 
-    pub fn get(&self, id: u32) -> Option<&Moment> {
-        self.moments.iter().find(|m| m.id == id)
+    pub fn get(&self, id: u32) -> Option<&Effect> {
+        self.effects.iter().find(|m| m.id == id)
     }
 
     /// Mutable access that keeps the list sorted afterwards, since moving a
-    /// moment is the common edit.
-    pub fn update(&mut self, id: u32, f: impl FnOnce(&mut Moment)) {
-        if let Some(m) = self.moments.iter_mut().find(|m| m.id == id) {
+    /// effect is the common edit.
+    pub fn update(&mut self, id: u32, f: impl FnOnce(&mut Effect)) {
+        if let Some(m) = self.effects.iter_mut().find(|m| m.id == id) {
             f(m);
             if m.end < m.start + MIN_SPAN {
                 m.end = m.start + MIN_SPAN;
@@ -276,21 +356,21 @@ impl EditList {
     }
 
     fn sort(&mut self) {
-        self.moments.sort_by(|a, b| {
+        self.effects.sort_by(|a, b| {
             a.start
                 .partial_cmp(&b.start)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
 
-    /// Moments covering a source time, in list order.
-    pub fn active_at(&self, t: f64) -> impl Iterator<Item = &Moment> {
-        self.moments.iter().filter(move |m| m.covers(t))
+    /// Effects covering a source time, in list order.
+    pub fn active_at(&self, t: f64) -> impl Iterator<Item = &Effect> {
+        self.effects.iter().filter(move |m| m.covers(t))
     }
 
     /// Only the ones that change the clock, in start order.
-    fn retimed(&self) -> impl Iterator<Item = &Moment> {
-        self.moments.iter().filter(|m| m.tool.alters_time())
+    fn retimed(&self) -> impl Iterator<Item = &Effect> {
+        self.effects.iter().filter(|m| m.tool.alters_time())
     }
 
     /// Where a source time lands in the finished video.
@@ -375,14 +455,14 @@ impl EditList {
 
     /// Is this source time removed from the finished video?
     pub fn is_removed(&self, t: f64) -> bool {
-        self.moments
+        self.effects
             .iter()
             .any(|m| matches!(m.tool, Tool::Cut | Tool::Trim) && t >= m.start && t < m.end)
     }
 
     /// How fast a source time plays.
     pub fn rate_at(&self, t: f64) -> f32 {
-        self.moments
+        self.effects
             .iter()
             .find(|m| matches!(m.tool, Tool::Speed { .. }) && m.covers(t))
             .map(|m| match m.tool {
@@ -393,14 +473,14 @@ impl EditList {
     }
 
     pub fn is_muted(&self, t: f64) -> bool {
-        self.moments
+        self.effects
             .iter()
             .any(|m| matches!(m.tool, Tool::Mute) && m.covers(t))
     }
 
     /// The screen forced on at this time, if any.
     pub fn forced_screen(&self, t: f64) -> Option<&str> {
-        self.moments.iter().find_map(|m| match &m.tool {
+        self.effects.iter().find_map(|m| match &m.tool {
             Tool::Screen { file } if m.covers(t) => Some(file.as_str()),
             _ => None,
         })
@@ -410,7 +490,7 @@ impl EditList {
     /// can be exported as it stands.
     pub fn problems(&self, source_duration: f64) -> Vec<Problem> {
         let mut found = Vec::new();
-        let retimed: Vec<&Moment> = self.retimed().collect();
+        let retimed: Vec<&Effect> = self.retimed().collect();
         for (i, a) in retimed.iter().enumerate() {
             for b in retimed.iter().skip(i + 1) {
                 if a.end > b.start + f64::EPSILON && a.start < b.end {
@@ -418,7 +498,7 @@ impl EditList {
                 }
             }
         }
-        for m in &self.moments {
+        for m in &self.effects {
             if m.start > source_duration + f64::EPSILON {
                 found.push(Problem::PastEnd { id: m.id });
             }
@@ -435,7 +515,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_moment_placed_on_a_screen_remembers_which_one() {
+    fn an_effect_placed_on_a_screen_remembers_which_one() {
         let mut edits = EditList::default();
         let zoom = Tool::Zoom {
             area: Area::new(0.1, 0.1, 0.2, 0.2),
@@ -451,21 +531,21 @@ mod tests {
         assert_eq!(
             edits.get(anywhere).unwrap().screen,
             None,
-            "a moment that changes time belongs to no one screen"
+            "a effect that changes time belongs to no one screen"
         );
 
         // The screen is only written when there is one, so an edit list
         // from before this existed reads back unchanged.
         let json = serde_json::to_string(edits.get(anywhere).unwrap()).unwrap();
         assert!(!json.contains("screen"), "{json}");
-        let back: Moment =
+        let back: Effect =
             serde_json::from_str(r#"{"id":9,"start":0.0,"end":2.0,"tool":"mute"}"#).unwrap();
         assert_eq!(back.screen, None);
     }
 
-    fn list(moments: &[(f64, f64, Tool)]) -> EditList {
+    fn list(effects: &[(f64, f64, Tool)]) -> EditList {
         let mut l = EditList::new();
-        for (a, b, t) in moments {
+        for (a, b, t) in effects {
             l.add(*a, *b, t.clone());
         }
         l
@@ -643,7 +723,7 @@ mod tests {
         assert!(!l.is_muted(18.0));
         assert_eq!(l.forced_screen(32.0), Some("screen2.mp4"));
         assert_eq!(l.forced_screen(40.0), None);
-        l.remove(l.moments[0].id);
+        l.remove(l.effects[0].id);
         assert_eq!(l.rate_at(15.0), 1.0);
     }
 
@@ -653,17 +733,17 @@ mod tests {
         let late = l.add(30.0, 32.0, Tool::Cut);
         let early = l.add(5.0, 6.0, Tool::Cut);
         assert_ne!(late, early);
-        assert_eq!(l.moments[0].id, early, "sorted by start, not by insertion");
+        assert_eq!(l.effects[0].id, early, "sorted by start, not by insertion");
         l.update(early, |m| {
             m.start = 40.0;
             m.end = 41.0;
         });
-        assert_eq!(l.moments[0].id, late, "moving one re-sorts the list");
+        assert_eq!(l.effects[0].id, late, "moving one re-sorts the list");
     }
 
     #[test]
-    fn a_moment_cannot_be_inverted_or_vanishingly_short() {
-        let m = Moment::new(1, 9.0, 4.0, Tool::Cut);
+    fn an_effect_cannot_be_inverted_or_vanishingly_short() {
+        let m = Effect::new(1, 9.0, 4.0, Tool::Cut);
         assert!(m.start < m.end, "reversed drag is normalised");
         let mut l = EditList::new();
         let id = l.add(5.0, 5.0, Tool::Mute);

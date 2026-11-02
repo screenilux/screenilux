@@ -2,7 +2,7 @@
 //!
 //! Playing and editing are one thing here, not two. The tab is the player —
 //! its picture and its controls — with a side panel that carries the text
-//! read off the screen and the moments on one set of tabs. So there is one
+//! read off the screen and the effects on one set of tabs. So there is one
 //! recording open, one decoder, one clock and one picture, and no second
 //! window to arrange. The editor never opens a recording of its own; it
 //! follows whatever the player has.
@@ -10,7 +10,7 @@
 //! Two surfaces, split by what a tool needs to know. Tools that need a *where*
 //! — zoom, hide, point at — are placed by clicking the picture, which is the
 //! only place that question has an answer. Tools that need a *when* — cut,
-//! speed up, mute, show a screen — come from dragging the timeline. Moments
+//! speed up, mute, show a screen — come from dragging the timeline. Effects
 //! then live on one track and in a list that opens where it sits, so an edit
 //! is changed in the same place it is read.
 //!
@@ -27,15 +27,17 @@
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
-use screenilux_core::edit::{Area, EditList, MIN_SPAN, Moment, Problem, Tool};
+use screenilux_core::edit::{
+    Area, Backdrop, EditList, Effect, MIN_SPAN, Place, Problem, Tool, trim_zero,
+};
 use screenilux_core::session::{MANIFEST_NAME, Manifest};
 use screenilux_player::SharedClock;
 
 use crate::player_view::PlayerView;
-use crate::theme;
+use crate::theme::{self, icon};
 
-/// How tall the timeline is. It carries a ruler, the moments as blocks and
-/// the playhead, and its edges are grabbed to re-time a moment, so it wants
+/// How tall the timeline is. It carries a ruler, the effects as blocks and
+/// the playhead, and its edges are grabbed to re-time a effect, so it wants
 /// more than a scrubber's few pixels.
 const TRACK_H: f32 = 64.0;
 
@@ -57,25 +59,16 @@ enum Grab {
     Selecting {
         from: f64,
     },
-    /// Moving a whole moment, holding where it was grabbed.
+    /// Moving a whole effect, holding where it was grabbed.
     Moving {
         id: u32,
         offset: f64,
     },
-    /// Dragging one end of a moment.
+    /// Dragging one end of a effect.
     Edge {
         id: u32,
         start_side: bool,
     },
-}
-
-/// Which of the side panel's tabs is showing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side {
-    /// The text read off the screen, which is the player's.
-    Text,
-    /// The moments, which are the editor's.
-    Moments,
 }
 
 /// A menu waiting to be answered.
@@ -96,7 +89,7 @@ pub struct EditView {
     grab: Grab,
     selection: Option<(f64, f64)>,
     asking: Option<Asking>,
-    /// Which moment is open in the list, which is also the one highlighted on
+    /// Which effect is open in the list, which is also the one highlighted on
     /// the track: selecting in one place selects in the other.
     opened: Option<u32>,
     saved: bool,
@@ -104,7 +97,12 @@ pub struct EditView {
     /// released.
     wants_save: bool,
     wants_close: bool,
-    side: Side,
+    /// Where the timeline was drawn last frame, for the tour to point at.
+    track_at: Option<egui::Rect>,
+    /// What is typed into the effect menu's search box.
+    find: String,
+    /// Whether that box has been given focus since the menu opened.
+    found_focus: bool,
 }
 
 struct Loaded {
@@ -134,7 +132,9 @@ impl EditView {
             saved: true,
             wants_save: false,
             wants_close: false,
-            side: Side::Moments,
+            track_at: None,
+            find: String::new(),
+            found_focus: false,
         }
     }
 
@@ -206,9 +206,9 @@ impl EditView {
     // -- the side panel ----------------------------------------------------
 
     /// The panel beside the picture: the text read off the screen, and the
-    /// moments, on one set of tabs. Both are about the recording that is
+    /// effects, on one set of tabs. Both are about the recording that is
     /// open, so they share an edge rather than each taking one.
-    pub fn side_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, player: &mut PlayerView) {
+    pub fn side_panel(&mut self, ui: &mut egui::Ui, player: &mut PlayerView) {
         let p = theme::palette(ui);
 
         // A click on the paused picture is an edit placed where it landed,
@@ -225,34 +225,18 @@ impl EditView {
                 .as_ref()
                 .and_then(|l| l.screens.get(spot.track).cloned());
             self.asking = Some(Asking::Spot { at, area, screen });
-            self.side = Side::Moments;
         }
 
-        let chosen = match self.side {
-            Side::Text => 0,
-            Side::Moments => 1,
-        };
-        match theme::segmented(ui, &["Text on screen", "Moments"], chosen) {
-            Some(0) => self.side = Side::Text,
-            Some(1) => self.side = Side::Moments,
-            _ => {}
-        }
-        ui.add_space(12.0);
-
-        match self.side {
-            Side::Text => player.text_panel(ui),
-            Side::Moments => self.moments(ui, ctx, &p, player),
-        }
+        self.panel(ui, &p, player);
     }
 
-    /// The moments tab: what to save, the timeline, and what is on it.
-    fn moments(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        p: &theme::Palette,
-        player: &mut PlayerView,
-    ) {
+    /// Where the timeline is on screen, for the tour to point at.
+    pub fn track_at(&self) -> Option<egui::Rect> {
+        self.track_at
+    }
+
+    /// The panel: what to save, and the effects on the recording.
+    fn panel(&mut self, ui: &mut egui::Ui, p: &theme::Palette, player: &mut PlayerView) {
         if let Some(e) = self.error.clone() {
             theme::notice(ui, e);
             ui.add_space(6.0);
@@ -266,7 +250,7 @@ impl EditView {
         ui.add_space(12.0);
         let rest = ui.available_height().max(LIST_MIN);
         self.list(ui, p, clock, rest);
-        let _ = (ctx, player);
+        let _ = player;
     }
 
     /// The timeline, under the picture and as wide as it is. Click to move
@@ -308,11 +292,11 @@ impl EditView {
         let problems: Vec<Problem> = l.edits.problems(l.duration);
 
         ui.horizontal(|ui| {
-            let n = l.edits.moments.len();
+            let n = l.edits.effects.len();
             let count = match n {
                 0 => "Nothing changed yet".to_string(),
-                1 => "1 moment".to_string(),
-                n => format!("{n} moments"),
+                1 => "1 effect".to_string(),
+                n => format!("{n} effects"),
             };
             ui.label(
                 egui::RichText::new(count)
@@ -348,7 +332,7 @@ impl EditView {
         }
     }
 
-    /// One track: moments as blocks, with what happened kept faint behind.
+    /// One track: effects as blocks, with what happened kept faint behind.
     fn track(&mut self, ui: &mut egui::Ui, p: &theme::Palette, clock: &SharedClock) {
         let Some(l) = self.loaded.as_mut() else {
             return;
@@ -356,6 +340,7 @@ impl EditView {
         let width = ui.available_width();
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(width, TRACK_H), egui::Sense::click_and_drag());
+        self.track_at = Some(rect);
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, egui::CornerRadius::same(8), p.surface);
         painter.rect_stroke(
@@ -406,10 +391,10 @@ impl EditView {
             );
         }
 
-        // moments
+        // effects
         let mut hit: Option<(u32, bool, bool)> = None; // id, on-left-edge, on-right-edge
         let pointer = response.hover_pos().or(response.interact_pointer_pos());
-        for m in &l.edits.moments {
+        for m in &l.edits.effects {
             let r = egui::Rect::from_min_max(
                 egui::pos2(x_of(m.start), rect.top() + 13.0),
                 egui::pos2(x_of(m.end).max(x_of(m.start) + 6.0), rect.bottom() - 4.0),
@@ -540,17 +525,17 @@ impl EditView {
         }
     }
 
-    /// Moments, each opening where it sits.
+    /// Effects, each opening where it sits.
     fn list(&mut self, ui: &mut egui::Ui, p: &theme::Palette, clock: &SharedClock, tall: f32) {
         // Read what the list needs, then let go: the scroll closure needs the
         // whole view, so nothing may still be borrowed out of it.
-        let (at, duration, moments) = {
+        let (at, duration, effects) = {
             let Some(l) = self.loaded.as_ref() else {
                 return;
             };
-            (clock.position(), l.duration, l.edits.moments.clone())
+            (clock.position(), l.duration, l.edits.effects.clone())
         };
-        if moments.is_empty() {
+        if effects.is_empty() {
             theme::hint(
                 ui,
                 "Click the picture to zoom, hide or point at something. Drag the track to cut or speed up a stretch.",
@@ -565,7 +550,7 @@ impl EditView {
         egui::ScrollArea::vertical()
             .max_height(tall)
             .show(ui, |ui| {
-                for m in &moments {
+                for m in &effects {
                     let id = m.id;
                     let live = m.covers(at);
                     let open = self.opened == Some(id);
@@ -622,7 +607,7 @@ impl EditView {
         if let Some(id) = refit {
             // Put the end back where the recording says it belongs. Without a
             // pointer track this is the placed default; with one it becomes
-            // the moment the pointer actually left the area.
+            // the effect the pointer actually left the area.
             if let Some(m) = l.edits.get(id).cloned() {
                 let end = (m.start + 6.0).min(l.duration);
                 l.edits.update(id, |m| m.end = end);
@@ -641,13 +626,13 @@ impl EditView {
         }
     }
 
-    /// The fields for one moment, by what that tool actually has.
+    /// The fields for one effect, by what that tool actually has.
     #[allow(clippy::too_many_arguments)]
     fn editor(
         &mut self,
         ui: &mut egui::Ui,
         p: &theme::Palette,
-        m: &Moment,
+        m: &Effect,
         duration: f64,
         remove: &mut Option<u32>,
         seek: &mut Option<f64>,
@@ -751,6 +736,100 @@ impl EditView {
                     self.saved = false;
                 }
             }
+            Tool::Blur { area, strength } => {
+                let area = *area;
+                let mut strength = *strength;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Softness").size(11.0).color(p.weak));
+                    if ui
+                        .add(egui::Slider::new(&mut strength, 0.2..=1.0).show_value(false))
+                        .changed()
+                    {
+                        l.edits
+                            .update(id, |m| m.tool = Tool::Blur { area, strength });
+                        self.saved = false;
+                    }
+                });
+            }
+            Tool::Spotlight { area, dim } => {
+                let area = *area;
+                let mut dim = *dim;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Dim the rest").size(11.0).color(p.weak));
+                    if ui
+                        .add(egui::Slider::new(&mut dim, 0.1..=0.9).show_value(false))
+                        .changed()
+                    {
+                        l.edits
+                            .update(id, |m| m.tool = Tool::Spotlight { area, dim });
+                        self.saved = false;
+                    }
+                });
+            }
+            Tool::Caption { text, place } => {
+                let mut text = text.clone();
+                let mut place = *place;
+                if ui.text_edit_singleline(&mut text).changed() {
+                    let (t, pl) = (text.clone(), place);
+                    l.edits.update(id, |m| {
+                        m.tool = Tool::Caption {
+                            text: t.clone(),
+                            place: pl,
+                        };
+                    });
+                    self.saved = false;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Sits").size(11.0).color(p.weak));
+                    for (option, label) in [
+                        (Place::Bottom, "Bottom"),
+                        (Place::Centre, "Middle"),
+                        (Place::Top, "Top"),
+                    ] {
+                        if ui.selectable_label(place == option, label).clicked() {
+                            place = option;
+                            let t = text.clone();
+                            l.edits.update(id, |m| {
+                                m.tool = Tool::Caption {
+                                    text: t.clone(),
+                                    place,
+                                };
+                            });
+                            self.saved = false;
+                        }
+                    }
+                });
+            }
+            Tool::Backdrop { pad, style } => {
+                let mut pad = *pad;
+                let mut style = *style;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Inset").size(11.0).color(p.weak));
+                    if ui
+                        .add(egui::Slider::new(&mut pad, 0.0..=0.2).show_value(false))
+                        .changed()
+                    {
+                        l.edits
+                            .update(id, |m| m.tool = Tool::Backdrop { pad, style });
+                        self.saved = false;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Behind").size(11.0).color(p.weak));
+                    for (option, label) in [
+                        (Backdrop::Gradient, "Gradient"),
+                        (Backdrop::Solid, "Solid"),
+                        (Backdrop::Blurred, "Blurred"),
+                    ] {
+                        if ui.selectable_label(style == option, label).clicked() {
+                            style = option;
+                            l.edits
+                                .update(id, |m| m.tool = Tool::Backdrop { pad, style });
+                            self.saved = false;
+                        }
+                    }
+                });
+            }
             Tool::Speed { rate } => {
                 let mut rate = *rate;
                 ui.horizontal(|ui| {
@@ -799,104 +878,81 @@ impl EditView {
     }
 
     /// The menu a click or a drag asked for.
+    /// Everything that can be put here, searched rather than scrolled. The
+    /// list grows every time an effect is added, and a name you half
+    /// remember is faster to type than to find.
     fn menu(&mut self, ctx: &egui::Context, p: &theme::Palette) {
         let Some(asking) = self.asking.as_ref() else {
             return;
         };
-        let Some(l) = self.loaded.as_mut() else {
+        let Some(l) = self.loaded.as_ref() else {
             self.asking = None;
             return;
         };
-        let mut close = false;
-        let mut placed: Option<(f64, f64, Tool)> = None;
-        // Which screen the spot was clicked on, if it came from the picture.
-        let mut on_screen: Option<String> = None;
 
-        let title = match asking {
-            Asking::Spot { at, .. } => format!("Here, at {}", stamp(*at)),
-            Asking::Span { from, to } => format!("{} → {}", stamp(*from), stamp(*to)),
+        let (title, choices) = match asking {
+            Asking::Spot { at, area, screen } => (
+                format!("Here, at {}", stamp(*at)),
+                spot_choices(*at, *area, screen.clone(), l.duration),
+            ),
+            Asking::Span { from, to } => (
+                format!("{} → {}", stamp(*from), stamp(*to)),
+                span_choices(*from, *to, l.duration, &l.screens),
+            ),
         };
+
+        let query = self.find.trim().to_lowercase();
+        let shown: Vec<&Choice> = choices
+            .iter()
+            .filter(|c| {
+                query.is_empty()
+                    || c.name.to_lowercase().contains(&query)
+                    || c.hint.to_lowercase().contains(&query)
+            })
+            .collect();
+
+        let mut close = false;
+        let mut chosen: Option<usize> = None;
 
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.set_max_width(290.0);
-                match asking {
-                    Asking::Spot { at, area, screen } => {
-                        let (at, area) = (*at, *area);
-                        on_screen = screen.clone();
-                        let end = (at + 6.0).min(l.duration);
-                        if item(
-                            ui,
-                            p,
-                            "Zoom & follow the pointer",
-                            "Holds until the pointer leaves this area",
-                        ) {
-                            placed = Some((
-                                at,
-                                end,
-                                Tool::Zoom {
-                                    area,
-                                    follow: true,
-                                    scale: 2.1,
-                                },
-                            ));
+                ui.set_max_width(320.0);
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.find)
+                        .hint_text(format!("{}  Search effects", icon::SEARCH))
+                        .desired_width(f32::INFINITY),
+                );
+                // The menu opens ready to be typed into, so reaching for an
+                // effect never means reaching for the mouse first.
+                if !self.found_focus {
+                    field.request_focus();
+                    self.found_focus = true;
+                }
+                ui.add_space(6.0);
+
+                if shown.is_empty() {
+                    theme::hint(ui, "Nothing by that name.");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        for (i, c) in shown.iter().enumerate() {
+                            if item(ui, p, &c.name, &c.hint) {
+                                chosen = Some(i);
+                            }
                         }
-                        if item(ui, p, "Zoom and hold still", "Stays on this area") {
-                            placed = Some((
-                                at,
-                                end,
-                                Tool::Zoom {
-                                    area,
-                                    follow: false,
-                                    scale: 2.1,
-                                },
-                            ));
-                        }
-                        if item(ui, p, "Hide this region", "Covered while it is on screen") {
-                            placed = Some((at, (at + 8.0).min(l.duration), Tool::Hide { area }));
-                        }
-                        if item(ui, p, "Point at this", "Dims everything else") {
-                            placed = Some((
-                                at,
-                                (at + 4.0).min(l.duration),
-                                Tool::Callout {
-                                    area,
-                                    text: "Look here".into(),
-                                },
-                            ));
-                        }
-                    }
-                    Asking::Span { from, to } => {
-                        let (from, to) = (*from, *to);
-                        let span = to - from;
-                        let at_end = from < 1.2 || to > l.duration - 1.2;
-                        if at_end && item(ui, p, "Trim this end", &format!("Drops {span:.1}s")) {
-                            placed = Some((from, to, Tool::Trim));
-                        }
-                        if item(ui, p, "Cut this out", &format!("{span:.1}s removed")) {
-                            placed = Some((from, to, Tool::Cut));
-                        }
-                        if item(
-                            ui,
-                            p,
-                            "Speed up 4×",
-                            &format!("{span:.1}s becomes {:.1}s", span / 4.0),
-                        ) {
-                            placed = Some((from, to, Tool::Speed { rate: 4.0 }));
-                        }
-                        if item(ui, p, "Mute this stretch", "The picture keeps playing") {
-                            placed = Some((from, to, Tool::Mute));
-                        }
-                        if l.screens.len() > 1
-                            && item(ui, p, "Show one screen", "Overrides what Screenilux picked")
-                        {
-                            let file = l.screens.first().cloned().unwrap_or_default();
-                            placed = Some((from, to, Tool::Screen { file }));
-                        }
-                    }
+                    });
+
+                // Enter takes the first match, which is what the typing was
+                // narrowing towards.
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) && !shown.is_empty() {
+                    chosen = Some(0);
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
                 }
                 ui.add_space(4.0);
                 if ui.add(theme::outline("Cancel")).clicked() {
@@ -904,8 +960,12 @@ impl EditView {
                 }
             });
 
-        if let Some((a, b, tool)) = placed {
-            let id = l.edits.add_on(a, b, tool, on_screen);
+        let picked = chosen.map(|i| shown[i].clone());
+        drop(shown);
+        if let Some(c) = picked
+            && let Some(l) = self.loaded.as_mut()
+        {
+            let id = l.edits.add_on(c.start, c.end, c.tool, c.screen);
             self.opened = Some(id);
             self.saved = false;
             self.selection = None;
@@ -913,8 +973,188 @@ impl EditView {
         }
         if close {
             self.asking = None;
+            self.find.clear();
+            self.found_focus = false;
         }
     }
+}
+
+/// One thing the menu offers: what it is called, what it does, and the
+/// effect it would add.
+#[derive(Clone)]
+struct Choice {
+    name: String,
+    hint: String,
+    start: f64,
+    end: f64,
+    tool: Tool,
+    screen: Option<String>,
+}
+
+impl Choice {
+    fn new(name: &str, hint: String, start: f64, end: f64, tool: Tool) -> Self {
+        Self {
+            name: name.to_string(),
+            hint,
+            start,
+            end,
+            tool,
+            screen: None,
+        }
+    }
+}
+
+/// What can be put at a point on the picture: everything that needs a
+/// *where*.
+fn spot_choices(at: f64, area: Area, screen: Option<String>, duration: f64) -> Vec<Choice> {
+    let till = |secs: f64| (at + secs).min(duration);
+    let mut out = vec![
+        Choice::new(
+            "Zoom & follow the pointer",
+            "Holds until the pointer leaves this area".into(),
+            at,
+            till(6.0),
+            Tool::Zoom {
+                area,
+                follow: true,
+                scale: 2.1,
+            },
+        ),
+        Choice::new(
+            "Zoom and hold still",
+            "Stays on this area".into(),
+            at,
+            till(6.0),
+            Tool::Zoom {
+                area,
+                follow: false,
+                scale: 2.1,
+            },
+        ),
+        Choice::new(
+            "Spotlight this",
+            "Keeps it lit and dims the rest".into(),
+            at,
+            till(5.0),
+            Tool::Spotlight { area, dim: 0.55 },
+        ),
+        Choice::new(
+            "Blur this region",
+            "Softened, so the shape still reads".into(),
+            at,
+            till(8.0),
+            Tool::Blur {
+                area,
+                strength: 0.6,
+            },
+        ),
+        Choice::new(
+            "Hide this region",
+            "Covered while it is on screen".into(),
+            at,
+            till(8.0),
+            Tool::Hide { area },
+        ),
+        Choice::new(
+            "Point at this",
+            "A label, with everything else dimmed".into(),
+            at,
+            till(4.0),
+            Tool::Callout {
+                area,
+                text: "Look here".into(),
+            },
+        ),
+    ];
+    for c in &mut out {
+        c.screen = screen.clone();
+    }
+    out
+}
+
+/// What can be done to a stretch of time: everything that needs a *when*.
+fn span_choices(from: f64, to: f64, duration: f64, screens: &[String]) -> Vec<Choice> {
+    let span = to - from;
+    let at_end = from < 1.2 || to > duration - 1.2;
+    let mut out = Vec::new();
+    if at_end {
+        out.push(Choice::new(
+            "Trim this end",
+            format!("Drops {span:.1}s"),
+            from,
+            to,
+            Tool::Trim,
+        ));
+    }
+    out.push(Choice::new(
+        "Cut this out",
+        format!("{span:.1}s removed"),
+        from,
+        to,
+        Tool::Cut,
+    ));
+    for rate in [2.0_f32, 4.0, 8.0] {
+        out.push(Choice::new(
+            &format!("Speed up {}×", trim_zero(rate)),
+            format!("{span:.1}s becomes {:.1}s", span / rate as f64),
+            from,
+            to,
+            Tool::Speed { rate },
+        ));
+    }
+    out.push(Choice::new(
+        "Hold the frame",
+        "Stays on one frame for this stretch".into(),
+        from,
+        to,
+        Tool::Freeze,
+    ));
+    out.push(Choice::new(
+        "Caption this",
+        "Words along the bottom".into(),
+        from,
+        to,
+        Tool::Caption {
+            text: "Say something here".into(),
+            place: Place::Bottom,
+        },
+    ));
+    out.push(Choice::new(
+        "Backdrop",
+        "Insets the picture on a background".into(),
+        from,
+        to,
+        Tool::Backdrop {
+            pad: 0.06,
+            style: Backdrop::Gradient,
+        },
+    ));
+    out.push(Choice::new(
+        "Mute this stretch",
+        "The picture keeps playing".into(),
+        from,
+        to,
+        Tool::Mute,
+    ));
+    out.push(Choice::new(
+        "Mark every click",
+        "A ring wherever a click was recorded".into(),
+        from,
+        to,
+        Tool::MarkClicks,
+    ));
+    if screens.len() > 1 {
+        out.push(Choice::new(
+            "Show one screen",
+            "Overrides what Screenilux picked".into(),
+            from,
+            to,
+            Tool::Screen {
+                file: screens.first().cloned().unwrap_or_default(),
+            },
+        ));
+    }
+    out
 }
 
 fn item(ui: &mut egui::Ui, p: &theme::Palette, title: &str, sub: &str) -> bool {

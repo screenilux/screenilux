@@ -33,6 +33,7 @@ pub struct App {
     sizer: Sizer,
     /// The window title as last set, so it is only sent when it changes.
     titled: String,
+    tour: crate::tour::Tour,
     player: PlayerView,
     editor: EditView,
     previews: Previews,
@@ -95,6 +96,7 @@ impl App {
             tab: Tab::Record,
             sizer: Sizer::new(),
             titled: String::new(),
+            tour: crate::tour::Tour::new(),
             player: PlayerView::new(),
             editor: EditView::new(),
             previews: Previews::start(ctx),
@@ -1070,7 +1072,7 @@ impl App {
 
     /// The Edit tab: play a recording and shape it, in one place. The player
     /// draws the picture and its controls; the editor adds a strip of
-    /// timeline and moments along the bottom.
+    /// timeline and an effects panel beside it.
     fn edit_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = theme::palette(ui);
         let out_dir = self.settings.out_dir.clone();
@@ -1099,28 +1101,33 @@ impl App {
 
         // Full screen is the picture and nothing else, so the panel stands
         // down rather than floating over the thing being watched.
+        let mut side = None;
         if !player.is_full() {
-            egui::Panel::right("edit-side")
-                .exact_size(crate::player_view::SIDE_WIDTH)
-                .resizable(false)
-                .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
-                    left: 0,
-                    right: MARGIN,
-                    top: 0,
-                    bottom: MARGIN,
-                }))
-                .show_separator_line(false)
-                .show(ui, |ui| {
-                    egui::Frame::new()
-                        .stroke(egui::Stroke::new(1.0, p.stroke))
-                        .corner_radius(20)
-                        .inner_margin(20)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.set_height(ui.available_height());
-                            editor.side_panel(ui, ctx, player);
-                        });
-                });
+            side = Some(
+                egui::Panel::right("edit-side")
+                    .exact_size(crate::player_view::SIDE_WIDTH)
+                    .resizable(false)
+                    .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
+                        left: 0,
+                        right: MARGIN,
+                        top: 0,
+                        bottom: MARGIN,
+                    }))
+                    .show_separator_line(false)
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .stroke(egui::Stroke::new(1.0, p.stroke))
+                            .corner_radius(20)
+                            .inner_margin(20)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.set_height(ui.available_height());
+                                editor.side_panel(ui, player);
+                            });
+                    })
+                    .response
+                    .rect,
+            );
 
             // The timeline spans the picture, not the panel: it is dragged
             // and grabbed by the edges, so it needs the width. Added after
@@ -1146,8 +1153,45 @@ impl App {
         if let (Some(Asked::Share), Some(path)) = (player.take_asked(), open) {
             self.share(&path);
         }
-        if let Some((path, index)) = self.player.take_indexed() {
-            self.shares.add_text(&path, index, &self.sharing.bucket);
+        self.guide(ctx, side);
+    }
+
+    /// The tour, on the first visit to the Edit tab with something open. It
+    /// points at the real panels, so it is drawn after them, once they have
+    /// said where they are.
+    fn guide(&mut self, ctx: &egui::Context, side: Option<egui::Rect>) {
+        let ready = self.player.clock().is_some() && !self.player.is_full();
+        if !self.prefs.toured && !self.tour.running() && ready {
+            self.tour.start();
+        }
+        if !ready {
+            return;
+        }
+        let stops = vec![
+            crate::tour::Stop {
+                spot: None,
+                title: "This is where a recording becomes a demo",
+                body: "Nothing you do here changes the recording. Effects are kept beside it and drawn on the way out, so you can undo any of it by deleting it.",
+            },
+            crate::tour::Stop {
+                spot: self.player.stage(),
+                title: "Click the picture to put an effect there",
+                body: "Zoom, spotlight, blur, hide, or point at something. Where you click is what the effect is about, and on a two-screen recording it remembers which screen.",
+            },
+            crate::tour::Stop {
+                spot: self.editor.track_at(),
+                title: "Drag the timeline to pick a stretch",
+                body: "Then cut it, speed it up, hold on a frame, caption it or mute it. Click it instead to move the playhead, and drag an effect's edge to re-time it.",
+            },
+            crate::tour::Stop {
+                spot: side,
+                title: "Everything you add lands here",
+                body: "Click one to open it and change it. Save when you are happy — the effects are written beside the recording, not into it.",
+            },
+        ];
+        if self.tour.show(ctx, &stops) {
+            self.prefs.toured = true;
+            self.prefs.save();
         }
     }
 

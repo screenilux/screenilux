@@ -89,6 +89,10 @@ pub struct Prefs {
     /// Keep a recording on this computer once it is shared. Without sharing,
     /// recordings always stay.
     pub keep_local: bool,
+    /// Whether the Edit tab's tour has been seen. Finishing it and skipping
+    /// it both count: it is offered once, not until it is completed.
+    #[serde(default)]
+    pub toured: bool,
 }
 
 impl Default for Prefs {
@@ -96,6 +100,7 @@ impl Default for Prefs {
         Self {
             out_dir: None,
             keep_local: true,
+            toured: false,
         }
     }
 }

@@ -28,9 +28,7 @@ pub mod icon {
     pub const MIC: &str = "\u{E720}";
     pub const SPEAKER: &str = "\u{E767}";
     pub const WARNING: &str = "\u{E7BA}";
-    pub const REFRESH: &str = "\u{E72C}";
     pub const MONITOR: &str = "\u{E7F4}";
-    pub const TEXT: &str = "\u{E8D2}";
     pub const CHEVRON_DOWN: &str = "\u{E70D}";
     pub const CHEVRON_UP: &str = "\u{E70E}";
     pub const FULL_SCREEN: &str = "\u{E740}";
@@ -55,9 +53,7 @@ pub mod icon {
     pub const MIC: &str = "\u{1F3A4}";
     pub const SPEAKER: &str = "\u{1F50A}";
     pub const WARNING: &str = "\u{26A0}";
-    pub const REFRESH: &str = "\u{1F504}";
     pub const MONITOR: &str = "\u{1F5B5}";
-    pub const TEXT: &str = "\u{1F5DB}";
     pub const CHEVRON_DOWN: &str = "\u{23F7}";
     pub const CHEVRON_UP: &str = "\u{23F6}";
     pub const FULL_SCREEN: &str = "\u{26F6}";
@@ -130,8 +126,10 @@ pub fn palette(ui: &egui::Ui) -> Palette {
     if ui.visuals().dark_mode { DARK } else { LIGHT }
 }
 
-pub fn palette_of(ctx: &egui::Context) -> Palette {
-    if ctx.theme() == Theme::Dark {
+/// The palette where there is no `Ui` to hand, as when painting over the
+/// whole window.
+pub fn palette_for(ctx: &egui::Context) -> Palette {
+    if ctx.theme() == egui::Theme::Dark {
         DARK
     } else {
         LIGHT

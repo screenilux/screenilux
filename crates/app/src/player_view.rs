@@ -2,25 +2,19 @@
 //! search the text in it. Full screen gives the picture the whole display,
 //! with the controls floating over it.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use eframe::egui;
 use screenilux_core::playback::{Area, Layout, arrange};
-use screenilux_core::text::{Hit, Page, TextIndex, WordRef};
 use screenilux_player::Player;
-use screenilux_player::open::{Opened, Origin, save_text};
-use screenilux_player::text::{INDEX_INTERVAL, Indexer, TextWorker};
+use screenilux_player::open::{Opened, Origin};
 
 use crate::sharing::{self, Asked, Link};
 use crate::theme::{self, ON_DARK, Palette, icon};
 
-/// Wait this long after the picture stops changing before reading its text,
-/// so scrubbing does not queue OCR for every frame passed over.
-const SETTLE: Duration = Duration::from_millis(200);
 const GAP: f32 = 16.0;
 /// Space between the window's edge and the content.
 const MARGIN: i8 = 24;
@@ -51,20 +45,7 @@ struct Loaded {
     textures: Vec<Option<(u64, egui::TextureHandle)>>,
 }
 
-/// Text read off a paused frame.
-struct PageAt {
-    serial: u64,
-    page: Result<Page, String>,
-}
-
 #[derive(Default)]
-struct Selection {
-    track: usize,
-    /// Drag start, in frame pixels.
-    anchor: (f32, f32),
-    words: Option<(WordRef, WordRef)>,
-}
-
 /// A click on the paused picture while the editor is showing: which screen
 /// it landed on, and where on that screen as a fraction of it. Knowing the
 /// screen is what lets an edit on a multi-screen recording say which picture
@@ -86,33 +67,20 @@ pub struct PlayerView {
     pinned: Option<usize>,
     /// The picture fills the display and the controls float over it.
     full: bool,
-    /// In full screen, the text panel is showing.
-    text_open: bool,
 
-    worker: Option<TextWorker>,
-    /// Per track: the serial a read was asked for.
-    requested: HashMap<usize, u64>,
-    pages: HashMap<usize, PageAt>,
-    last_change: Instant,
-    last_serials: Vec<u64>,
-    selection: Option<Selection>,
-
-    indexer: Option<Indexer>,
-    query: String,
-    hits: Vec<Hit>,
     /// Recordings in the save folder, read when first shown.
     recents: Option<Vec<Recent>>,
     /// The open recording's link, and whether it can be shared, as the app
     /// last said; and sharing it, if asked for.
     link: (Link, bool),
     asked: Option<Asked>,
-    /// A recording just made searchable, and its text, for the app to add
-    /// to the recording's link if it has one.
-    indexed: Option<(PathBuf, TextIndex)>,
     /// The editor is showing, so a plain click on the paused picture places
     /// an edit instead of clearing the text selection.
     editing: bool,
     placed: Option<Placed>,
+    /// Where the picture was drawn last frame, for anything that needs to
+    /// point at it.
+    stage: Option<egui::Rect>,
 }
 
 impl PlayerView {
@@ -124,22 +92,12 @@ impl PlayerView {
             layout: Layout::Auto,
             pinned: None,
             full: false,
-            text_open: false,
-            worker: None,
-            requested: HashMap::new(),
-            pages: HashMap::new(),
-            last_change: Instant::now(),
-            last_serials: Vec::new(),
-            selection: None,
-            indexer: None,
-            query: String::new(),
-            hits: Vec::new(),
             recents: None,
             link: (Link::None, false),
             asked: None,
-            indexed: None,
             editing: false,
             placed: None,
+            stage: None,
         }
     }
 
@@ -152,6 +110,11 @@ impl PlayerView {
 
     pub fn take_placed(&mut self) -> Option<Placed> {
         self.placed.take()
+    }
+
+    /// Where the picture is on screen, once there has been a frame to draw.
+    pub fn stage(&self) -> Option<egui::Rect> {
+        self.stage
     }
 
     /// The picture fills the display, with the controls floating over it.
@@ -222,9 +185,6 @@ impl PlayerView {
                 // Drop the previous player first so its threads let go of
                 // their files before new ones open.
                 self.loaded = None;
-                self.indexer = None;
-                self.reset_text();
-                self.hits.clear();
                 let repaint_ctx = ctx.clone();
                 let player = Player::start(
                     opened.recording.clone(),
@@ -241,28 +201,9 @@ impl PlayerView {
                     player,
                     textures: (0..n).map(|_| None).collect(),
                 });
-                if !self.query.is_empty() {
-                    self.run_search();
-                }
             }
             Err(e) => self.status = Some(format!("Could not open it: {e}")),
         }
-    }
-
-    fn reset_text(&mut self) {
-        self.requested.clear();
-        self.pages.clear();
-        self.selection = None;
-        self.last_serials.clear();
-    }
-
-    fn run_search(&mut self) {
-        self.hits = self
-            .loaded
-            .as_ref()
-            .and_then(|l| l.opened.text.as_ref())
-            .map(|idx| idx.search(&self.query))
-            .unwrap_or_default();
     }
 
     /// The file of the open recording, if it is one that can be shared: a
@@ -279,11 +220,6 @@ impl PlayerView {
         self.link = (link, can_share);
     }
 
-    /// A recording made searchable since last time, and its text.
-    pub fn take_indexed(&mut self) -> Option<(PathBuf, TextIndex)> {
-        self.indexed.take()
-    }
-
     /// Sharing the open recording, if it was asked for since last time.
     pub fn take_asked(&mut self) -> Option<Asked> {
         self.asked.take()
@@ -291,7 +227,6 @@ impl PlayerView {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, out_dir: &Path) {
         self.finish_opening(ctx);
-        self.poll_indexer();
         let p = theme::palette(ui);
 
         if self.loaded.is_none() {
@@ -321,33 +256,6 @@ impl PlayerView {
             self.full_screen(ui, ctx);
             self.handle_keys(ctx);
             return;
-        }
-
-        // The editor hosts the side panel while it is showing, so that the
-        // text and the moments share one set of tabs instead of fighting
-        // for the same edge.
-        if !self.editing {
-            egui::Panel::right("play-text")
-                .exact_size(PANEL + MARGIN as f32)
-                .resizable(false)
-                .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
-                    left: 0,
-                    right: MARGIN,
-                    top: 0,
-                    bottom: MARGIN,
-                }))
-                .show_separator_line(false)
-                .show(ui, |ui| {
-                    egui::Frame::new()
-                        .stroke(egui::Stroke::new(1.0, p.stroke))
-                        .corner_radius(20)
-                        .inner_margin(20)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.set_height(ui.available_height());
-                            self.text_panel(ui);
-                        });
-                });
         }
 
         egui::CentralPanel::default_margins()
@@ -384,7 +292,6 @@ impl PlayerView {
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
                 self.controls_row(&mut controls_ui, ctx);
-                self.copy_row(ui);
             });
 
         self.handle_keys(ctx);
@@ -432,232 +339,6 @@ impl PlayerView {
                 }
             });
         });
-    }
-
-    /// Under the video: what to do while paused, and the copy buttons.
-    fn copy_row(&mut self, ui: &mut egui::Ui) {
-        let Some(loaded) = &self.loaded else { return };
-        let playing = loaded.player.clock().is_playing();
-        let sound_error = loaded.player.sound_error();
-        let any_text = !playing && !self.visible_text().is_empty();
-        let any_sel = !playing && self.selected_text().is_some();
-        let mut copy_all = false;
-        let mut copy_sel = false;
-        ui.horizontal(|ui| {
-            match sound_error {
-                Some(e) => theme::notice(ui, format!("No sound: {e}")),
-                None if playing => {
-                    theme::hint(ui, "Click the picture to pause it and select text.")
-                }
-                None => theme::hint(
-                    ui,
-                    "Paused. Drag across text in the picture to select it. Space plays, F fills \
-                     the screen.",
-                ),
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(any_text, theme::outline("Copy all text"))
-                    .on_hover_text("Copy all the text on screen")
-                    .clicked()
-                {
-                    copy_all = true;
-                }
-                if ui
-                    .add_enabled(any_sel, theme::outline("Copy selection"))
-                    .on_hover_text("Ctrl+C")
-                    .clicked()
-                {
-                    copy_sel = true;
-                }
-            });
-        });
-        if copy_all {
-            ui.ctx().copy_text(self.visible_text());
-        }
-        if copy_sel && let Some(t) = self.selected_text() {
-            ui.ctx().copy_text(t);
-        }
-    }
-
-    /// The text panel: make the recording searchable, then search it and
-    /// jump to what was found.
-    /// The text read off the screen: search it, select it, copy it. Public
-    /// because the Edit tab hosts it as one tab of its side panel rather
-    /// than letting the player put up a panel of its own.
-    pub fn text_panel(&mut self, ui: &mut egui::Ui) {
-        let p = theme::palette(ui);
-        let Some(loaded) = &self.loaded else { return };
-        let indexed = loaded.opened.text.is_some();
-        let recording = loaded.opened.recording.clone();
-
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Text on screen").font(egui::FontId::new(16.0, theme::bold())),
-            );
-            if indexed {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new("Read every 2 seconds")
-                            .size(12.0)
-                            .color(p.weak),
-                    );
-                });
-            }
-        });
-        ui.add_space(4.0);
-
-        if let Some(ix) = &self.indexer {
-            ui.add(
-                egui::ProgressBar::new(ix.progress())
-                    .desired_width(ui.available_width())
-                    .corner_radius(6)
-                    .fill(p.action)
-                    .text(format!("Reading the text, {:.0}%", ix.progress() * 100.0)),
-            );
-            if ui.add(theme::outline("Stop reading")).clicked() {
-                self.indexer = None;
-            }
-            return;
-        }
-        if !indexed {
-            theme::hint(
-                ui,
-                "Read the text on every screen every two seconds, so you can search the \
-                 recording for any word that was on screen. It is saved with the recording.",
-            );
-            ui.add_space(4.0);
-            if ui
-                .add(theme::outline(format!(
-                    "{}  Make text searchable",
-                    icon::TEXT
-                )))
-                .clicked()
-            {
-                let repaint = ui.ctx().clone();
-                self.indexer = Some(Indexer::start(
-                    recording,
-                    INDEX_INTERVAL,
-                    Arc::new(move || repaint.request_repaint()),
-                ));
-            }
-            return;
-        }
-
-        // The search field: a pill on the surface with its icon inside.
-        let field = egui::Frame::new()
-            .fill(p.surface)
-            .corner_radius(22)
-            .inner_margin(egui::Margin::symmetric(14, 10))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(icon::SEARCH).color(p.weak));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.query)
-                            .hint_text("Find a word you saw")
-                            .frame(egui::Frame::NONE)
-                            .desired_width(f32::INFINITY),
-                    )
-                })
-                .inner
-            });
-        let response = field.inner;
-        if response.changed() {
-            self.run_search();
-        }
-        // Ctrl+F, as everywhere else.
-        if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
-            response.request_focus();
-        }
-
-        let note = match (self.query.trim().is_empty(), self.hits.len()) {
-            (true, _) => "Type a word to find every place it was on screen.".to_string(),
-            (false, 0) => format!(
-                "Nothing matching \u{201c}{}\u{201d} was on screen. Try a shorter word, or pause \
-                 on it to select it directly.",
-                self.query.trim()
-            ),
-            (false, 1) => "1 place. Choose it to jump there.".to_string(),
-            (false, n) => format!("{n} places. Choose one to jump there."),
-        };
-        theme::hint(ui, &note);
-
-        let mut jump = None;
-        let mut again = false;
-        let query = self.query.trim().to_lowercase();
-        egui::ScrollArea::vertical()
-            .id_salt("hits")
-            .auto_shrink([false; 2])
-            .max_height(ui.available_height() - 40.0)
-            .show(ui, |ui| {
-                let Some(loaded) = &self.loaded else { return };
-                let tracks = &loaded.opened.recording.tracks;
-                for (i, hit) in self.hits.iter().enumerate() {
-                    let track = tracks.iter().position(|t| t.id == hit.screen);
-                    let screen = track
-                        .map(|t| tracks[t].label.as_str())
-                        .unwrap_or(hit.screen.as_str());
-                    let colour = track.map(|t| track_colour(&p, t)).unwrap_or(p.weak);
-                    if hit_row(ui, hit, screen, colour, &query, tracks.len() > 1, &p).clicked() {
-                        jump = Some(i);
-                    }
-                }
-            });
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new(format!("{}  Read the text again", icon::REFRESH))
-                            .size(12.0)
-                            .color(p.weak),
-                    )
-                    .frame(false),
-                )
-                .clicked()
-            {
-                again = true;
-            }
-        });
-        if again && let Some(l) = &self.loaded {
-            let repaint = ui.ctx().clone();
-            self.indexer = Some(Indexer::start(
-                l.opened.recording.clone(),
-                INDEX_INTERVAL,
-                Arc::new(move || repaint.request_repaint()),
-            ));
-        }
-        if let Some(i) = jump {
-            self.jump_to(i);
-        }
-    }
-
-    fn poll_indexer(&mut self) {
-        let Some(ix) = &self.indexer else { return };
-        let Some(result) = ix.finished() else { return };
-        self.indexer = None;
-        let Some(loaded) = &mut self.loaded else {
-            return;
-        };
-        match result {
-            Ok(index) => {
-                let words: usize = index.entries.iter().map(|e| e.page.words().count()).sum();
-                self.status = match save_text(&loaded.opened.origin, &index) {
-                    Ok(_) => None,
-                    Err(e) => Some(format!("Text was read but could not be saved: {e}")),
-                };
-                if let Origin::Package(path) | Origin::Video(path) = &loaded.opened.origin
-                    && words > 0
-                {
-                    self.indexed = Some((path.clone(), index.clone()));
-                }
-                if words == 0 {
-                    self.status = Some("No text was found in this recording.".into());
-                }
-                loaded.opened.text = Some(index);
-                self.run_search();
-            }
-            Err(e) => self.status = Some(format!("Could not read the text: {e}")),
-        }
     }
 
     /// The Recordings tab, in the main window: opening a file, and the
@@ -796,14 +477,7 @@ impl PlayerView {
         self.loaded = None;
         self.opening = None;
         self.full = false;
-        self.text_open = false;
         self.pinned = None;
-        self.worker = None;
-        self.requested.clear();
-        self.pages.clear();
-        self.selection = None;
-        self.query.clear();
-        self.hits.clear();
     }
 
     /// Forget the list of recent recordings, so it is read again next time.
@@ -832,6 +506,7 @@ impl PlayerView {
 
     fn video(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, size: egui::Vec2) {
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+        self.stage = Some(rect);
         let painter = ui.painter_at(rect);
         let pal = theme::palette(ui);
 
@@ -910,12 +585,6 @@ impl PlayerView {
         }
 
         let paused = !loaded.player.clock().is_playing();
-        if paused {
-            self.request_text(&placements, ctx);
-            self.draw_text(&painter, &placements, &response, ctx);
-        } else {
-            self.reset_text();
-        }
 
         if response.double_clicked() {
             let to = !self.full;
@@ -942,196 +611,6 @@ impl PlayerView {
         }
     }
 
-    /// Once the paused picture has settled, ask for the text on each visible
-    /// screen that has not been read yet.
-    fn request_text(
-        &mut self,
-        placements: &[screenilux_core::playback::Placement],
-        ctx: &egui::Context,
-    ) {
-        let Some(loaded) = &self.loaded else { return };
-        let serials: Vec<u64> = (0..loaded.opened.recording.tracks.len())
-            .map(|i| loaded.player.feed(i).map(|f| f.serial()).unwrap_or(0))
-            .collect();
-        if serials != self.last_serials {
-            self.last_serials = serials.clone();
-            self.last_change = Instant::now();
-            // The picture moved on: old text and selections no longer apply.
-            self.pages.retain(|t, p| serials.get(*t) == Some(&p.serial));
-            if self
-                .selection
-                .as_ref()
-                .is_some_and(|s| !self.pages.contains_key(&s.track))
-            {
-                self.selection = None;
-            }
-            return;
-        }
-        if self.last_change.elapsed() < SETTLE {
-            return;
-        }
-        let worker = self.worker.get_or_insert_with(|| {
-            let ctx = ctx.clone();
-            TextWorker::start(Arc::new(move || ctx.request_repaint()))
-        });
-        for p in placements {
-            let serial = serials[p.track];
-            if self.requested.get(&p.track) == Some(&serial) {
-                continue;
-            }
-            if let Some(frame) = loaded.player.feed(p.track).and_then(|f| f.frame()) {
-                worker.read(p.track, frame);
-                self.requested.insert(p.track, serial);
-            }
-        }
-        for r in worker.results() {
-            let serial = serials.get(r.track).copied().unwrap_or(0);
-            if self.requested.get(&r.track) == Some(&serial) {
-                self.pages.insert(
-                    r.track,
-                    PageAt {
-                        serial,
-                        page: r.page,
-                    },
-                );
-            }
-        }
-    }
-
-    /// Word boxes over the paused picture, drag-to-select, and copy.
-    fn draw_text(
-        &mut self,
-        painter: &egui::Painter,
-        placements: &[screenilux_core::playback::Placement],
-        response: &egui::Response,
-        ctx: &egui::Context,
-    ) {
-        let Some(loaded) = &self.loaded else { return };
-        let to_screen = |track: usize, area: Area| {
-            let t = &loaded.opened.recording.tracks[track];
-            let r = to_rect(area);
-            let (sx, sy) = (r.width() / t.width as f32, r.height() / t.height as f32);
-            move |x: f32, y: f32| r.min + egui::vec2(x * sx, y * sy)
-        };
-        let to_frame = |track: usize, area: Area, pos: egui::Pos2| {
-            let t = &loaded.opened.recording.tracks[track];
-            let r = to_rect(area);
-            (
-                (pos.x - r.min.x) * t.width as f32 / r.width(),
-                (pos.y - r.min.y) * t.height as f32 / r.height(),
-            )
-        };
-
-        // Drag handling: start on a screen that has text, extend while held.
-        if let Some(pos) = response.interact_pointer_pos() {
-            if response.drag_started() || response.clicked() {
-                // egui reports a drag only once the pointer has moved, so
-                // anchor where the button went down, not where it is now.
-                let origin = ctx.input(|i| i.pointer.press_origin()).unwrap_or(pos);
-                self.selection = placements
-                    .iter()
-                    .find(|p| to_rect(p.area).contains(origin))
-                    .filter(|p| {
-                        matches!(self.pages.get(&p.track), Some(PageAt { page: Ok(_), .. }))
-                    })
-                    .map(|p| Selection {
-                        track: p.track,
-                        anchor: to_frame(p.track, p.area, origin),
-                        words: None,
-                    });
-            }
-            if let Some(sel) = &mut self.selection
-                && let Some(p) = placements.iter().find(|p| p.track == sel.track)
-                && let Some(PageAt { page: Ok(page), .. }) = self.pages.get(&sel.track)
-            {
-                sel.words = page.select(sel.anchor, to_frame(p.track, p.area, pos));
-            }
-        }
-
-        let pal = theme::palette_of(ctx);
-        let select = pal.soft.gamma_multiply(0.45);
-        let mut reading = false;
-        for p in placements {
-            let Some(at) = self.pages.get(&p.track) else {
-                reading = true;
-                continue;
-            };
-            let Ok(page) = &at.page else { continue };
-            let map = to_screen(p.track, p.area);
-            let selected = self
-                .selection
-                .as_ref()
-                .filter(|s| s.track == p.track)
-                .and_then(|s| s.words);
-            for (r, w) in page.words() {
-                let rect =
-                    egui::Rect::from_min_max(map(w.x, w.y), map(w.x + w.w, w.y + w.h)).expand(1.5);
-                if selected.is_some_and(|sel| Page::is_selected(r, sel)) {
-                    painter.rect_filled(rect, 2.0, select);
-                } else {
-                    painter.rect_stroke(
-                        rect,
-                        2.0,
-                        egui::Stroke::new(1.0, pal.soft.gamma_multiply(0.5)),
-                        egui::StrokeKind::Outside,
-                    );
-                }
-            }
-        }
-        if reading && !placements.is_empty() {
-            let r = to_rect(placements[0].area);
-            chip(
-                painter,
-                r.right_top() + egui::vec2(-120.0, 8.0),
-                "Reading text…",
-                &pal,
-            );
-        }
-
-        // The text cursor only over a screen whose text can be selected, and
-        // only when the picture itself is under the pointer, not a button or
-        // panel drawn over or beside it.
-        let over_text = response.hover_pos().is_some_and(|pos| {
-            placements.iter().any(|p| {
-                to_rect(p.area).contains(pos)
-                    && matches!(
-                        self.pages.get(&p.track),
-                        Some(PageAt { page: Ok(page), .. }) if !page.is_empty()
-                    )
-            })
-        });
-        if over_text {
-            ctx.set_cursor_icon(egui::CursorIcon::Text);
-        }
-
-        // Ctrl+C arrives as a Copy event, not a key press.
-        let copy = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
-        if copy && let Some(text) = self.selected_text() {
-            ctx.copy_text(text);
-        }
-    }
-
-    fn selected_text(&self) -> Option<String> {
-        let sel = self.selection.as_ref()?;
-        let words = sel.words?;
-        match &self.pages.get(&sel.track)?.page {
-            Ok(page) => Some(page.selected_text(words)).filter(|s| !s.is_empty()),
-            Err(_) => None,
-        }
-    }
-
-    /// All text on the visible screens, in display order.
-    fn visible_text(&self) -> String {
-        let mut tracks: Vec<&usize> = self.pages.keys().collect();
-        tracks.sort();
-        tracks
-            .into_iter()
-            .filter_map(|t| self.pages[t].page.as_ref().ok().map(Page::text))
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    }
-
     /// The transport: play, the position, the timeline with the screens
     /// beneath it, and full screen.
     fn controls_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1154,7 +633,7 @@ impl PlayerView {
             .iter()
             .map(|t| t.label.clone())
             .collect();
-        let marks: Vec<f64> = self.hits.iter().map(|h| h.t).collect();
+        let marks: Vec<f64> = Vec::new();
 
         let mut toggle = false;
         let mut fill = false;
@@ -1248,7 +727,6 @@ impl PlayerView {
             return;
         }
         self.full = full;
-        self.text_open = false;
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(full));
     }
 
@@ -1266,7 +744,7 @@ impl PlayerView {
         let screen = ctx.content_rect();
         let playing = self.is_playing();
         let idle = ctx.input(|i| i.pointer.time_since_last_movement()) > IDLE;
-        if playing && idle && !self.text_open {
+        if playing && idle {
             ctx.set_cursor_icon(egui::CursorIcon::None);
             return;
         }
@@ -1306,39 +784,6 @@ impl PlayerView {
                 });
         }
 
-        // The text panel's switch, top right.
-        egui::Area::new(egui::Id::unique("full-text-button"))
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-24.0, 24.0))
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                let label = format!("{}  Text on screen", icon::SEARCH);
-                let button = theme::outline(label)
-                    .fill(if self.text_open {
-                        p.surface
-                    } else {
-                        p.base.gamma_multiply(0.9)
-                    })
-                    .selected(self.text_open);
-                if ui.add(button).clicked() {
-                    self.text_open = !self.text_open;
-                }
-            });
-
-        if self.text_open {
-            let top = screen.top() + 92.0;
-            let height = (screen.height() - 92.0 - 120.0).max(200.0);
-            egui::Area::new(egui::Id::unique("full-text"))
-                .fixed_pos(egui::pos2(screen.right() - 24.0 - PANEL, top))
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    floating(&p).inner_margin(20).show(ui, |ui| {
-                        ui.set_width(PANEL - 40.0);
-                        ui.set_height(height - 40.0);
-                        self.text_panel(ui);
-                    });
-                });
-        }
-
         // The controls, along the bottom.
         egui::Area::new(egui::Id::unique("full-controls"))
             .fixed_pos(egui::pos2(
@@ -1366,21 +811,6 @@ impl PlayerView {
             }
             l.player.clock().toggle();
         }
-    }
-
-    /// Pause on a search hit, showing the screen it was found on.
-    fn jump_to(&mut self, hit: usize) {
-        let Some(loaded) = &self.loaded else { return };
-        let Some(h) = self.hits.get(hit) else { return };
-        let clock = loaded.player.clock();
-        clock.pause();
-        clock.seek(h.t);
-        self.pinned = loaded
-            .opened
-            .recording
-            .tracks
-            .iter()
-            .position(|t| t.id == h.screen);
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -1563,87 +993,6 @@ fn layout_icons(ui: &mut egui::Ui, current: Layout) -> Option<Layout> {
         }
     }
     picked
-}
-
-/// One search result: a time chip, the line with the match picked out, and
-/// the screen it was on.
-fn hit_row(
-    ui: &mut egui::Ui,
-    hit: &Hit,
-    screen: &str,
-    colour: egui::Color32,
-    query: &str,
-    multi: bool,
-    p: &Palette,
-) -> egui::Response {
-    let width = ui.available_width();
-    let mut job = egui::text::LayoutJob::default();
-    let normal = egui::TextFormat {
-        font_id: egui::FontId::proportional(14.0),
-        color: p.text,
-        ..Default::default()
-    };
-    let found = egui::TextFormat {
-        background: p.stroke,
-        ..normal.clone()
-    };
-    let lower = hit.snippet.to_lowercase();
-    match lower
-        .find(query)
-        .filter(|_| lower.len() == hit.snippet.len())
-    {
-        Some(at) if !query.is_empty() => {
-            job.append(&hit.snippet[..at], 0.0, normal.clone());
-            job.append(&hit.snippet[at..at + query.len()], 0.0, found);
-            job.append(&hit.snippet[at + query.len()..], 0.0, normal);
-        }
-        _ => job.append(&hit.snippet, 0.0, normal),
-    }
-    let text_width = width - 20.0 - 72.0;
-    job.wrap.max_width = text_width;
-
-    let inner = egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(10, 10))
-        .corner_radius(8)
-        .show(ui, |ui| {
-            ui.set_width(width - 20.0);
-            ui.horizontal_top(|ui| {
-                let chip = ui.painter().layout_no_wrap(
-                    clock_text(hit.t),
-                    egui::FontId::new(12.0, theme::strong()),
-                    p.text,
-                );
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(62.0, 22.0), egui::Sense::hover());
-                ui.painter().rect_filled(rect, 11.0, p.surface);
-                ui.painter()
-                    .circle_filled(rect.left_center() + egui::vec2(10.0, 0.0), 3.0, colour);
-                ui.painter().galley(
-                    egui::pos2(rect.left() + 18.0, rect.center().y - chip.size().y / 2.0),
-                    chip,
-                    p.text,
-                );
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.set_width(text_width);
-                    ui.label(job);
-                    if multi {
-                        ui.label(egui::RichText::new(screen).size(12.0).color(p.weak));
-                    }
-                });
-            });
-        });
-    let response = ui.interact(
-        inner.response.rect,
-        ui.scope_id().with(("hit", hit.entry, hit.screen.as_str())),
-        egui::Sense::click(),
-    );
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(inner.response.rect, 8.0, p.text.gamma_multiply(0.05));
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response
 }
 
 /// A small dark label over the picture, readable on any content.

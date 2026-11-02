@@ -13,6 +13,7 @@ mod sharing;
 mod sizing;
 mod state;
 mod theme;
+mod tour;
 
 use eframe::egui;
 
