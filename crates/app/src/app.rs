@@ -940,6 +940,9 @@ impl App {
                 if let (Some(Asked::Share), Some(path)) = (self.player.take_asked(), open) {
                     self.share(&path);
                 }
+                if let Some((path, index)) = self.player.take_indexed() {
+                    self.shares.add_text(&path, index, &self.sharing.bucket);
+                }
             },
         );
         if closed {

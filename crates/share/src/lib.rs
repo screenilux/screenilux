@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 pub use contents::{Contents, Item};
 use seal::Sealer;
 pub use seal::{ShareKey, open, sealed_len};
+pub use store::Rights;
 use store::{Hosted, Own, Store};
 
 /// Where the web player lives. Links point here.
@@ -135,6 +136,9 @@ pub struct Progress {
     pub state: State,
     /// When the link stops working, if it does.
     pub expires: Option<SystemTime>,
+    /// The right to add files to the share later, such as its text once it
+    /// has been read: keep it with the link.
+    pub rights: Option<Rights>,
 }
 
 /// An upload running on its own thread.
@@ -151,6 +155,7 @@ impl Upload {
             total: contents.total(),
             state: State::Starting,
             expires: None,
+            rights: None,
         }));
         let shared = Arc::clone(&progress);
         let thread = std::thread::Builder::new()
@@ -208,6 +213,7 @@ fn run(
         let mut p = lock(progress);
         p.link = Some(link);
         p.state = State::Uploading;
+        p.rights = Some(store.rights());
     }
 
     let mut uploaded = 0u64;
@@ -321,6 +327,38 @@ fn fill(reader: &mut impl Read, buf: &mut [u8]) -> Result<usize, ShareError> {
         }
     }
     Ok(n)
+}
+
+/// Add a recording's text index to a share that already exists, so its link
+/// can search and copy text too. `bucket` is needed for a share in the
+/// user's own bucket, and is the bucket settings as they are now.
+pub fn add_text(
+    rights: &Rights,
+    bucket: Option<&Bucket>,
+    link: &str,
+    index_json: &[u8],
+) -> Result<(), ShareError> {
+    let key = link
+        .split_once("#")
+        .and_then(|(_, fragment)| {
+            url::form_urlencoded::parse(fragment.as_bytes()).find(|(k, _)| k == "k")
+        })
+        .and_then(|(_, v)| ShareKey::from_link(&v))
+        .ok_or_else(|| ShareError::Read("the link has no key".into()))?;
+    let sealed = seal::seal(&key, index_json)?;
+    let agent = ureq::Agent::new_with_defaults();
+    let store: Box<dyn Store> = match rights {
+        Rights::Screenilux { recording, token } => {
+            Box::new(Hosted::resume(agent, recording, token))
+        }
+        Rights::Bucket { prefix } => {
+            let bucket = bucket.ok_or_else(|| {
+                ShareError::Bucket("sharing to your own bucket is not set up".into())
+            })?;
+            Box::new(Own::resume(agent, bucket, prefix)?)
+        }
+    };
+    store.put(screenilux_core::text::TEXT_INDEX_NAME, &sealed, &mut |_| {})
 }
 
 /// A new id for this computer on the Screenilux storage, made once and kept.

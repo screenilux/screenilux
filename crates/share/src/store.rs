@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use rusty_s3::{Bucket as S3Bucket, Credentials, S3Action, UrlStyle};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{Bucket, PLAYER, ShareError};
@@ -46,7 +46,20 @@ impl std::io::Read for Counted<'_, '_> {
     }
 }
 
+/// What it takes to add to a share after it was made: kept with its link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Rights {
+    /// The recording's address on the Screenilux storage and its upload
+    /// token, which works for that recording only.
+    Screenilux { recording: String, token: String },
+    /// Where its files are in the user's own bucket.
+    Bucket { prefix: String },
+}
+
 pub(crate) trait Store: Send {
+    /// What it takes to add to this share later.
+    fn rights(&self) -> Rights;
     fn put(&self, name: &str, body: &[u8], sent: Sent<'_>) -> Result<(), ShareError>;
     /// Start a file that goes up in parts; returns the upload's id.
     fn start_parts(&self, name: &str) -> Result<String, ShareError>;
@@ -71,6 +84,7 @@ pub(crate) trait Store: Send {
 pub(crate) struct Hosted {
     agent: ureq::Agent,
     auth: String,
+    token: String,
     /// `<server>/api/recordings/<id>`
     recording: String,
 }
@@ -135,20 +149,32 @@ impl Hosted {
                 "the storage allowed less than this recording needs".into(),
             ));
         }
-        let auth = format!("Bearer {}", created.token);
         let recording = format!("{server}/api/recordings/{}", created.id);
         Ok((
-            Self {
-                agent,
-                auth,
-                recording,
-            },
+            Self::resume(agent, &recording, &created.token),
             created.link,
         ))
+    }
+
+    /// A recording already on the storage, to add to it.
+    pub fn resume(agent: ureq::Agent, recording: &str, token: &str) -> Self {
+        Self {
+            agent,
+            auth: format!("Bearer {token}"),
+            token: token.to_string(),
+            recording: recording.to_string(),
+        }
     }
 }
 
 impl Store for Hosted {
+    fn rights(&self) -> Rights {
+        Rights::Screenilux {
+            recording: self.recording.clone(),
+            token: self.token.clone(),
+        }
+    }
+
     fn put(&self, name: &str, body: &[u8], sent: Sent<'_>) -> Result<(), ShareError> {
         let request = self
             .agent
@@ -291,12 +317,25 @@ impl Own {
         ))
     }
 
+    /// A share already in the bucket at `prefix`, to add to it.
+    pub fn resume(agent: ureq::Agent, settings: &Bucket, prefix: &str) -> Result<Self, ShareError> {
+        let (mut own, _) = Self::create(agent, settings, "resume", "")?;
+        own.prefix = prefix.to_string();
+        Ok(own)
+    }
+
     fn key(&self, name: &str) -> String {
         format!("{}{name}", self.prefix)
     }
 }
 
 impl Store for Own {
+    fn rights(&self) -> Rights {
+        Rights::Bucket {
+            prefix: self.prefix.clone(),
+        }
+    }
+
     fn put(&self, name: &str, body: &[u8], sent: Sent<'_>) -> Result<(), ShareError> {
         let key = self.key(name);
         let mut action = self.bucket.put_object(Some(&self.credentials), &key);

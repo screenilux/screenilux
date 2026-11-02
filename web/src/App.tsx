@@ -294,9 +294,22 @@ function Home() {
   return (
     <Notice title="Screenilux">
       <span className="block">
-        Record every screen at once, play them back together, and copy any text you saw. Links to recordings shared
-        from the Screenilux app open here.
+        The screen recorder for people who work across more than one screen.
       </span>
+      <ul className="mt-4 space-y-1 text-left text-sm">
+        <li>
+          <strong className="text-ink">Every screen, in sync.</strong> All your monitors, recorded at once and played
+          back together.
+        </li>
+        <li>
+          <strong className="text-ink">Copy any text you saw.</strong> Select it on a paused frame, or search for it.
+        </li>
+        <li>
+          <strong className="text-ink">Links only your recipients can watch.</strong> Encrypted before they leave the
+          computer.
+        </li>
+      </ul>
+      <span className="mt-4 block text-sm">Links to recordings shared from the Screenilux app open here.</span>
       <a
         href="https://github.com/screenilux/screenilux"
         className="mt-6 inline-flex h-10 items-center rounded-full bg-mist px-5 font-semibold text-ink hover:bg-soft/50"

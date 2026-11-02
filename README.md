@@ -16,7 +16,7 @@
   <a href="https://github.com/screenilux/screenilux/releases/latest"><img src="https://img.shields.io/badge/download-latest-04736f" alt="Download the latest release"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-012625" alt="Windows and Linux">
   <a href="LICENSE"><img src="https://img.shields.io/badge/licence-GPL--3.0-069a95" alt="Licence: GPL-3.0"></a>
-  <img src="https://img.shields.io/badge/free-no%20account%2C%20no%20limits-07beb8" alt="Free, with no account and no limits">
+  <img src="https://img.shields.io/badge/links-end--to--end%20encrypted-07beb8" alt="Share links are end-to-end encrypted">
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/made%20with-Rust-dea584?logo=rust&amp;logoColor=white" alt="Made with Rust"></a>
 </p>
 
@@ -30,17 +30,24 @@
 
 ---
 
-Screenilux is a free screen recorder and player for Windows and Linux, made
-for work that spreads across more than one screen.
+Screenilux is the screen recorder for people who work across more than one
+screen.
 
-It records **all your screens at the same time**, each as its own sharp video,
-and plays them back **in step**, so you can watch the work move from monitor
-to monitor exactly as it happened. Pause anywhere and the **text on screen
-becomes something you can select and copy**. Make a recording searchable and
-jump straight to the moment a word appeared.
+- **Every screen, in sync.** It records all your monitors at the same time,
+  each as its own sharp video, and plays them back in step, following your
+  pointer from screen to screen. Other recorders capture one screen, or
+  squeeze several into one wide, blurry video.
+- **Copy any text you saw.** Pause anywhere and the text on screen, such as
+  code, commands, error messages or numbers, becomes something you can
+  select and copy. Search a recording for a word and jump to where it
+  appeared.
+- **Links only your recipients can watch.** Share a recording and it is
+  encrypted on your computer first. The key is in the link, so neither
+  Screenilux nor whoever stores it can watch, and the people you send it to
+  can still play every screen and search and copy the text.
 
-Everything stays **on your computer**: no account, no upload, no time limit,
-no watermark.
+It is free and open source for Windows and Linux, with no account and no
+limits on length.
 
 <p align="center">
   <img src="docs/play.png" alt="A two-screen recording playing side by side, with a search for a word on the right" width="900">
@@ -52,7 +59,8 @@ no watermark.
 |---|---|
 | **Every screen, in sync** | Most recorders capture one screen, or squeeze several into one wide, blurry video. Screenilux records each screen at its full size and keeps them in step, so playback can follow the pointer from one to the next. |
 | **Text you can copy and search** | Code, commands, error messages, numbers: pause and drag across them to copy, or search the whole recording for a word. It reads the screen on your computer, offline. |
-| **Yours, on your computer** | No sign-up, no cloud, no limits on length or number of recordings. Files are standard MP4s you can keep, move and open anywhere. |
+| **Private links** | Shared recordings are encrypted before they leave your computer, with the key in the link. Only the people you send it to can watch. |
+| **Yours, on your computer** | No sign-up and no limits on length or number of recordings. Files are standard MP4s you can keep, move and open anywhere. |
 | **Stays out of the picture** | While you record, the window shrinks to a small bar that never shows up in the video (on Windows). |
 
 ## Recording
@@ -77,8 +85,8 @@ no watermark.
 
 ## Playing
 
-- **Every screen plays together:** one at a time following the pointer, side
-  by side, or stacked.
+- **Every screen plays together,** in a window of its own: one at a time
+  following the pointer, side by side, or stacked.
 - **Copy text straight from the video.** Pause, then drag across any words to
   select and copy them.
 - **Search inside recordings.** Choose *Make text searchable*, then search for
@@ -87,7 +95,7 @@ no watermark.
   the screen and the controls float over it, out of the way while it plays.
   `Esc` brings the window back.
 - **Open recordings your way:** double-click one, drop it on the window, or
-  use *Open recording*.
+  pick one under **Recordings**.
 
 <p align="center">
   <img src="docs/full-screen.png" alt="Full screen, with the controls floating over a two-screen recording" width="900">
@@ -95,10 +103,12 @@ no watermark.
 
 ## Sharing a link
 
-Turn on **Share a link when you stop** under **More options**. When you stop
-recording, Screenilux uploads the recording and copies a link to it. Anyone
-can open the link in a browser and watch every screen play in step, with no
-account and nothing to install.
+Turn on **Share a link when you stop** in **Settings** (the gear). When you
+stop recording, Screenilux uploads the recording and copies a link to it.
+Anyone you send it to can open it in a browser and watch every screen play in
+step, with no account and nothing to install. If the recording has been made
+searchable, they can search it and copy its text too; making it searchable
+after sharing adds the text to the same link.
 
 You can send the link straight away. Until the upload finishes, the page
 shows how far along it is, then starts playing by itself.
@@ -117,31 +127,32 @@ Choose where recordings go:
   [Setting up your own storage](docs/own-storage.md) takes about five minutes.
 
 Recordings still open only in the Screenilux app on your computer; the
-browser page is for the people you send the link to.
+browser page is for the people you send the link to. In Settings you can
+also choose not to keep a copy on your computer once a recording is
+uploaded.
 
 ## How it compares
 
-Tools like Loom are built for sending a quick video as a link. Screenilux is
-built for recording everything you are working on, on your own computer, and
-getting the most out of it afterwards.
+Tools like Loom are built for sending a quick talking-head video to a
+colleague. Screenilux is built for the work itself: everything across your
+screens, readable and searchable afterwards, and private when shared.
 
 | | Screenilux | Loom |
 |---|---|---|
-| Several screens at once | Yes, played back together in step | No, one screen per recording |
-| Length of a recording | No limit | 5 minutes on the free plan |
-| Number of recordings | No limit | 25 per person on the free plan |
+| Several screens at once | Yes, played back together in step | One screen per recording |
+| Text on screen | Copy it from a paused frame, search a recording for it | Not readable; transcripts cover what was said |
+| Shared links | Encrypted on your computer; only people with the link can watch | Kept on Loom's servers, protected by link settings and passwords |
+| Where recordings are kept | On your computer, and in your own storage if you like | On Loom's servers |
+| Length and number | No limits | 5 minutes and 25 recordings on the free plan |
 | Account | None | Required |
-| Share a link | Yes, from Screenilux or your own storage | Yes |
-| Where recordings are kept | On your computer. Shared ones also in your own storage, or on Screenilux for 7 days | On Loom's servers |
 | Price | Free and open source | Free plan with limits, or a monthly fee per person |
 
-Screenilux also reads the text on screen, on your computer and without
-internet, so you can copy it from a paused video or search a recording for a
-word.
+Screenilux does not try to be a video messaging service. Comments,
+reactions, view analytics and AI summaries are what Loom and similar tools
+do well, and are not on its list. What is on it: more of the three things
+above, on more computers.
 
-Loom is ahead in comments, reactions, editing, and apps for Mac and phones.
-
-<sub>Loom's limits are from its help pages and plan listings in November 2026.</sub>
+<sub>Loom's details are from its help pages and plan listings in November 2026.</sub>
 
 ## Download
 
