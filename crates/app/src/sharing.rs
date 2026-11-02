@@ -323,6 +323,8 @@ impl Shares {
 /// What the person asked of a link.
 pub enum Asked {
     Share,
+    /// Write the recording out as a GIF.
+    Export,
 }
 
 /// How long "Copied" shows after copying.

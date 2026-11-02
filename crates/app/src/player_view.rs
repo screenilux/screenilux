@@ -45,7 +45,18 @@ struct Loaded {
     textures: Vec<Option<(u64, egui::TextureHandle)>>,
 }
 
-#[derive(Default)]
+/// How writing a GIF is going.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Exporting {
+    #[default]
+    Idle,
+    /// Under way, with how much of it is done.
+    Busy(f32),
+    /// Finished, with something short to say about it.
+    Done(String),
+    Failed(String),
+}
+
 /// A click on the paused picture while the editor is showing: which screen
 /// it landed on, and where on that screen as a fraction of it. Knowing the
 /// screen is what lets an edit on a multi-screen recording say which picture
@@ -85,6 +96,10 @@ pub struct PlayerView {
     /// where that band ended up.
     footer: f32,
     footer_at: Option<egui::Rect>,
+    /// How an export is going, as the editor last reported it. The player
+    /// shows it beside the link, because a GIF and a link are two answers
+    /// to the same question and belong in the same place.
+    export: Exporting,
 }
 
 impl PlayerView {
@@ -104,6 +119,7 @@ impl PlayerView {
             stage: None,
             footer: 0.0,
             footer_at: None,
+            export: Exporting::Idle,
         }
     }
 
@@ -116,6 +132,12 @@ impl PlayerView {
 
     pub fn take_placed(&mut self) -> Option<Placed> {
         self.placed.take()
+    }
+
+    /// Tell the title row how an export is going, so it can say so beside
+    /// the link.
+    pub fn set_export(&mut self, state: Exporting) {
+        self.export = state;
     }
 
     /// Where the picture is on screen, once there has been a frame to draw.
@@ -369,9 +391,51 @@ impl PlayerView {
             });
             let multi = rec.is_multi();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // The link first, at the far right, then the layouts.
+                // The link first, at the far right, then the GIF beside it:
+                // both are ways of handing the demo to someone. Then the
+                // layouts.
                 if let Some(asked) = sharing::link_chip(ui, &self.link.0, self.link.1) {
                     self.asked = Some(asked);
+                }
+                if self.editing {
+                    ui.add_space(8.0);
+                    match self.export.clone() {
+                        Exporting::Busy(at) => {
+                            ui.add(
+                                egui::ProgressBar::new(at)
+                                    .desired_width(132.0)
+                                    .desired_height(30.0)
+                                    .corner_radius(10)
+                                    .text(
+                                        egui::RichText::new(format!("GIF {:.0}%", at * 100.0))
+                                            .size(12.0),
+                                    ),
+                            );
+                            ui.ctx().request_repaint_after(Duration::from_millis(120));
+                        }
+                        state => {
+                            let tip = match &state {
+                                Exporting::Done(text) => text.clone(),
+                                Exporting::Failed(e) => format!("It did not work: {e}"),
+                                _ => "A looping picture with no sound: small enough for a                                       README or a chat"
+                                    .to_string(),
+                            };
+                            let label = format!("{}  Export GIF", icon::EXPORT);
+                            if ui
+                                .add(theme::outline(label))
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                self.asked = Some(Asked::Export);
+                            }
+                            if let Exporting::Done(text) = &state {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(text.clone()).size(12.0).color(p.weak),
+                                );
+                            }
+                        }
+                    }
                 }
                 if multi {
                     ui.add_space(12.0);

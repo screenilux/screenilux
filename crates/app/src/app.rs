@@ -128,6 +128,11 @@ impl App {
     /// Open `path` in the player window.
     pub fn play(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.player.open(path, ctx);
+        // Edit is where a recording is watched now, so opening one goes
+        // there. Without this, Play on the saved card and a recording
+        // double-clicked in Explorer both opened it somewhere nobody was
+        // looking.
+        self.tab = Tab::Edit;
     }
 
     /// Where recordings go and whether a copy stays here, as last chosen.
@@ -1087,6 +1092,7 @@ impl App {
         } = self;
 
         editor.follow(player);
+        editor.poll_export(player);
         // The timeline belongs in the picture's card, as its bottom band,
         // not in a panel of its own under it.
         player.set_footer(if player.is_full() {
@@ -1145,8 +1151,10 @@ impl App {
             let mut band_ui = ui.new_child(egui::UiBuilder::new().max_rect(band));
             editor.timeline(&mut band_ui, ctx, player);
         }
-        if let (Some(Asked::Share), Some(path)) = (player.take_asked(), open) {
-            self.share(&path);
+        match (player.take_asked(), open) {
+            (Some(Asked::Share), Some(path)) => self.share(&path),
+            (Some(Asked::Export), _) => self.editor.start_gif(&mut self.player),
+            _ => {}
         }
         self.guide(ctx, side);
     }
@@ -1196,6 +1204,7 @@ impl App {
     fn recordings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = theme::palette(ui);
         let out_dir = self.settings.out_dir.clone();
+        let open_before = self.player.has_window();
         egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
                 left: MARGIN,
@@ -1204,9 +1213,11 @@ impl App {
                 bottom: 20,
             }))
             .show(ui, |ui| self.player.library(ui, ctx, &out_dir));
-        // Picking a recording is picking the thing to work on, so it opens
-        // where it can be both watched and edited.
-        if self.player.has_window() {
+        // Picking a recording here is picking the thing to work on, so it
+        // opens where it can be watched and edited. Only when one was just
+        // picked: otherwise the tab could never be looked at with a
+        // recording already open.
+        if !open_before && self.player.has_window() {
             self.tab = Tab::Edit;
         }
     }
