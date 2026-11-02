@@ -81,6 +81,10 @@ pub struct PlayerView {
     /// Where the picture was drawn last frame, for anything that needs to
     /// point at it.
     stage: Option<egui::Rect>,
+    /// How much of the card's bottom to keep for whoever is editing, and
+    /// where that band ended up.
+    footer: f32,
+    footer_at: Option<egui::Rect>,
 }
 
 impl PlayerView {
@@ -98,6 +102,8 @@ impl PlayerView {
             editing: false,
             placed: None,
             stage: None,
+            footer: 0.0,
+            footer_at: None,
         }
     }
 
@@ -115,6 +121,18 @@ impl PlayerView {
     /// Where the picture is on screen, once there has been a frame to draw.
     pub fn stage(&self) -> Option<egui::Rect> {
         self.stage
+    }
+
+    /// Keep `height` points at the bottom of the card for an editor's own
+    /// controls, so they sit inside the picture's card instead of floating
+    /// under it.
+    pub fn set_footer(&mut self, height: f32) {
+        self.footer = height;
+    }
+
+    /// Where that band ended up, once there has been a frame to draw.
+    pub fn footer_at(&self) -> Option<egui::Rect> {
+        self.footer_at
     }
 
     /// The picture fills the display, with the controls floating over it.
@@ -276,14 +294,36 @@ impl PlayerView {
                 let (card, _) =
                     ui.allocate_exact_size(egui::vec2(width, card_h), egui::Sense::hover());
                 ui.painter().rect_filled(card, 20.0, p.stage);
+                // The picture, its controls and whatever an editor puts
+                // below them are one object, so they share one card: three
+                // bands of it rather than a card and something floating
+                // under the card.
+                let foot = self.footer;
+                let bottom = card.max.y - foot;
                 let stage = egui::Rect::from_min_max(
                     card.min + egui::vec2(16.0, 16.0),
-                    egui::pos2(card.max.x - 16.0, card.max.y - 72.0),
+                    egui::pos2(card.max.x - 16.0, bottom - 72.0),
                 );
                 let controls = egui::Rect::from_min_max(
-                    egui::pos2(card.min.x + 16.0, card.max.y - 72.0),
-                    egui::pos2(card.max.x - 16.0, card.max.y - 8.0),
+                    egui::pos2(card.min.x + 16.0, bottom - 72.0),
+                    egui::pos2(card.max.x - 16.0, bottom - 8.0),
                 );
+                self.footer_at = (foot > 0.0).then(|| {
+                    let band = egui::Rect::from_min_max(
+                        egui::pos2(card.min.x, bottom),
+                        egui::pos2(card.max.x, card.max.y),
+                    );
+                    // A hairline where the bands meet, so the card reads as
+                    // sections of one thing rather than one flat expanse.
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(band.left() + 16.0, band.top()),
+                            egui::pos2(band.right() - 16.0, band.top()),
+                        ],
+                        egui::Stroke::new(1.0, theme::blend(p.stroke, p.stage, 0.45)),
+                    );
+                    band.shrink2(egui::vec2(16.0, 12.0))
+                });
                 let mut stage_ui = ui.new_child(egui::UiBuilder::new().max_rect(stage));
                 self.video(&mut stage_ui, ctx, stage.size());
                 let mut controls_ui = ui.new_child(

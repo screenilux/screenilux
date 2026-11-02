@@ -252,7 +252,7 @@ impl EditView {
         };
 
         self.save_row(ui, p);
-        ui.add_space(12.0);
+        ui.add_space(14.0);
         let rest = ui.available_height().max(LIST_MIN);
         self.list(ui, p, clock, rest);
         let _ = player;
@@ -296,31 +296,33 @@ impl EditView {
         let saved_time = l.edits.time_saved(l.duration);
         let problems: Vec<Problem> = l.edits.problems(l.duration);
 
+        let n = l.edits.effects.len();
+        let count = match n {
+            0 => "Nothing yet".to_string(),
+            1 => "1 effect".to_string(),
+            n => format!("{n} effects"),
+        };
+
         ui.horizontal(|ui| {
-            let n = l.edits.effects.len();
-            let count = match n {
-                0 => "Nothing changed yet".to_string(),
-                1 => "1 effect".to_string(),
-                n => format!("{n} effects"),
-            };
-            ui.label(
-                egui::RichText::new(count)
-                    .family(theme::strong())
-                    .color(p.text),
-            );
-            if saved_time > 0.05 {
-                ui.add_space(8.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
                 ui.label(
-                    egui::RichText::new(format!("exports as {}", stamp(out)))
-                        .color(p.signal)
-                        .size(12.0),
+                    egui::RichText::new("Effects")
+                        .font(egui::FontId::new(15.0, theme::bold()))
+                        .color(p.text),
                 );
-            }
+                let under = if saved_time > 0.05 {
+                    format!("{count} · exports as {}", stamp(out))
+                } else {
+                    count.clone()
+                };
+                ui.label(egui::RichText::new(under).size(11.5).color(p.weak));
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(theme::outline("Close")).clicked() {
                     self.wants_close = true;
                 }
-                let label = if self.saved { "Saved" } else { "Save edits" };
+                let label = if self.saved { "Saved" } else { "Save" };
                 if ui.add_enabled(!self.saved, theme::outline(label)).clicked() {
                     self.wants_save = true;
                 }
@@ -335,6 +337,18 @@ impl EditView {
             };
             theme::hint(ui, text);
         }
+
+        // A rule under the header, so the panel has a head and a body
+        // rather than a stack of things that happen to start at the top.
+        ui.add_space(12.0);
+        let line = ui.available_rect_before_wrap();
+        ui.painter().line_segment(
+            [
+                egui::pos2(line.left(), line.top()),
+                egui::pos2(line.right(), line.top()),
+            ],
+            egui::Stroke::new(1.0, p.stroke),
+        );
     }
 
     /// One track: effects as blocks, with what happened kept faint behind.
@@ -347,12 +361,12 @@ impl EditView {
             ui.allocate_exact_size(egui::vec2(width, TRACK_H), egui::Sense::click_and_drag());
         self.track_at = Some(rect);
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, egui::CornerRadius::same(8), p.surface);
-        painter.rect_stroke(
+        // A groove in the card it sits in, not a box on top of it: one tone
+        // down from the card, with no border of its own.
+        painter.rect_filled(
             rect,
-            egui::CornerRadius::same(8),
-            egui::Stroke::new(1.0, p.stroke),
-            egui::StrokeKind::Inside,
+            egui::CornerRadius::same(9),
+            theme::blend(p.stage, p.text, 0.07),
         );
 
         let dur = l.duration;
@@ -566,15 +580,18 @@ impl EditView {
                     let tint = tool_colour(&m.tool, p);
 
                     egui::Frame::NONE
-                        .fill(if live {
-                            theme::blend(tint, p.base, 0.9)
-                        } else {
+                        .fill(if open {
                             p.base
+                        } else if live {
+                            theme::blend(tint, p.surface, 0.86)
+                        } else {
+                            p.surface
                         })
-                        .stroke(egui::Stroke::new(
-                            if open { 1.5 } else { 1.0 },
-                            if open { tint } else { p.stroke },
-                        ))
+                        .stroke(if open {
+                            egui::Stroke::new(1.5, tint)
+                        } else {
+                            egui::Stroke::NONE
+                        })
                         .corner_radius(12)
                         .inner_margin(egui::Margin::symmetric(12, 10))
                         .show(ui, |ui| {

@@ -1087,6 +1087,13 @@ impl App {
         } = self;
 
         editor.follow(player);
+        // The timeline belongs in the picture's card, as its bottom band,
+        // not in a panel of its own under it.
+        player.set_footer(if player.is_full() {
+            0.0
+        } else {
+            crate::edit_view::TIMELINE_H
+        });
         // One window, so its title is whatever is open in it.
         let want = player
             .title()
@@ -1128,28 +1135,16 @@ impl App {
                     .response
                     .rect,
             );
-
-            // The timeline spans the picture, not the panel: it is dragged
-            // and grabbed by the edges, so it needs the width. Added after
-            // the side panel, so it takes what that leaves.
-            if player.clock().is_some() {
-                egui::Panel::bottom("edit-timeline")
-                    .exact_size(crate::edit_view::TIMELINE_H)
-                    .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
-                        left: MARGIN,
-                        right: MARGIN,
-                        top: 4,
-                        bottom: 18,
-                    }))
-                    .show_separator_line(false)
-                    .show(ui, |ui| editor.timeline(ui, ctx, player));
-            }
         }
 
         let open = player.shareable();
         let link = open.as_deref().map_or(Link::None, |path| shares.of(path));
         player.set_link(link, open.is_some() && can_share);
         player.ui(ui, ctx, &out_dir);
+        if let Some(band) = player.footer_at() {
+            let mut band_ui = ui.new_child(egui::UiBuilder::new().max_rect(band));
+            editor.timeline(&mut band_ui, ctx, player);
+        }
         if let (Some(Asked::Share), Some(path)) = (player.take_asked(), open) {
             self.share(&path);
         }
