@@ -4,6 +4,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod chrome;
 mod edit_view;
 mod icon;
 mod overlay;
@@ -47,6 +48,10 @@ fn main() -> eframe::Result<()> {
                 width: 64,
                 height: 64,
             })
+            // The app draws its own title bar; see `chrome`. Windows' one
+            // is a grey strip carrying a second copy of the icon and the
+            // title, right above a header that already says both.
+            .with_decorations(false)
             // Full screen to start with, since every tab has something to
             // do with the room. Restoring down, resizing or moving it is
             // the user's business from then on: nothing in the app reshapes

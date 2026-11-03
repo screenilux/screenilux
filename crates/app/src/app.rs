@@ -1142,42 +1142,61 @@ impl App {
     }
 
     /// The mark, the tabs, and the way to Settings.
-    fn header(&mut self, ui: &mut egui::Ui) {
+    fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = theme::palette(ui);
-        ui.horizontal(|ui| {
+        let row = ui.horizontal(|ui| {
             theme::logo(ui, 26.0);
             ui.label(
                 egui::RichText::new("Screenilux").font(egui::FontId::new(18.0, theme::bold())),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let on = self.tab == Tab::Settings;
-                let gear = egui::Button::new(
-                    egui::RichText::new(icon::SETTINGS).size(15.0).color(if on {
-                        p.signal
-                    } else {
-                        p.text
-                    }),
-                )
-                .fill(if on { p.surface } else { p.base })
-                .stroke(egui::Stroke::new(1.0, if on { p.signal } else { p.stroke }))
-                .corner_radius(10)
-                .min_size(egui::vec2(34.0, 34.0));
-                if ui.add(gear).on_hover_text("Settings").clicked() {
-                    self.tab = if on { Tab::Record } else { Tab::Settings };
-                }
-                ui.add_space(4.0);
-                let chosen = match self.tab {
-                    Tab::Record => 0,
-                    Tab::Recordings => 1,
-                    Tab::Settings => 2,
-                };
-                match theme::segmented(ui, &["Record", "Recordings"], chosen) {
-                    Some(0) => self.tab = Tab::Record,
-                    Some(1) => self.tab = Tab::Recordings,
-                    _ => {}
-                }
-            });
+            let names = ui.min_rect().right();
+            let controls = ui
+                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // The window's own buttons sit where Windows would have put
+                    // them, in the corner the hand already goes to.
+                    crate::chrome::buttons(ui, ctx);
+                    ui.add_space(10.0);
+                    let on = self.tab == Tab::Settings;
+                    let gear = egui::Button::new(
+                        egui::RichText::new(icon::SETTINGS).size(15.0).color(if on {
+                            p.signal
+                        } else {
+                            p.text
+                        }),
+                    )
+                    .fill(if on { p.surface } else { p.base })
+                    .stroke(egui::Stroke::new(1.0, if on { p.signal } else { p.stroke }))
+                    .corner_radius(10)
+                    .min_size(egui::vec2(34.0, 34.0));
+                    if ui.add(gear).on_hover_text("Settings").clicked() {
+                        self.tab = if on { Tab::Record } else { Tab::Settings };
+                    }
+                    ui.add_space(4.0);
+                    let chosen = match self.tab {
+                        Tab::Record => 0,
+                        Tab::Recordings => 1,
+                        Tab::Settings => 2,
+                    };
+                    match theme::segmented(ui, &["Record", "Recordings"], chosen) {
+                        Some(0) => self.tab = Tab::Record,
+                        Some(1) => self.tab = Tab::Recordings,
+                        _ => {}
+                    }
+                    // Where the controls begin; the strip to drag ends here.
+                    ui.min_rect().left()
+                })
+                .inner;
+            (names, controls)
         });
+        // Between the name and the first control: the only part of the row
+        // that is not already something to press. Taking the whole right
+        // side would put the strip on top of the buttons and swallow them.
+        let (names, controls) = row.inner;
+        let band = egui::Rect::from_min_max(
+            egui::pos2(names, row.response.rect.top()),
+            egui::pos2(controls.max(names), row.response.rect.bottom()),
+        );
+        crate::chrome::grab(ui, ctx, band);
     }
 
     /// The Edit tab: play a recording and shape it, in one place. The player
@@ -1682,13 +1701,15 @@ impl eframe::App for App {
                     bottom: 14,
                 }))
                 .show_separator_line(false)
-                .show(ui, |ui| self.header(ui))
+                .show(ui, |ui| self.header(ui, &ctx))
                 .response
                 .rect
                 .height()
         };
 
         self.sizer.update(&ctx, Fit::Window);
+        // A frameless window has no border to pull, so it carries its own.
+        crate::chrome::edges(&ctx);
         let _ = header;
         match self.tab {
             Tab::Record => self.record_tab(ui, &ctx),

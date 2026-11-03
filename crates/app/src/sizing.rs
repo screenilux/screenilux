@@ -154,18 +154,17 @@ fn work_area(ctx: &egui::Context, outer: egui::Rect) -> egui::Rect {
     }
 }
 
-/// A normal window, or the bar: no title bar, not resizable, above
-/// everything else so it stays reachable over whatever is being recorded.
+/// A normal window, or the bar: not resizable, above everything else so it
+/// stays reachable over whatever is being recorded. Neither is decorated —
+/// the app draws its own frame; see `chrome`.
 fn dress(ctx: &egui::Context, normal: bool) {
     use egui::ViewportCommand as C;
     if normal {
-        ctx.send_viewport_cmd(C::Decorations(true));
         ctx.send_viewport_cmd(C::Resizable(true));
         ctx.send_viewport_cmd(C::WindowLevel(egui::WindowLevel::Normal));
         ctx.send_viewport_cmd(C::MinInnerSize(MIN_SIZE));
     } else {
         ctx.send_viewport_cmd(C::MinInnerSize(egui::Vec2::ZERO));
-        ctx.send_viewport_cmd(C::Decorations(false));
         ctx.send_viewport_cmd(C::Resizable(false));
         ctx.send_viewport_cmd(C::WindowLevel(egui::WindowLevel::AlwaysOnTop));
     }
