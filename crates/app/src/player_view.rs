@@ -377,6 +377,24 @@ impl PlayerView {
             }
             let Some(l) = &self.loaded else { return };
             let rec = &l.opened.recording;
+            // The way back to the list, where the recording came from.
+            if self.editing {
+                let back = egui::Button::new(
+                    egui::RichText::new(icon::BACK).size(15.0).color(p.text),
+                )
+                .fill(p.base)
+                .stroke(egui::Stroke::new(1.0, p.stroke))
+                .corner_radius(10)
+                .min_size(egui::vec2(38.0, 38.0));
+                if ui
+                    .add(back)
+                    .on_hover_text("Back to your recordings. Effects are saved first.")
+                    .clicked()
+                {
+                    self.asked = Some(Asked::Back);
+                }
+                ui.add_space(12.0);
+            }
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(
