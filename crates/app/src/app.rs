@@ -1235,7 +1235,7 @@ impl App {
         player.set_footer(if player.is_full() {
             0.0
         } else {
-            crate::edit_view::TIMELINE_H
+            editor.timeline_height()
         });
         // One window, so its title is whatever is open in it.
         let want = player

@@ -39,15 +39,10 @@ use screenilux_player::SharedClock;
 
 use crate::player_view::{Exporting, PlayerView};
 use crate::theme::{self, icon};
+use crate::track;
 
-/// How tall the timeline is. It carries a ruler, the effects as blocks and
-/// the playhead, and its edges are grabbed to re-time a effect, so it wants
-/// more than a scrubber's few pixels.
-const TRACK_H: f32 = 64.0;
-
-/// The timeline with the room around it: what the panel under the picture
-/// asks for.
-pub const TIMELINE_H: f32 = TRACK_H + 26.0;
+/// The room the timeline wants around itself inside the picture's card.
+const TIMELINE_PAD: f32 = 26.0;
 
 /// The least list worth scrolling, when the panel is short.
 const LIST_MIN: f32 = 120.0;
@@ -56,30 +51,6 @@ const LIST_MIN: f32 = 120.0;
 /// each, and tall enough to show six without scrolling.
 const MENU_W: f32 = 420.0;
 const MENU_LIST_H: f32 = 330.0;
-/// A drag shorter than this is a click: move the playhead, do not select.
-const TAP: f64 = 0.35;
-/// How close to a block's edge counts as grabbing that edge.
-const GRIP: f32 = 7.0;
-
-/// What the pointer is doing on the timeline.
-enum Grab {
-    None,
-    /// Dragging out a new selection.
-    Selecting {
-        from: f64,
-    },
-    /// Moving a whole effect, holding where it was grabbed.
-    Moving {
-        id: u32,
-        offset: f64,
-    },
-    /// Dragging one end of a effect.
-    Edge {
-        id: u32,
-        start_side: bool,
-    },
-}
-
 /// A GIF on its way to disk, written off the interface's thread so the
 /// picture keeps playing while it is made.
 struct Writing {
@@ -103,12 +74,11 @@ enum Asking {
 pub struct EditView {
     loaded: Option<Loaded>,
     error: Option<String>,
-    grab: Grab,
-    selection: Option<(f64, f64)>,
     asking: Option<Asking>,
-    /// Which effect is open in the list, which is also the one highlighted on
-    /// the track: selecting in one place selects in the other.
-    opened: Option<u32>,
+    /// The timeline's own state: what the pointer is doing to it, the
+    /// stretch marked out on it, and which effect is lit. The list reads
+    /// the last of those, so selecting in one place selects in the other.
+    track: track::State,
     saved: bool,
     /// Set by the Save button, acted on once the borrows are released.
     wants_save: bool,
@@ -143,10 +113,8 @@ impl EditView {
         Self {
             loaded: None,
             error: None,
-            grab: Grab::None,
-            selection: None,
             asking: None,
-            opened: None,
+            track: track::State::default(),
             saved: true,
             wants_save: false,
             track_at: None,
@@ -203,9 +171,7 @@ impl EditView {
         match path {
             None => {
                 self.loaded = None;
-                self.opened = None;
-                self.selection = None;
-                self.grab = Grab::None;
+                self.track.clear();
                 self.asking = None;
             }
             Some(path) => self.adopt(&path, player),
@@ -216,9 +182,7 @@ impl EditView {
     /// with none is simply one nobody has edited yet.
     fn adopt(&mut self, path: &Path, player: &PlayerView) {
         self.error = None;
-        self.opened = None;
-        self.selection = None;
-        self.grab = Grab::None;
+        self.track.clear();
         self.asking = None;
         let duration = player
             .clock()
@@ -287,6 +251,17 @@ impl EditView {
     /// Where the timeline is on screen, for the tour to point at.
     pub fn track_at(&self) -> Option<egui::Rect> {
         self.track_at
+    }
+
+    /// The band the picture's card has to leave under itself. The track
+    /// grows a lane at a time as effects start overlapping, so the answer
+    /// depends on what is loaded rather than being one number forever.
+    pub fn timeline_height(&self) -> f32 {
+        let lanes = self
+            .loaded
+            .as_ref()
+            .map_or(1, |l| track::lanes_needed(&l.edits));
+        track::height(lanes) + TIMELINE_PAD
     }
 
     /// The panel: what to save, and the effects on the recording.
@@ -455,200 +430,21 @@ impl EditView {
         );
     }
 
-    /// One track: effects as blocks, with what happened kept faint behind.
+    /// The track, and whatever the pointer just did to it. The track keeps
+    /// its own state and paints itself; what comes back here is only what
+    /// the rest of the editor has to answer — a stretch to ask about, and
+    /// whether the edits still match what is on disk.
     fn track(&mut self, ui: &mut egui::Ui, p: &theme::Palette, clock: &SharedClock) {
         let Some(l) = self.loaded.as_mut() else {
             return;
         };
-        let width = ui.available_width();
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(width, TRACK_H), egui::Sense::click_and_drag());
-        self.track_at = Some(rect);
-        let painter = ui.painter_at(rect);
-        // A groove in the card it sits in, not a box on top of it: one tone
-        // down from the card, with no border of its own.
-        painter.rect_filled(
-            rect,
-            egui::CornerRadius::same(9),
-            theme::blend(p.stage, p.text, 0.07),
-        );
-
-        let dur = l.duration;
-        let x_of = |t: f64| rect.left() + (t / dur) as f32 * rect.width();
-        let t_of = |x: f32| (((x - rect.left()) / rect.width()) as f64 * dur).clamp(0.0, dur);
-
-        // a ruler, every ten seconds
-        let mut mark = 0.0;
-        while mark <= dur {
-            let x = x_of(mark);
-            painter.line_segment(
-                [
-                    egui::pos2(x, rect.top() + 3.0),
-                    egui::pos2(x, rect.top() + 9.0),
-                ],
-                egui::Stroke::new(1.0, theme::blend(p.stroke, p.surface, 0.3)),
-            );
-            painter.text(
-                egui::pos2(x + 5.0, rect.top() + 2.0),
-                egui::Align2::LEFT_TOP,
-                stamp_short(mark),
-                egui::FontId::new(9.5, theme::strong()),
-                p.weak,
-            );
-            mark += 10.0;
+        let out = track::show(ui, p, &mut self.track, &mut l.edits, l.duration, clock);
+        self.track_at = Some(out.rect);
+        if out.changed {
+            self.saved = false;
         }
-
-        // selection
-        if let Some((a, b)) = self.selection {
-            let r = egui::Rect::from_min_max(
-                egui::pos2(x_of(a.min(b)), rect.top() + 13.0),
-                egui::pos2(x_of(a.max(b)), rect.bottom() - 4.0),
-            );
-            painter.rect_filled(
-                r,
-                egui::CornerRadius::same(4),
-                theme::blend(p.signal, p.surface, 0.75),
-            );
-            painter.rect_stroke(
-                r,
-                egui::CornerRadius::same(4),
-                egui::Stroke::new(1.0, p.signal),
-                egui::StrokeKind::Inside,
-            );
-        }
-
-        // effects
-        let mut hit: Option<(u32, bool, bool)> = None; // id, on-left-edge, on-right-edge
-        let pointer = response.hover_pos().or(response.interact_pointer_pos());
-        for m in &l.edits.effects {
-            let r = egui::Rect::from_min_max(
-                egui::pos2(x_of(m.start), rect.top() + 13.0),
-                egui::pos2(x_of(m.end).max(x_of(m.start) + 6.0), rect.bottom() - 4.0),
-            );
-            let tint = tool_colour(&m.tool, p);
-            let on = self.opened == Some(m.id);
-            let round = egui::CornerRadius::same(7);
-            painter.rect_filled(r, round, theme::blend(tint, p.surface, 0.68));
-            // A bar of full colour down the leading edge, so a block says
-            // which effect it is even when it is too narrow for its name.
-            let edge = egui::Rect::from_min_size(r.min, egui::vec2(3.0, r.height()));
-            painter.rect_filled(edge, egui::CornerRadius::same(2), tint);
-            painter.rect_stroke(
-                r,
-                round,
-                egui::Stroke::new(if on { 1.6 } else { 1.0 }, tint),
-                egui::StrokeKind::Inside,
-            );
-            if r.width() > 52.0 {
-                painter.text(
-                    r.left_center() + egui::vec2(11.0, 0.0),
-                    egui::Align2::LEFT_CENTER,
-                    m.tool.label(),
-                    egui::FontId::new(11.0, theme::strong()),
-                    p.text,
-                );
-            }
-            if let Some(pos) = pointer
-                && r.expand2(egui::vec2(GRIP, 0.0)).contains(pos)
-            {
-                hit = Some((
-                    m.id,
-                    (pos.x - r.left()).abs() <= GRIP,
-                    (pos.x - r.right()).abs() <= GRIP,
-                ));
-            }
-        }
-
-        // playhead
-        let hx = x_of(clock.position());
-        painter.line_segment(
-            [egui::pos2(hx, rect.top()), egui::pos2(hx, rect.bottom())],
-            egui::Stroke::new(2.0, p.text),
-        );
-
-        // dragging
-        if response.drag_started()
-            && let Some(pos) = response.interact_pointer_pos()
-        {
-            let t = t_of(pos.x);
-            self.grab = match hit {
-                Some((id, true, _)) => Grab::Edge {
-                    id,
-                    start_side: true,
-                },
-                Some((id, _, true)) => Grab::Edge {
-                    id,
-                    start_side: false,
-                },
-                Some((id, _, _)) => {
-                    let m = l.edits.get(id).map(|m| m.start).unwrap_or(t);
-                    self.opened = Some(id);
-                    Grab::Moving { id, offset: t - m }
-                }
-                None => {
-                    self.selection = Some((t, t));
-                    Grab::Selecting { from: t }
-                }
-            };
-            if let Some((id, _, _)) = hit {
-                self.opened = Some(id);
-            }
-        }
-        if response.dragged()
-            && let Some(pos) = response.interact_pointer_pos()
-        {
-            let t = t_of(pos.x);
-            match &self.grab {
-                Grab::Selecting { from } => self.selection = Some((*from, t)),
-                Grab::Moving { id, offset } => {
-                    let id = *id;
-                    let offset = *offset;
-                    let span = l.edits.get(id).map(|m| m.span()).unwrap_or(1.0);
-                    let start = (t - offset).clamp(0.0, (dur - span).max(0.0));
-                    l.edits.update(id, |m| {
-                        m.start = start;
-                        m.end = start + span;
-                    });
-                    self.saved = false;
-                }
-                Grab::Edge { id, start_side } => {
-                    let (id, left) = (*id, *start_side);
-                    l.edits.update(id, |m| {
-                        if left {
-                            m.start = t.min(m.end - MIN_SPAN).max(0.0);
-                        } else {
-                            m.end = t.max(m.start + MIN_SPAN).min(dur);
-                        }
-                    });
-                    self.saved = false;
-                }
-                Grab::None => {}
-            }
-        }
-        if response.drag_stopped() {
-            if let (Grab::Selecting { from }, Some((a, b))) = (&self.grab, self.selection) {
-                let _ = from;
-                let (lo, hi) = (a.min(b), a.max(b));
-                if hi - lo < TAP {
-                    self.selection = None;
-                    clock.seek(lo);
-                } else {
-                    self.asking = Some(Asking::Span { from: lo, to: hi });
-                }
-            }
-            self.grab = Grab::None;
-        }
-        if response.clicked()
-            && matches!(self.grab, Grab::None)
-            && let Some(pos) = response.interact_pointer_pos()
-        {
-            match hit {
-                Some((id, _, _)) => self.opened = Some(id),
-                None => {
-                    self.selection = None;
-                    clock.seek(t_of(pos.x));
-                }
-            }
+        if let Some((from, to)) = out.marked {
+            self.asking = Some(Asking::Span { from, to });
         }
     }
 
@@ -679,7 +475,7 @@ impl EditView {
                 for m in &effects {
                     let id = m.id;
                     let live = m.covers(at);
-                    let open = self.opened == Some(id);
+                    let open = self.track.opened == Some(id);
                     let tint = tool_colour(&m.tool, p);
 
                     egui::Frame::NONE
@@ -726,7 +522,7 @@ impl EditView {
                                 );
                             });
                             if head.response.interact(egui::Sense::click()).clicked() {
-                                self.opened = if open { None } else { Some(id) };
+                                self.track.opened = if open { None } else { Some(id) };
                                 seek = Some(m.start);
                             }
                             if open {
@@ -746,8 +542,8 @@ impl EditView {
         }
         if let Some(id) = remove {
             l.edits.remove(id);
-            if self.opened == Some(id) {
-                self.opened = None;
+            if self.track.opened == Some(id) {
+                self.track.opened = None;
             }
             self.saved = false;
         }
@@ -1079,13 +875,17 @@ impl EditView {
             && let Some(l) = self.loaded.as_mut()
         {
             let id = l.edits.add_on(c.start, c.end, c.tool, c.screen);
-            self.opened = Some(id);
+            self.track.opened = Some(id);
             self.saved = false;
-            self.selection = None;
+            self.track.selection = None;
             close = true;
         }
         if close {
             self.asking = None;
+            // The stretch was marked to ask this question. Closing without
+            // an answer drops it too, rather than leaving a band on the
+            // track that nothing will ever be laid on.
+            self.track.selection = None;
             self.find.clear();
             self.found_focus = false;
         }
@@ -1352,7 +1152,7 @@ fn item(ui: &mut egui::Ui, p: &theme::Palette, title: &str, sub: &str) -> bool {
     response.clicked()
 }
 
-fn tool_colour(tool: &Tool, p: &theme::Palette) -> egui::Color32 {
+pub(crate) fn tool_colour(tool: &Tool, p: &theme::Palette) -> egui::Color32 {
     match tool {
         Tool::Zoom { .. } | Tool::MarkClicks => p.signal,
         Tool::Hide { .. } => p.action,
@@ -1361,11 +1161,11 @@ fn tool_colour(tool: &Tool, p: &theme::Palette) -> egui::Color32 {
     }
 }
 
-fn stamp(t: f64) -> String {
+pub(crate) fn stamp(t: f64) -> String {
     let m = (t / 60.0).floor() as i64;
     format!("{m}:{:04.1}", t - m as f64 * 60.0)
 }
-fn stamp_short(t: f64) -> String {
+pub(crate) fn stamp_short(t: f64) -> String {
     let m = (t / 60.0).floor() as i64;
     format!("{m}:{:02}", (t - m as f64 * 60.0).floor() as i64)
 }

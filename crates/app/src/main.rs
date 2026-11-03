@@ -16,6 +16,7 @@ mod sizing;
 mod state;
 mod theme;
 mod tour;
+mod track;
 
 use eframe::egui;
 
