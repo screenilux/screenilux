@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use eframe::egui;
 use screenilux_core::playback::{Area, Layout, arrange};
+use screenilux_export::Format;
 use screenilux_player::Player;
 use screenilux_player::open::{Opened, Origin};
 
@@ -38,23 +39,15 @@ struct Recent {
     detail: String,
 }
 
+/// The export menu: wide enough for a format's name and what it is for,
+/// each on one line.
+const EXPORT_MENU_W: f32 = 320.0;
+
 struct Loaded {
     opened: Opened,
     player: Player,
     /// Per track: the feed serial uploaded, and the texture.
     textures: Vec<Option<(u64, egui::TextureHandle)>>,
-}
-
-/// How writing a GIF is going.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub enum Exporting {
-    #[default]
-    Idle,
-    /// Under way, with how much of it is done.
-    Busy(f32),
-    /// Finished, with something short to say about it.
-    Done(String),
-    Failed(String),
 }
 
 /// A click on the paused picture while the editor is showing: which screen
@@ -106,10 +99,10 @@ pub struct PlayerView {
     /// is recorded in desktop coordinates, so placing it on a picture needs
     /// to know which part of the desktop that picture was.
     desks: Vec<(String, screenilux_core::Rect)>,
-    /// How an export is going, as the editor last reported it. The player
-    /// shows it beside the link, because a GIF and a link are two answers
-    /// to the same question and belong in the same place.
-    export: Exporting,
+    /// Whether an export is being written, as the editor last reported it.
+    /// The menu stands down while one is, so a second cannot be started on
+    /// top of the first.
+    exporting: bool,
 }
 
 impl PlayerView {
@@ -132,7 +125,7 @@ impl PlayerView {
             live: Vec::new(),
             path: None,
             desks: Vec::new(),
-            export: Exporting::Idle,
+            exporting: false,
         }
     }
 
@@ -164,10 +157,10 @@ impl PlayerView {
         self.desks = desks;
     }
 
-    /// Tell the title row how an export is going, so it can say so beside
-    /// the link.
-    pub fn set_export(&mut self, state: Exporting) {
-        self.export = state;
+    /// Tell the title row whether an export is running, so the menu can
+    /// stand down while one is.
+    pub fn set_exporting(&mut self, busy: bool) {
+        self.exporting = busy;
     }
 
     /// Where the picture is on screen, once there has been a frame to draw.
@@ -409,13 +402,12 @@ impl PlayerView {
             let rec = &l.opened.recording;
             // The way back to the list, where the recording came from.
             if self.editing {
-                let back = egui::Button::new(
-                    egui::RichText::new(icon::BACK).size(15.0).color(p.text),
-                )
-                .fill(p.base)
-                .stroke(egui::Stroke::new(1.0, p.stroke))
-                .corner_radius(10)
-                .min_size(egui::vec2(38.0, 38.0));
+                let back =
+                    egui::Button::new(egui::RichText::new(icon::BACK).size(15.0).color(p.text))
+                        .fill(p.base)
+                        .stroke(egui::Stroke::new(1.0, p.stroke))
+                        .corner_radius(10)
+                        .min_size(egui::vec2(38.0, 38.0));
                 if ui
                     .add(back)
                     .on_hover_text("Back to your recordings. Effects are saved first.")
@@ -447,43 +439,7 @@ impl PlayerView {
                 }
                 if self.editing {
                     ui.add_space(8.0);
-                    match self.export.clone() {
-                        Exporting::Busy(at) => {
-                            ui.add(
-                                egui::ProgressBar::new(at)
-                                    .desired_width(132.0)
-                                    .desired_height(30.0)
-                                    .corner_radius(10)
-                                    .text(
-                                        egui::RichText::new(format!("GIF {:.0}%", at * 100.0))
-                                            .size(12.0),
-                                    ),
-                            );
-                            ui.ctx().request_repaint_after(Duration::from_millis(120));
-                        }
-                        state => {
-                            let tip = match &state {
-                                Exporting::Done(text) => text.clone(),
-                                Exporting::Failed(e) => format!("It did not work: {e}"),
-                                _ => "A looping picture with no sound: small enough for a                                       README or a chat"
-                                    .to_string(),
-                            };
-                            let label = format!("{}  Export GIF", icon::EXPORT);
-                            if ui
-                                .add(theme::outline(label))
-                                .on_hover_text(tip)
-                                .clicked()
-                            {
-                                self.asked = Some(Asked::Export);
-                            }
-                            if let Exporting::Done(text) = &state {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    egui::RichText::new(text.clone()).size(12.0).color(p.weak),
-                                );
-                            }
-                        }
-                    }
+                    self.export_menu(ui, &p);
                 }
                 if multi {
                     ui.add_space(12.0);
@@ -498,6 +454,36 @@ impl PlayerView {
                 }
             });
         });
+    }
+
+    /// The export button: a menu, not a verb.
+    ///
+    /// One button that wrote a GIF hid the two exports people actually
+    /// wanted, because a button can only say one thing and there was no
+    /// room for the other two. A menu has room for all three and, more to
+    /// the point, says out loud that a choice exists.
+    fn export_menu(&mut self, ui: &mut egui::Ui, p: &theme::Palette) {
+        if self.exporting {
+            ui.add_enabled(false, theme::outline("Exporting…"));
+            return;
+        }
+        let label = format!("{}  Export  {}", icon::EXPORT, icon::CHEVRON_DOWN);
+        let mut picked = None;
+        egui::containers::menu::MenuButton::from_button(theme::outline(label)).ui(ui, |ui| {
+            ui.set_width(EXPORT_MENU_W);
+            // The rows carry their own spacing, so the style's does not
+            // stack on top of it.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for format in Format::ALL {
+                if crate::edit_view::item(ui, p, format.label(), format.hint()) {
+                    picked = Some(format);
+                    ui.close();
+                }
+            }
+        });
+        if let Some(format) = picked {
+            self.asked = Some(Asked::Export(format));
+        }
     }
 
     /// The Recordings tab, in the main window: opening a file, and the

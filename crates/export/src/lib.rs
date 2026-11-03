@@ -1,37 +1,102 @@
-//! Writing a recording out as a GIF.
+//! Writing a recording out: the three things a finished demo becomes.
 //!
-//! A GIF is what a demo wants to be when it has to live in a README, a pull
-//! request or a chat message: it plays by itself, it needs no player and it
-//! survives being pasted anywhere. The price is a small palette and no
-//! sound, so this is deliberately not a video export. It samples the
-//! recording at a handful of frames a second and shrinks it to a width
-//! worth loading.
+//! A demo leaves the app in one of three shapes, and which one is right
+//! depends entirely on where it is going. An **MP4** is the demo itself:
+//! full colour, full frame rate, the thing to upload or attach. A **GIF**
+//! is the demo made small enough to live inline. A **package** is the
+//! recording as working material — every screen, the text read off them and
+//! the edit list — so it can be opened and changed again, here or on
+//! another machine.
 //!
-//! It reads the recording through its edit list, which is what makes it the
-//! first thing in the app that treats edits as real: a cut is a stretch of
-//! source frames that are never asked for, a speed-up is frames arriving
-//! closer together, and the GIF comes out the length the editor said it
-//! would. Effects that change *pixels* rather than *time* — a zoom, a blur,
-//! a caption — are not drawn yet, here or anywhere else, so a GIF shows the
-//! recording cut to shape but not dressed.
+//! All three read the recording through its edit list, which is what makes
+//! edits real rather than a preview: a cut is a stretch of source frames
+//! that are never asked for, a speed-up is frames arriving closer together,
+//! and what comes out is the length the editor said it would be.
+//!
+//! Every export reports how far along it is and can be told to stop, since
+//! a long recording takes long enough that somebody will want to.
+//!
+//! One limit runs through all of them: effects that change *pixels* rather
+//! than *time* — a zoom, a blur, a caption — are not drawn yet, here or
+//! anywhere else, so an export shows the recording cut to shape but not
+//! dressed. The MP4 is also silent for now; the package is the one that
+//! keeps the sound.
 
 #![forbid(unsafe_code)]
 
 use std::fs::File;
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use screenilux_core::edit::EditList;
+use screenilux_core::package;
+use screenilux_core::ports::VideoSink;
+use screenilux_platform::NativeSink;
 use screenilux_platform::decoder::VideoDecoder;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
     #[error("could not read the recording: {0}")]
     Read(String),
-    #[error("could not write the GIF: {0}")]
+    #[error("could not write it out: {0}")]
     Write(String),
     #[error("there is nothing left to export: every frame is cut")]
     Empty,
+    #[error("the export was stopped")]
+    Stopped,
+}
+
+/// What a recording can be written out as.
+///
+/// These are three different answers to "what is this demo for", not three
+/// settings of one thing, which is why each says what it is good for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// The demo itself: full colour and frame rate, to upload or attach.
+    Mp4,
+    /// The demo made small: plays by itself anywhere a picture goes.
+    Gif,
+    /// The recording as working material, edits and all.
+    Package,
+}
+
+impl Format {
+    /// In the order the menu offers them: the one most people want first.
+    pub const ALL: [Self; 3] = [Self::Mp4, Self::Gif, Self::Package];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mp4 => "Video (MP4)",
+            Self::Gif => "Animated GIF",
+            Self::Package => "Screenilux package",
+        }
+    }
+
+    /// What it is for, in one line, for the menu row under the name.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Mp4 => "Full quality, to upload or attach. No sound yet.",
+            Self::Gif => "Small and silent: for a README, a PR or a chat.",
+            Self::Package => "Every screen and your effects, to open again later.",
+        }
+    }
+
+    pub fn ext(self) -> &'static str {
+        match self {
+            Self::Mp4 => "mp4",
+            Self::Gif => "gif",
+            Self::Package => package::PACKAGE_EXT,
+        }
+    }
+}
+
+/// Where an export of `stem` lands in `dir`.
+///
+/// The extension is appended rather than replaced: a recording called
+/// "v1.2 walkthrough" has no extension to replace, and `with_extension`
+/// would take ".2 walkthrough" for one.
+pub fn into_folder(dir: &Path, stem: &str, format: Format) -> PathBuf {
+    dir.join(format!("{stem}.{}", format.ext()))
 }
 
 /// How a GIF is to be written.
@@ -65,14 +130,21 @@ pub struct Written {
 
 /// Write `video` out to `out` as a GIF, read through `edits`.
 ///
+/// A GIF is what a demo wants to be when it has to live in a README, a pull
+/// request or a chat message: it plays by itself, it needs no player and it
+/// survives being pasted anywhere. The price is a small palette and no
+/// sound. It samples the recording at a handful of frames a second and
+/// shrinks it to a width worth loading.
+///
 /// `progress` is called with a fraction between 0 and 1 as the source is
-/// walked, and may be called many times a second.
+/// walked, and may be called many times a second. Returning `false` from it
+/// stops the export and leaves nothing behind.
 pub fn gif(
     video: &Path,
     out: &Path,
     edits: &EditList,
     how: Gif,
-    mut progress: impl FnMut(f32),
+    mut progress: impl FnMut(f32) -> bool,
 ) -> Result<Written, ExportError> {
     let mut decoder = VideoDecoder::open(video).map_err(|e| ExportError::Read(e.to_string()))?;
     let source_len = decoder.duration().max(0.001);
@@ -106,7 +178,11 @@ pub fn gif(
             .next_frame_if(|t| edits.to_output(t).is_some_and(|out_t| out_t + 1e-9 >= want))
             .map_err(|e| ExportError::Read(e.to_string()))?;
         let Some((t, frame)) = read else { break };
-        progress((t / source_len).clamp(0.0, 1.0) as f32);
+        if !progress((t / source_len).clamp(0.0, 1.0) as f32) {
+            drop(encoder);
+            let _ = std::fs::remove_file(out);
+            return Err(ExportError::Stopped);
+        }
 
         let Some(frame) = frame else { continue };
         let Some(out_t) = edits.to_output(t) else {
@@ -275,6 +351,169 @@ fn shrink(rgba: &[u8], width: u32, height: u32, limit: u32) -> (Vec<u8>, u32, u3
     (out, w, h)
 }
 
+/// How an MP4 is to be written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mp4 {
+    /// Frames a second in the finished video. The recording's own rate is
+    /// the right answer: anything lower throws motion away, and anything
+    /// higher invents frames that were never captured.
+    pub fps: u32,
+}
+
+impl Default for Mp4 {
+    fn default() -> Self {
+        Self { fps: 30 }
+    }
+}
+
+/// Write `video` out to `out` as an MP4, read through `edits`.
+///
+/// This is the demo itself rather than a picture of it: the recording's own
+/// resolution, its own frame rate, encoded by whatever the operating system
+/// encodes with. It is silent — carrying the sound through a list of cuts,
+/// speed-ups and mutes is a job of its own, and a package is the export
+/// that keeps it meanwhile.
+///
+/// The video comes out at a constant frame rate, so a source frame that
+/// covers several output frames is written once for each of them. That is
+/// what makes a held frame hold and a speed-up actually run faster, rather
+/// than the file merely claiming to.
+pub fn mp4(
+    video: &Path,
+    out: &Path,
+    edits: &EditList,
+    how: Mp4,
+    mut progress: impl FnMut(f32) -> bool,
+) -> Result<Written, ExportError> {
+    let mut decoder = VideoDecoder::open(video).map_err(|e| ExportError::Read(e.to_string()))?;
+    let source_len = decoder.duration().max(0.001);
+    let output_len = edits.output_duration(source_len);
+    if output_len <= 0.0 {
+        return Err(ExportError::Empty);
+    }
+
+    // Encoders want even sides, and a recording of an odd-sized window is
+    // rare but not impossible, so give up the last row or column rather
+    // than the whole export.
+    let (width, height) = (decoder.width() & !1, decoder.height() & !1);
+    if width == 0 || height == 0 {
+        return Err(ExportError::Empty);
+    }
+
+    let fps = how.fps.max(1);
+    let step = 1.0 / fps as f64;
+    let mut sink = NativeSink::new(width, height, fps, false, scratch_mp4())
+        .map_err(|e| ExportError::Write(e.to_string()))?;
+    sink.open_segment()
+        .map_err(|e| ExportError::Write(e.to_string()))?;
+
+    let mut frames = 0u32;
+    // The next point on the finished video's clock that wants a frame.
+    let mut want = 0.0_f64;
+    let mut bgra = vec![0u8; width as usize * height as usize * 4];
+
+    loop {
+        // Only the frames that are actually used are converted to pixels;
+        // the rest cost a timestamp each.
+        let read = decoder
+            .next_frame_if(|t| edits.to_output(t).is_some_and(|out_t| out_t + 1e-9 >= want))
+            .map_err(|e| ExportError::Read(e.to_string()))?;
+        let Some((t, frame)) = read else { break };
+        if !progress((t / source_len).clamp(0.0, 1.0) as f32) {
+            return Err(ExportError::Stopped);
+        }
+
+        let Some(frame) = frame else { continue };
+        let Some(out_t) = edits.to_output(t) else {
+            continue;
+        };
+        into_bgra(&frame.rgba, frame.width, width, height, &mut bgra);
+
+        // Every output frame this one is still the latest for.
+        while want <= out_t + 1e-9 && want < output_len {
+            sink.write(&bgra)
+                .map_err(|e| ExportError::Write(e.to_string()))?;
+            frames += 1;
+            want += step;
+        }
+        if want >= output_len {
+            break;
+        }
+    }
+
+    if frames == 0 {
+        return Err(ExportError::Empty);
+    }
+    sink.close_segment(0)
+        .map_err(|e| ExportError::Write(e.to_string()))?;
+    sink.finish(out)
+        .map_err(|e| ExportError::Write(e.to_string()))?;
+    progress(1.0);
+
+    Ok(Written {
+        frames,
+        bytes: std::fs::metadata(out).map(|m| m.len()).unwrap_or(0),
+        width,
+        height,
+    })
+}
+
+/// Copy a decoded picture into the encoder's buffer: red and blue swapped,
+/// and cropped to the even size the encoder was opened at.
+///
+/// The sink turns the rows over itself on the way to the encoder, so they
+/// go in the way they came out of the decoder.
+fn into_bgra(rgba: &[u8], source_width: u32, width: u32, height: u32, out: &mut [u8]) {
+    let src_stride = source_width as usize * 4;
+    let dst_stride = width as usize * 4;
+    for y in 0..height as usize {
+        let (src, dst) = (y * src_stride, y * dst_stride);
+        for x in 0..width as usize {
+            let (i, o) = (src + x * 4, dst + x * 4);
+            out[o] = rgba[i + 2];
+            out[o + 1] = rgba[i + 1];
+            out[o + 2] = rgba[i];
+            out[o + 3] = rgba[i + 3];
+        }
+    }
+}
+
+/// Where the encoder writes before the file is moved into place. Named for
+/// the moment it started, so two exports at once cannot collide.
+fn scratch_mp4() -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    std::env::temp_dir().join(format!("screenilux-export-{stamp}.mp4"))
+}
+
+/// Write the session folder `from` out as a `.screenilux` package at `out`.
+///
+/// Nothing is re-encoded: the videos are already H.264 and the edit list is
+/// a few lines of JSON, so this is a copy into one file. It is the only
+/// export that keeps the sound, the other screens and the effects as
+/// effects rather than as pixels, which makes it the one to send to
+/// somebody who will keep working on the demo.
+pub fn package(
+    from: &Path,
+    out: &Path,
+    mut progress: impl FnMut(f32) -> bool,
+) -> Result<Written, ExportError> {
+    if !progress(0.0) {
+        return Err(ExportError::Stopped);
+    }
+    // Packing walks the files itself and has nothing to report along the
+    // way, so the bar simply says it is working.
+    package::pack(from, out).map_err(|e| ExportError::Write(e.to_string()))?;
+    progress(1.0);
+    Ok(Written {
+        frames: 0,
+        bytes: std::fs::metadata(out).map(|m| m.len()).unwrap_or(0),
+        width: 0,
+        height: 0,
+    })
+}
+
 /// A name for the GIF beside the recording it came from.
 pub fn beside(recording: &Path) -> std::path::PathBuf {
     recording.with_extension("gif")
@@ -372,6 +611,54 @@ mod tests {
     }
 
     #[test]
+    fn every_format_lands_in_the_folder_it_was_given() {
+        let dir = Path::new("C:/demos");
+        assert!(into_folder(dir, "walkthrough", Format::Mp4).ends_with("walkthrough.mp4"));
+        assert!(into_folder(dir, "walkthrough", Format::Gif).ends_with("walkthrough.gif"));
+        assert!(
+            into_folder(dir, "walkthrough", Format::Package).ends_with("walkthrough.screenilux")
+        );
+    }
+
+    #[test]
+    fn a_name_with_a_dot_in_it_keeps_the_whole_name() {
+        // `with_extension` would take ".2 walkthrough" for an extension and
+        // hand back "v1.mp4", losing most of what the file was called.
+        let out = into_folder(Path::new("C:/demos"), "v1.2 walkthrough", Format::Mp4);
+        assert_eq!(
+            out.file_name().unwrap().to_string_lossy(),
+            "v1.2 walkthrough.mp4"
+        );
+    }
+
+    #[test]
+    fn the_formats_are_offered_in_the_order_people_want_them() {
+        assert_eq!(Format::ALL[0], Format::Mp4);
+        // No two look alike in the menu, or the menu is no help.
+        for a in Format::ALL {
+            for b in Format::ALL {
+                assert_eq!(a == b, a.label() == b.label());
+                assert_eq!(a == b, a.ext() == b.ext());
+            }
+        }
+    }
+
+    #[test]
+    fn red_and_blue_swap_on_the_way_to_the_encoder() {
+        // Two pixels of a three-wide picture, cropped to the even width the
+        // encoder was opened at.
+        let rgba = vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 9, // row 0: px0, px1, px2 (dropped)
+            10, 11, 12, 13, 14, 15, 16, 17, 9, 9, 9, 9, // row 1
+        ];
+        let mut out = vec![0u8; 2 * 2 * 4];
+        into_bgra(&rgba, 3, 2, 2, &mut out);
+        assert_eq!(&out[0..4], &[3, 2, 1, 4]);
+        assert_eq!(&out[4..8], &[7, 6, 5, 8]);
+        assert_eq!(&out[8..12], &[12, 11, 10, 13]);
+    }
+
+    #[test]
     fn a_gif_is_named_beside_the_recording_it_came_from() {
         let from = Path::new("C:/demos/monday.mp4");
         assert_eq!(beside(from), Path::new("C:/demos/monday.gif"));
@@ -397,7 +684,7 @@ mod against_a_real_recording {
             Path::new(&out),
             &edits,
             Gif::default(),
-            |_| {},
+            |_| true,
         )
         .expect("the GIF is written");
         println!("{done:?}");

@@ -1290,7 +1290,9 @@ impl App {
         }
         match (player.take_asked(), open) {
             (Some(Asked::Share), Some(path)) => self.share(&path),
-            (Some(Asked::Export), _) => self.editor.start_gif(&mut self.player),
+            (Some(Asked::Export(format)), _) => {
+                self.editor.start_export(format, &mut self.player);
+            }
             // Going back puts the recording away, which is what returns the
             // tab to its list. Effects are written first: they are data
             // beside the recording, and losing them to a misread arrow
@@ -1301,6 +1303,9 @@ impl App {
             }
             _ => {}
         }
+        // Over everything, including the tour: an export is the one thing
+        // that has to be waited for rather than worked around.
+        self.editor.show_export(ctx);
         self.guide(ctx, side);
     }
 

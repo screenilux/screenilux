@@ -25,19 +25,16 @@
 //! the click that placed it says which picture it landed on.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui;
 use screenilux_core::edit::{
     Area, Backdrop, EditList, Effect, MIN_SPAN, Place, Problem, Tool, trim_zero,
 };
 use screenilux_core::session::{MANIFEST_NAME, Manifest};
-use screenilux_export::{Gif, Written};
 use screenilux_player::SharedClock;
 
-use crate::player_view::{Exporting, PlayerView};
+use crate::exporting::{Exports, Source};
+use crate::player_view::PlayerView;
 use crate::theme::{self, icon};
 use crate::track;
 
@@ -51,14 +48,6 @@ const LIST_MIN: f32 = 120.0;
 /// each, and tall enough to show six without scrolling.
 const MENU_W: f32 = 420.0;
 const MENU_LIST_H: f32 = 330.0;
-/// A GIF on its way to disk, written off the interface's thread so the
-/// picture keeps playing while it is made.
-struct Writing {
-    done: Arc<AtomicU32>,
-    result: Receiver<Result<Written, String>>,
-    to: PathBuf,
-}
-
 /// A menu waiting to be answered.
 enum Asking {
     /// Placed on the picture: spatial tools, at a point on a named screen.
@@ -84,9 +73,9 @@ pub struct EditView {
     wants_save: bool,
     /// Where the timeline was drawn last frame, for the tour to point at.
     track_at: Option<egui::Rect>,
-    /// A GIF being written: how far along, and what came of it.
-    writing: Option<Writing>,
-    wrote: Option<Result<String, String>>,
+    /// Writing the recording out: which format, how far along, and what
+    /// came of it.
+    exports: Exports,
     /// What is typed into the effect menu's search box.
     find: String,
     /// Whether that box has been given focus since the menu opened.
@@ -118,8 +107,7 @@ impl EditView {
             saved: true,
             wants_save: false,
             track_at: None,
-            writing: None,
-            wrote: None,
+            exports: Exports::default(),
             find: String::new(),
             found_focus: false,
         }
@@ -282,65 +270,49 @@ impl EditView {
         self.list(ui, p, clock, rest);
     }
 
-    /// Keep up with a GIF being written and tell the player how it is
-    /// going, since the button that started it lives up in the title row
-    /// beside the link.
+    /// Keep up with an export and let the title row know whether one is
+    /// running, since the menu that starts them lives up there.
     pub fn poll_export(&mut self, player: &mut PlayerView) {
-        if let Some(w) = &self.writing {
-            match w.result.try_recv() {
-                Ok(Ok(done)) => {
-                    self.wrote = Some(Ok(format!(
-                        "{} · {}×{} · {}",
-                        w.to.file_name().unwrap_or_default().to_string_lossy(),
-                        done.width,
-                        done.height,
-                        weight(done.bytes),
-                    )));
-                    self.writing = None;
-                }
-                Ok(Err(e)) => {
-                    self.wrote = Some(Err(e));
-                    self.writing = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.writing = None,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-        }
-        let state = match (&self.writing, &self.wrote) {
-            (Some(w), _) => Exporting::Busy(w.done.load(Ordering::Relaxed) as f32 / 1000.0),
-            (None, Some(Ok(text))) => Exporting::Done(text.clone()),
-            (None, Some(Err(e))) => Exporting::Failed(e.clone()),
-            (None, None) => Exporting::Idle,
-        };
-        player.set_export(state);
+        self.exports.poll();
+        player.set_exporting(self.exports.busy());
     }
 
-    /// Start writing the GIF, off this thread.
-    pub fn start_gif(&mut self, player: &mut PlayerView) {
+    /// The export popup, over everything: a bar while it writes, and what
+    /// came of it after.
+    pub fn show_export(&mut self, ctx: &egui::Context) {
+        self.exports.show(ctx, &theme::palette_for(ctx));
+    }
+
+    /// Ask where the recording should go, and start writing it there.
+    pub fn start_export(&mut self, format: screenilux_export::Format, player: &mut PlayerView) {
         let (Some(video), Some(l)) = (player.track_file(0), self.loaded.as_ref()) else {
             return;
         };
-        // Beside the recording, not beside whatever the package unpacked
-        // to: the scratch folder is cleared when the recording is closed.
-        let to = screenilux_export::beside(&l.path);
-        let edits = l.edits.clone();
-        let done = Arc::new(AtomicU32::new(0));
-        let (tx, rx) = channel();
-        let ticker = Arc::clone(&done);
-        let out = to.clone();
-        std::thread::spawn(move || {
-            let result = screenilux_export::gif(&video, &out, &edits, Gif::default(), |at| {
-                ticker.store((at * 1000.0) as u32, Ordering::Relaxed);
-            })
-            .map_err(|e| e.to_string());
-            let _ = tx.send(result);
-        });
-        self.wrote = None;
-        self.writing = Some(Writing {
-            done,
-            result: rx,
-            to,
-        });
+        // A package is made of the folder the videos actually live in,
+        // which for a `.screenilux` is wherever it was unpacked, not the
+        // file itself.
+        let Some(folder) = video.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        // The dialog opens where the recording came from, which is where
+        // people keep looking for what came out of it.
+        let start_in = l
+            .path
+            .parent()
+            .filter(|d| d.is_dir())
+            .map_or_else(|| folder.clone(), Path::to_path_buf);
+
+        self.exports.start(
+            format,
+            Source {
+                video,
+                folder,
+                stem: friendly_stem(&l.path),
+                edits: l.edits.clone(),
+                fps: f64::from(l.manifest.fps.max(1)),
+                start_in,
+            },
+        );
     }
 
     /// The timeline, under the picture and as wide as it is. Click to move
@@ -1075,16 +1047,6 @@ fn span_choices(from: f64, to: f64, duration: f64, screens: &[String]) -> Vec<Ch
 /// rail and the reading on one line and gives the rail the room it needs to
 /// be worth dragging.
 /// A file size someone can hold in their head.
-fn weight(bytes: u64) -> String {
-    const MB: f64 = 1024.0 * 1024.0;
-    let mb = bytes as f64 / MB;
-    if mb >= 1.0 {
-        format!("{mb:.1} MB")
-    } else {
-        format!("{:.0} KB", bytes as f64 / 1024.0)
-    }
-}
-
 fn percent(v: f32) -> String {
     format!("{:.0}%", v * 100.0)
 }
@@ -1119,7 +1081,7 @@ fn dial(
 /// One row of a chooser: a name, what it does, and the whole width of the
 /// list as its target. It lights up under the pointer, so the list reads as
 /// something to pick from rather than something to read.
-fn item(ui: &mut egui::Ui, p: &theme::Palette, title: &str, sub: &str) -> bool {
+pub(crate) fn item(ui: &mut egui::Ui, p: &theme::Palette, title: &str, sub: &str) -> bool {
     let width = ui.available_width();
     let height = 50.0;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
@@ -1159,6 +1121,15 @@ pub(crate) fn tool_colour(tool: &Tool, p: &theme::Palette) -> egui::Color32 {
         Tool::Callout { .. } | Tool::Screen { .. } => p.soft,
         _ => p.weak,
     }
+}
+
+/// What an export of this recording is called, before its extension: the
+/// recording's own name, so the two sit together in a folder.
+fn friendly_stem(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "recording".to_string())
 }
 
 pub(crate) fn stamp(t: f64) -> String {

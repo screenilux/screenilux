@@ -7,6 +7,7 @@ mod app;
 mod chrome;
 mod edit_view;
 mod effects;
+mod exporting;
 mod icon;
 mod overlay;
 mod player_view;
