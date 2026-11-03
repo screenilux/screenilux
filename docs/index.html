@@ -77,13 +77,20 @@ img { max-width: 100%; display: block; }
 
 /* ---- the rail: the page laid out as one timeline ------------------- */
 
+.frame {
+  max-width: 1420px;
+  margin-inline: auto;
+  display: grid;
+  grid-template-columns: var(--rail) minmax(0, 1fr);
+}
+
 .rail {
-  position: fixed;
-  inset: 0 auto 0 0;
-  width: var(--rail);
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: 100vh;
   padding: 104px 0 64px;
   border-right: 1px solid var(--line);
-  background: var(--ink);
   z-index: 4;
 }
 .rail ol { list-style: none; margin: 0; padding: 0; height: 100%; position: relative; }
@@ -125,9 +132,9 @@ img { max-width: 100%; display: block; }
 
 /* ---- page frame ----------------------------------------------------- */
 
-.page { margin-left: var(--rail); }
+.page { min-width: 0; }
 .band { padding: 0 var(--gutter); }
-.hold { max-width: 1180px; margin: 0 auto; }
+.hold { max-width: 1040px; margin: 0 auto; }
 .say  { max-width: var(--measure); }
 
 .top {
@@ -164,7 +171,7 @@ img { max-width: 100%; display: block; }
   font-size: var(--t-4);
   font-variation-settings: "wdth" 124;
   font-weight: 800;
-  max-width: 17ch;
+  max-width: 15ch;
 }
 .hero h1 .second {
   display: block;
@@ -266,7 +273,14 @@ section.moment p + p { margin-top: 14px; }
 .pair.narrow .shot img { max-height: 620px; width: auto; }
 
 /* Effects, drawn as the blocks they are in the app. */
-.effects { list-style: none; margin: 30px 0 0; padding: 0; display: grid; gap: 10px; }
+.effects {
+  list-style: none;
+  margin: 30px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+  max-width: var(--measure);
+}
 .effects li {
   display: grid;
   grid-template-columns: 158px 1fr;
@@ -284,6 +298,7 @@ section.moment p + p { margin-top: 14px; }
 /* The weight of a GIF, said with the two numbers. */
 .weigh {
   margin-top: 34px;
+  max-width: var(--measure);
   display: flex;
   align-items: flex-end;
   gap: clamp(20px, 4vw, 44px);
@@ -323,6 +338,7 @@ section.moment p + p { margin-top: 14px; }
 
 pre {
   margin: 22px 0 0;
+  max-width: var(--measure);
   padding: 18px 20px;
   background: var(--panel);
   border: 1px solid var(--line);
@@ -354,10 +370,14 @@ pre .c { color: var(--mute); }
 
 /* ---- narrower ------------------------------------------------------- */
 
+@media (max-width: 1140px) {
+  .pair, .pair.narrow { grid-template-columns: 1fr; }
+  .pair.narrow .shot { max-width: 420px; }
+}
+
 @media (max-width: 980px) {
   .rail { display: none; }
-  .page { margin-left: 0; }
-  .pair, .pair.narrow { grid-template-columns: 1fr; }
+  .frame { grid-template-columns: minmax(0, 1fr); }
   .top nav a.hide-sm { display: none; }
 }
 @media (max-width: 560px) {
@@ -367,6 +387,8 @@ pre .c { color: var(--mute); }
 </style>
 </head>
 <body>
+
+<div class="frame">
 
 <aside class="rail" aria-hidden="true">
   <div class="playhead" id="playhead"></div>
@@ -461,7 +483,7 @@ pre .c { color: var(--mute); }
     <!-- edit -->
     <section class="moment" id="edit">
       <div class="hold">
-        <h2>Two ways to change it, and no more</h2>
+        <h2>Two ways to change it</h2>
         <div class="say">
           <p>
             Editing a demo is two questions: <em>where</em> and <em>when</em>. So there are two
@@ -484,7 +506,7 @@ pre .c { color: var(--mute); }
     <!-- send -->
     <section class="moment" id="send">
       <div class="hold">
-        <h2>Send it as a picture or a link</h2>
+        <h2>Send it as a picture, or a link</h2>
         <div class="say">
           <p>
             A GIF plays by itself, needs no player, and survives being pasted into a README, a
@@ -558,6 +580,8 @@ cargo run --release -p screenilux</pre>
     </footer>
 
   </main>
+</div>
+
 </div>
 
 <script>
