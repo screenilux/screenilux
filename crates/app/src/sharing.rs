@@ -323,8 +323,8 @@ impl Shares {
 /// What the person asked of a link.
 pub enum Asked {
     Share,
-    /// Write the recording out as a GIF.
-    Export,
+    /// Write the recording out, in the shape picked from the export menu.
+    Export(screenilux_export::Format),
     /// Put the recording away and go back to the list.
     Back,
 }

@@ -41,6 +41,6 @@ pub use backend::{
     InputHook, MediaInfo, NativeSink, ScreenCapture, Speaker, TextReader, Thumbnail, VideoDecoder,
     VideoFrame, cameras, cursor_pos, exclude_from_capture, find_window, has_microphone,
     has_system_sound, include_in_capture, monitors, now_local, probe, register_file_types, reveal,
-    set_circular, set_dpi_awareness, set_opacity, set_rounded, thumbnail,
+    set_dpi_awareness, set_opacity, set_rounded, thumbnail,
 };
 pub use backend::{audio, capture, decoder, display, encoder};

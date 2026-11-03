@@ -16,6 +16,7 @@ pub mod geometry;
 pub mod mix;
 pub mod package;
 pub mod playback;
+pub mod pointer;
 pub mod ports;
 pub mod session;
 pub mod text;

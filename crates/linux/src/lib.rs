@@ -47,6 +47,6 @@ pub use snapshot::{Thumbnail, thumbnail};
 pub use speaker::Speaker;
 pub use watch::DisplayWatcher;
 pub use window::{
-    CAN_HIDE_FROM_CAPTURE, exclude_from_capture, find_window, include_in_capture, set_circular,
-    set_opacity, set_rounded,
+    CAN_HIDE_FROM_CAPTURE, exclude_from_capture, find_window, include_in_capture, set_opacity,
+    set_rounded,
 };

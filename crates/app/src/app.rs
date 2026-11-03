@@ -170,6 +170,11 @@ impl App {
             return;
         }
 
+        // The camera is released when a recording ends, so a setting left
+        // switched on has to open it again here.
+        if self.settings.effects.camera && self.runtime.camera_feed.is_none() {
+            self.toggle_camera(true);
+        }
         let camera = self
             .runtime
             .camera_feed
@@ -240,6 +245,13 @@ impl App {
                 self.player.recordings_changed();
             }
             Err(e) => self.status = format!("Could not save: {e}"),
+        }
+        // Let the camera go. Holding it open between recordings leaves the
+        // light on and the device busy for other apps, for a preview nobody
+        // asked to keep; the setting stays on and `start` opens it again.
+        if self.settings.effects.camera {
+            self.runtime.stop_camera();
+            self.overlay = None;
         }
         self.phase = Phase::Idle;
         self.started_at = None;
@@ -1223,7 +1235,7 @@ impl App {
         player.set_footer(if player.is_full() {
             0.0
         } else {
-            crate::edit_view::TIMELINE_H
+            editor.timeline_height()
         });
         // One window, so its title is whatever is open in it.
         let want = player
@@ -1278,7 +1290,9 @@ impl App {
         }
         match (player.take_asked(), open) {
             (Some(Asked::Share), Some(path)) => self.share(&path),
-            (Some(Asked::Export), _) => self.editor.start_gif(&mut self.player),
+            (Some(Asked::Export(format)), _) => {
+                self.editor.start_export(format, &mut self.player);
+            }
             // Going back puts the recording away, which is what returns the
             // tab to its list. Effects are written first: they are data
             // beside the recording, and losing them to a misread arrow
@@ -1289,6 +1303,9 @@ impl App {
             }
             _ => {}
         }
+        // Over everything, including the tour: an export is the one thing
+        // that has to be waited for rather than worked around.
+        self.editor.show_export(ctx);
         self.guide(ctx, side);
     }
 

@@ -103,6 +103,11 @@ pub struct Manifest {
     /// an untouched recording writes the same manifest it always did.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub edits: Option<crate::edit::EditList>,
+    /// Where the pointer went while this was recorded. Absent on anything
+    /// made before the recorder kept it, which simply means a zoom cannot
+    /// follow it and its clicks cannot be marked.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pointer: Option<crate::pointer::Track>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -130,6 +135,7 @@ impl Manifest {
             screens: Vec::new(),
             focus: None,
             edits: None,
+            pointer: None,
         }
     }
 

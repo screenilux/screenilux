@@ -39,11 +39,6 @@ pub unsafe fn set_opacity(_hwnd: isize, _alpha: u8) {}
 /// No requirements here; `unsafe` only to match the Windows backend.
 pub unsafe fn set_rounded(_hwnd: isize, _rounded: bool) {}
 
-/// # Safety
-///
-/// No requirements here; `unsafe` only to match the Windows backend.
-pub unsafe fn set_circular(_hwnd: isize) {}
-
 /// Windows are not looked up by title here; nothing needs a handle.
 pub fn find_window(_title: &str) -> Option<isize> {
     None
