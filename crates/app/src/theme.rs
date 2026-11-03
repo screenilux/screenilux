@@ -407,6 +407,38 @@ pub fn outline(text: impl Into<egui::WidgetText>) -> egui::Button<'static> {
 
 /// The main action: a full-width pill in Action with white bold text and,
 /// for recording, a dot before the words.
+/// The one button that starts the job, sized to its own words so it can sit
+/// at the end of a row of switches rather than across the whole window.
+pub fn go_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let p = palette(ui);
+    let font = FontId::new(15.0, bold());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font.clone(), ON_DARK);
+    let width = galley.size().x + 60.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 44.0), egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, text));
+    if ui.is_rect_visible(rect) {
+        let fill = if response.is_pointer_button_down_on() {
+            blend(p.action, p.text, 0.2)
+        } else if response.hovered() {
+            blend(p.action, ON_DARK, 0.1)
+        } else {
+            p.action
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(22), fill);
+        let start = rect.center().x - (galley.size().x + 20.0) / 2.0;
+        painter.circle_filled(egui::pos2(start + 5.0, rect.center().y), 5.0, ON_DARK);
+        painter.galley(
+            egui::pos2(start + 20.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            ON_DARK,
+        );
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 pub fn big_button(ui: &mut egui::Ui, text: &str, dot: bool) -> egui::Response {
     let p = palette(ui);
     let width = ui.available_width();
@@ -537,72 +569,84 @@ pub fn setting(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response 
 
 /// A source the recording can use, as a rounded row: a round badge with its
 /// icon, its name over the device, and a switch. Clicking anywhere on the row
-/// flips it.
-pub fn source_row(
-    ui: &mut egui::Ui,
-    glyph: &str,
-    title: &str,
-    detail: &str,
-    on: bool,
-) -> egui::Response {
+/// One source as a pill: an icon, whether it is on, and what device it
+/// would use. Sized to its own text so a row of them reads as a set of
+/// switches rather than a stack of full-width rows.
+pub fn pill(ui: &mut egui::Ui, glyph: &str, state: &str, detail: &str, on: bool) -> egui::Response {
     let p = palette(ui);
-    let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 60.0), egui::Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), on, title)
-    });
-    if ui.is_rect_visible(rect) {
-        let enabled = ui.is_enabled();
-        let fill = if response.hovered() && enabled {
-            p.stroke
-        } else {
-            p.surface
-        };
-        let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(16), fill);
-        let badge = egui::pos2(rect.left() + 32.0, rect.center().y);
-        painter.circle_filled(badge, 18.0, if on { p.stroke } else { p.base });
-        let ink = if on { p.action } else { p.weak };
-        if glyph == icon::MIC && !cfg!(windows) {
-            // egui's fonts draw the microphone as an empty box, so it is drawn.
-            paint_microphone(painter, badge, ink);
-        } else {
-            painter.text(
-                badge,
-                egui::Align2::CENTER_CENTER,
-                glyph,
-                FontId::proportional(16.0),
-                ink,
-            );
-        }
+    let enabled = ui.is_enabled();
+    let strong_font = FontId::new(13.5, strong());
+    let thin_font = FontId::new(12.5, FontFamily::Proportional);
+    let state_w = ui
+        .painter()
+        .layout_no_wrap(state.to_string(), strong_font.clone(), p.text)
+        .size()
+        .x;
+    let detail_w = if detail.is_empty() {
+        0.0
+    } else {
+        ui.painter()
+            .layout_no_wrap(detail.to_string(), thin_font.clone(), p.weak)
+            .size()
+            .x
+            + 10.0
+    };
+    let width = 30.0 + 26.0 + state_w + detail_w + 18.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 44.0), egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, enabled, on, state));
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let hot = response.hovered() && enabled;
+    let fill = if on {
+        blend(p.action, p.base, if hot { 0.08 } else { 0.0 })
+    } else if hot {
+        p.stroke
+    } else {
+        p.surface
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(22), fill);
+    let ink = if !enabled {
+        p.weak
+    } else if on {
+        ON_DARK
+    } else {
+        p.text
+    };
+    let badge = egui::pos2(rect.left() + 22.0, rect.center().y);
+    if glyph == icon::MIC && !cfg!(windows) {
+        paint_microphone(painter, badge, ink);
+    } else {
         painter.text(
-            egui::pos2(rect.left() + 62.0, rect.center().y - 9.0),
-            egui::Align2::LEFT_CENTER,
-            title,
-            FontId::new(14.0, strong()),
-            if enabled { p.text } else { p.weak },
+            badge,
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            FontId::proportional(15.0),
+            ink,
         );
+    }
+    let mut x = rect.left() + 38.0;
+    painter.text(
+        egui::pos2(x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        state,
+        strong_font,
+        ink,
+    );
+    x += state_w + 10.0;
+    if !detail.is_empty() {
         painter.text(
-            egui::pos2(rect.left() + 62.0, rect.center().y + 10.0),
+            egui::pos2(x, rect.center().y),
             egui::Align2::LEFT_CENTER,
             detail,
-            FontId::proportional(12.0),
-            p.weak,
+            thin_font,
+            if on {
+                blend(ON_DARK, p.action, 0.35)
+            } else {
+                p.weak
+            },
         );
-        let t = ui.ctx().animate_bool_responsive(response.id, on);
-        let track_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - 50.0, rect.center().y - 10.0),
-            egui::vec2(36.0, 20.0),
-        );
-        paint_switch(ui, track_rect, on, t, enabled);
-        painter.text(
-            egui::pos2(track_rect.left() - 10.0, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            if on { "On" } else { "Off" },
-            FontId::new(12.0, strong()),
-            if on { p.text } else { p.weak },
-        );
-        focus_ring(ui, &response, rect, 18);
     }
     response
 }
