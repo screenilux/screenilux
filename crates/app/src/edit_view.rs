@@ -110,10 +110,8 @@ pub struct EditView {
     /// the track: selecting in one place selects in the other.
     opened: Option<u32>,
     saved: bool,
-    /// Set by the Save and Close buttons, acted on once the borrows are
-    /// released.
+    /// Set by the Save button, acted on once the borrows are released.
     wants_save: bool,
-    wants_close: bool,
     /// Where the timeline was drawn last frame, for the tour to point at.
     track_at: Option<egui::Rect>,
     /// A GIF being written: how far along, and what came of it.
@@ -151,7 +149,6 @@ impl EditView {
             opened: None,
             saved: true,
             wants_save: false,
-            wants_close: false,
             track_at: None,
             writing: None,
             wrote: None,
@@ -352,9 +349,6 @@ impl EditView {
         if std::mem::take(&mut self.wants_save) {
             self.save();
         }
-        if std::mem::take(&mut self.wants_close) {
-            player.close();
-        }
     }
 
     fn empty(&mut self, ui: &mut egui::Ui, p: &theme::Palette) {
@@ -397,9 +391,6 @@ impl EditView {
                 ui.label(egui::RichText::new(under).size(11.5).color(p.weak));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(theme::outline("Close")).clicked() {
-                    self.wants_close = true;
-                }
                 let label = if self.saved { "Saved" } else { "Save" };
                 if ui.add_enabled(!self.saved, theme::outline(label)).clicked() {
                     self.wants_save = true;
@@ -1392,6 +1383,6 @@ mod tests {
         let v = EditView::new();
         assert!(v.loaded.is_none());
         assert!(v.saved, "nothing to save before anything is open");
-        assert!(!v.wants_save && !v.wants_close);
+        assert!(!v.wants_save);
     }
 }

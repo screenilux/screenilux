@@ -23,7 +23,7 @@ const MARGIN: i8 = 24;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Record,
-    Edit,
+    /// The library, and the editor that opens out of it.
     Recordings,
     Settings,
 }
@@ -128,11 +128,11 @@ impl App {
     /// Open `path` in the player window.
     pub fn play(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.player.open(path, ctx);
-        // Edit is where a recording is watched now, so opening one goes
-        // there. Without this, Play on the saved card and a recording
-        // double-clicked in Explorer both opened it somewhere nobody was
-        // looking.
-        self.tab = Tab::Edit;
+        // A recording is watched and shaped inside Recordings, so opening
+        // one goes there. Without this, Play on the saved card and a
+        // recording double-clicked in Explorer both opened it somewhere
+        // nobody was looking.
+        self.tab = Tab::Recordings;
     }
 
     /// Where recordings go and whether a copy stays here, as last chosen.
@@ -1168,14 +1168,12 @@ impl App {
                 ui.add_space(4.0);
                 let chosen = match self.tab {
                     Tab::Record => 0,
-                    Tab::Edit => 1,
-                    Tab::Recordings => 2,
-                    Tab::Settings => 3,
+                    Tab::Recordings => 1,
+                    Tab::Settings => 2,
                 };
-                match theme::segmented(ui, &["Record", "Edit", "Recordings"], chosen) {
+                match theme::segmented(ui, &["Record", "Recordings"], chosen) {
                     Some(0) => self.tab = Tab::Record,
-                    Some(1) => self.tab = Tab::Edit,
-                    Some(2) => self.tab = Tab::Recordings,
+                    Some(1) => self.tab = Tab::Recordings,
                     _ => {}
                 }
             });
@@ -1261,6 +1259,14 @@ impl App {
         match (player.take_asked(), open) {
             (Some(Asked::Share), Some(path)) => self.share(&path),
             (Some(Asked::Export), _) => self.editor.start_gif(&mut self.player),
+            // Going back puts the recording away, which is what returns the
+            // tab to its list. Effects are written first: they are data
+            // beside the recording, and losing them to a misread arrow
+            // would be worse than keeping a change somebody tried out.
+            (Some(Asked::Back), _) => {
+                self.editor.save();
+                self.player.close();
+            }
             _ => {}
         }
         self.guide(ctx, side);
@@ -1308,10 +1314,17 @@ impl App {
     /// The Recordings tab: open a file, or one saved here. Either plays in
     /// the player window. It keeps the Record tab's height, so switching
     /// between the two does not resize the window, and its list scrolls.
+    /// The Recordings tab: the list of what has been recorded, and the
+    /// editor that opens out of it. One tab rather than two, because
+    /// picking a recording and working on it is one errand; the back arrow
+    /// in the editor returns to the list.
     fn recordings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.player.has_window() {
+            self.edit_tab(ui, ctx);
+            return;
+        }
         let p = theme::palette(ui);
         let out_dir = self.settings.out_dir.clone();
-        let open_before = self.player.has_window();
         egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
                 left: MARGIN,
@@ -1320,13 +1333,6 @@ impl App {
                 bottom: 20,
             }))
             .show(ui, |ui| self.player.library(ui, ctx, &out_dir));
-        // Picking a recording here is picking the thing to work on, so it
-        // opens where it can be watched and edited. Only when one was just
-        // picked: otherwise the tab could never be looked at with a
-        // recording already open.
-        if !open_before && self.player.has_window() {
-            self.tab = Tab::Edit;
-        }
     }
 
     /// Settings: only what is set once and left. Recording options stay on
@@ -1686,7 +1692,6 @@ impl eframe::App for App {
         let _ = header;
         match self.tab {
             Tab::Record => self.record_tab(ui, &ctx),
-            Tab::Edit => self.edit_tab(ui, &ctx),
             Tab::Recordings => self.recordings_tab(ui, &ctx),
             Tab::Settings => self.settings_tab(ui),
         }

@@ -325,6 +325,8 @@ pub enum Asked {
     Share,
     /// Write the recording out as a GIF.
     Export,
+    /// Put the recording away and go back to the list.
+    Back,
 }
 
 /// How long "Copied" shows after copying.
