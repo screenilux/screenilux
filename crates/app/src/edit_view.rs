@@ -160,6 +160,18 @@ impl EditView {
     /// Follow whatever the player has open. The editor never opens a
     /// recording of its own: one decoder, one clock, one picture, and
     /// nothing to keep in step.
+    /// Hand the player whatever is live at the clock's position, so the
+    /// picture shows the effects instead of just listing them.
+    pub fn show_live(&self, player: &mut PlayerView) {
+        let at = player.clock().map_or(0.0, |c| c.position());
+        let live = self
+            .loaded
+            .as_ref()
+            .map(|l| l.edits.active_at(at).cloned().collect())
+            .unwrap_or_default();
+        player.set_live(live);
+    }
+
     pub fn follow(&mut self, player: &PlayerView) {
         let path = player.shareable();
         if self.loaded.as_ref().map(|l| &l.path) == path.as_ref() {

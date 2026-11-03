@@ -1217,6 +1217,7 @@ impl App {
 
         editor.follow(player);
         editor.poll_export(player);
+        editor.show_live(player);
         // The timeline belongs in the picture's card, as its bottom band,
         // not in a panel of its own under it.
         player.set_footer(if player.is_full() {
