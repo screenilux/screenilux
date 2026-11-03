@@ -96,6 +96,9 @@ pub struct PlayerView {
     /// where that band ended up.
     footer: f32,
     footer_at: Option<egui::Rect>,
+    /// The effects live at the current moment, as the editor last worked
+    /// them out. The player draws them; the editor owns them.
+    live: Vec<screenilux_core::edit::Effect>,
     /// How an export is going, as the editor last reported it. The player
     /// shows it beside the link, because a GIF and a link are two answers
     /// to the same question and belong in the same place.
@@ -119,6 +122,7 @@ impl PlayerView {
             stage: None,
             footer: 0.0,
             footer_at: None,
+            live: Vec::new(),
             export: Exporting::Idle,
         }
     }
@@ -132,6 +136,12 @@ impl PlayerView {
 
     pub fn take_placed(&mut self) -> Option<Placed> {
         self.placed.take()
+    }
+
+    /// The effects to draw over the picture, worked out by the editor for
+    /// wherever the clock is now.
+    pub fn set_live(&mut self, live: Vec<screenilux_core::edit::Effect>) {
+        self.live = live;
     }
 
     /// Tell the title row how an export is going, so it can say so beside
@@ -679,14 +689,17 @@ impl PlayerView {
         let multi = placements.len() > 1;
         for p in &placements {
             let r = to_rect(p.area);
+            // What the edit list says is happening to this screen now.
+            let screen = loaded.opened.recording.tracks[p.track]
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned());
+            let live = crate::effects::for_screen(&self.live, screen.as_deref());
+            let shown = crate::effects::lens(&live);
             match &loaded.textures[p.track] {
                 Some((_, tex)) => {
-                    painter.image(
-                        tex.id(),
-                        r,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
+                    painter.image(tex.id(), r, shown, egui::Color32::WHITE);
+                    crate::effects::over(&painter, &pal, r, shown, Some(tex.id()), &live);
                 }
                 None => {
                     painter.text(
