@@ -99,6 +99,13 @@ pub struct PlayerView {
     /// The effects live at the current moment, as the editor last worked
     /// them out. The player draws them; the editor owns them.
     live: Vec<screenilux_core::edit::Effect>,
+    /// Where the pointer went while the recording was made, when it was
+    /// written down. What lets a zoom follow it and clicks be marked.
+    path: Option<screenilux_core::pointer::Track>,
+    /// Where each screen sat on the desktop, by its file name. The pointer
+    /// is recorded in desktop coordinates, so placing it on a picture needs
+    /// to know which part of the desktop that picture was.
+    desks: Vec<(String, screenilux_core::Rect)>,
     /// How an export is going, as the editor last reported it. The player
     /// shows it beside the link, because a GIF and a link are two answers
     /// to the same question and belong in the same place.
@@ -123,6 +130,8 @@ impl PlayerView {
             footer: 0.0,
             footer_at: None,
             live: Vec::new(),
+            path: None,
+            desks: Vec::new(),
             export: Exporting::Idle,
         }
     }
@@ -142,6 +151,17 @@ impl PlayerView {
     /// wherever the clock is now.
     pub fn set_live(&mut self, live: Vec<screenilux_core::edit::Effect>) {
         self.live = live;
+    }
+
+    /// The pointer's path through this recording and where its screens sat,
+    /// both read from the manifest by whoever opened it.
+    pub fn set_path(
+        &mut self,
+        path: Option<screenilux_core::pointer::Track>,
+        desks: Vec<(String, screenilux_core::Rect)>,
+    ) {
+        self.path = path;
+        self.desks = desks;
     }
 
     /// Tell the title row how an export is going, so it can say so beside
@@ -706,14 +726,28 @@ impl PlayerView {
                 .map(|n| n.to_string_lossy().into_owned());
             let live = crate::effects::for_screen(&self.live, screen.as_deref());
             let at = loaded.player.clock().position();
-            let shown = crate::effects::lens(&live, at);
+            let bounds = screen
+                .as_deref()
+                .and_then(|name| self.desks.iter().find(|(f, _)| f == name).map(|(_, b)| *b));
+            let on = bounds.and_then(|b| crate::effects::pointer_on(self.path.as_ref(), b, at));
+            let shown = crate::effects::lens_following(&live, at, on);
             // A backdrop insets the picture, so it decides the rectangle
             // everything else is measured against.
             let r = crate::effects::backdrop(&painter, &pal, r, &live, at);
             match &loaded.textures[p.track] {
                 Some((_, tex)) => {
                     painter.image(tex.id(), r, shown, egui::Color32::WHITE);
-                    crate::effects::over(&painter, &pal, r, shown, Some(tex.id()), &live, at);
+                    let marks = self.path.as_ref().zip(bounds);
+                    crate::effects::over(
+                        &painter,
+                        &pal,
+                        r,
+                        shown,
+                        Some(tex.id()),
+                        &live,
+                        at,
+                        marks,
+                    );
                 }
                 None => {
                     painter.text(

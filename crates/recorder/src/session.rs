@@ -5,8 +5,8 @@
 //! share one run state so pause and stop reach them together.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -107,6 +107,10 @@ pub struct Session {
     workspace: TempDir,
     focus: Option<FocusWorker>,
     router: Option<RouterWorker>,
+    /// Where the pointer went, written down as the recording runs so a zoom
+    /// can follow it and its clicks can be marked afterwards.
+    watcher: Arc<Mutex<screenilux_core::pointer::Watcher>>,
+    sampler: Option<RouterWorker>,
     started: std::time::SystemTime,
 }
 
@@ -243,18 +247,47 @@ impl Session {
             });
         }
 
-        // The hook is only worth installing if something consumes it.
-        let router = config.pointer_events.clone().and_then(|events| {
-            if !(config.effects.zoom || config.effects.clicks || config.click_sound) {
-                return None;
-            }
+        let watcher = Arc::new(Mutex::new(screenilux_core::pointer::Watcher::new()));
+
+        // Reading the pointer is worth doing whether or not any effect is
+        // switched on: the track is what makes a zoom able to follow it
+        // later, and that is decided while editing, not while recording.
+        let sampler = {
             let stop = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&stop);
+            let watcher = Arc::clone(&watcher);
+            let clock = screens.first().map(|s| Arc::clone(&s.elapsed));
             let handle = std::thread::Builder::new()
-                .name("screenilux-router".into())
-                .spawn(move || route_events(events, event_senders, click_tx, flag))
+                .name("screenilux-pointer".into())
+                .spawn(move || {
+                    let step = Duration::from_secs_f64(1.0 / screenilux_core::pointer::RATE);
+                    while !flag.load(Ordering::Relaxed) {
+                        if let Some(clock) = &clock {
+                            let t = clock.get().as_secs_f64();
+                            let at = screenilux_platform::cursor_pos();
+                            if let Ok(mut w) = watcher.lock() {
+                                w.saw(t, at);
+                            }
+                        }
+                        std::thread::sleep(step);
+                    }
+                })
                 .ok();
             Some(RouterWorker { stop, handle })
+        };
+
+        // The hook is only worth installing if something consumes it, and
+        // the track counts: a click is part of it.
+        let router = config.pointer_events.clone().map(|events| {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let watcher = Arc::clone(&watcher);
+            let clock = screens.first().map(|s| Arc::clone(&s.elapsed));
+            let handle = std::thread::Builder::new()
+                .name("screenilux-router".into())
+                .spawn(move || route_events(events, event_senders, click_tx, flag, watcher, clock))
+                .ok();
+            RouterWorker { stop, handle }
         });
 
         // Focus is only meaningful across several screens.
@@ -279,6 +312,8 @@ impl Session {
             workspace,
             focus,
             router,
+            watcher,
+            sampler,
             started: std::time::SystemTime::now(),
         })
     }
@@ -306,6 +341,9 @@ impl Session {
         // recording rather than outliving it.
         if let Some(r) = self.router.take() {
             r.stop();
+        }
+        if let Some(s) = self.sampler.take() {
+            s.stop();
         }
 
         self.control.stop();
@@ -363,6 +401,16 @@ impl Session {
         let folder = self.workspace.path().join("session");
         std::fs::create_dir_all(&folder)?;
 
+        // The pointer's path, if anything was written down. Taken before the
+        // screens are finished, since nothing moves it after the capture
+        // threads have stopped.
+        let pointer = self
+            .watcher
+            .lock()
+            .ok()
+            .map(|mut w| std::mem::take(&mut *w).finish())
+            .filter(|t| !t.is_empty());
+
         let mut manifest = Manifest::new(
             iso_timestamp(self.started),
             round3(self.duration().as_secs_f64()),
@@ -370,6 +418,8 @@ impl Session {
             ENCODER_LABEL.to_string(),
             self.config.camera_enabled(),
         );
+
+        manifest.pointer = pointer;
 
         let mut saved_files = Vec::new();
         let mut lost = failures;
@@ -494,6 +544,8 @@ fn route_events(
     screens: Vec<(screenilux_core::geometry::Rect, Sender<PointerEvent>)>,
     clicks: Option<Sender<()>>,
     stop: Arc<AtomicBool>,
+    watcher: Arc<Mutex<screenilux_core::pointer::Watcher>>,
+    clock: Option<Arc<crate::screen::Elapsed>>,
 ) {
     while !stop.load(Ordering::Relaxed) {
         // A short block keeps the thread responsive to stop without spinning.
@@ -510,6 +562,11 @@ fn route_events(
                     }
                 }
                 PointerEvent::Click { at } => {
+                    if let Some(clock) = &clock
+                        && let Ok(mut w) = watcher.lock()
+                    {
+                        w.clicked(clock.get().as_secs_f64(), at);
+                    }
                     if let Some((_, tx)) = screens.iter().find(|(b, _)| b.contains(at)) {
                         let _ = tx.send(event);
                     }

@@ -12,6 +12,8 @@
 
 use eframe::egui;
 use screenilux_core::edit::{Area, Backdrop, Effect, Place, Tool};
+use screenilux_core::geometry::Rect as Desktop;
+use screenilux_core::pointer::Track;
 
 use crate::theme;
 
@@ -61,10 +63,36 @@ pub fn ramp(at: f64, start: f64, end: f64) -> f32 {
 /// Closeness slider says *how near*. Using the clicked rectangle as the
 /// viewport is what made every zoom the same hard jump whatever the slider
 /// said.
-pub fn lens(live: &[&Effect], at: f64) -> egui::Rect {
+/// How long a click's mark takes to fade.
+const MARK: f64 = 0.55;
+
+/// Where the pointer is on one screen now, as a fraction of it, if the
+/// recording wrote its path down.
+pub fn pointer_on(track: Option<&Track>, bounds: Desktop, at: f64) -> Option<egui::Pos2> {
+    let p = track?.at(at)?;
+    on_screen(p.x, p.y, bounds)
+}
+
+/// A desktop position as a fraction of one screen, or `None` when it is on
+/// another one.
+fn on_screen(x: i32, y: i32, b: Desktop) -> Option<egui::Pos2> {
+    if b.width == 0 || b.height == 0 {
+        return None;
+    }
+    let fx = (x - b.left) as f32 / b.width as f32;
+    let fy = (y - b.top) as f32 / b.height as f32;
+    ((0.0..=1.0).contains(&fx) && (0.0..=1.0).contains(&fy)).then_some(egui::pos2(fx, fy))
+}
+
+/// The lens, able to follow the pointer when `on` says where it is.
+pub fn lens_following(live: &[&Effect], at: f64, on: Option<egui::Pos2>) -> egui::Rect {
     let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-    let Some((area, scale, start, end)) = live.iter().find_map(|e| match &e.tool {
-        Tool::Zoom { area, scale, .. } => Some((*area, *scale, e.start, e.end)),
+    let Some((area, scale, follow, start, end)) = live.iter().find_map(|e| match &e.tool {
+        Tool::Zoom {
+            area,
+            scale,
+            follow,
+        } => Some((*area, *scale, *follow, e.start, e.end)),
         _ => None,
     }) else {
         return whole;
@@ -79,8 +107,15 @@ pub fn lens(live: &[&Effect], at: f64) -> egui::Rect {
     let half = side / 2.0;
     // Centred on what was clicked, pulled back inside the picture so a zoom
     // near an edge shows picture rather than nothing.
-    let cx = (area.x + area.w / 2.0).clamp(half, 1.0 - half);
-    let cy = (area.y + area.h / 2.0).clamp(half, 1.0 - half);
+    // Following keeps the pointer in the middle of the view. Without a
+    // path to follow it holds on what was clicked, which is all a
+    // recording made before the pointer was written down can do.
+    let (cx, cy) = match (follow, on) {
+        (true, Some(p)) => (p.x, p.y),
+        _ => (area.x + area.w / 2.0, area.y + area.h / 2.0),
+    };
+    let cx = cx.clamp(half, 1.0 - half);
+    let cy = cy.clamp(half, 1.0 - half);
     let near = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(side, side));
     egui::Rect::from_min_max(
         whole.min + (near.min - whole.min) * t,
@@ -152,6 +187,7 @@ pub fn backdrop(
 /// `shown` is the part of the texture on screen, so an overlay placed on a
 /// zoomed picture lands where the viewer sees it rather than where it was
 /// clicked.
+#[allow(clippy::too_many_arguments)]
 pub fn over(
     painter: &egui::Painter,
     p: &theme::Palette,
@@ -160,6 +196,7 @@ pub fn over(
     texture: Option<egui::TextureId>,
     live: &[&Effect],
     at: f64,
+    marks: Option<(&Track, Desktop)>,
 ) {
     for effect in live {
         // Overlays come and go on the same curve as the zoom, so a stretch
@@ -241,6 +278,39 @@ pub fn over(
         }
         caption(painter, p, rect, text, *place);
     }
+
+    // A ring wherever a click landed, growing and fading so the eye is
+    // drawn to it after the fact rather than having to be watching.
+    if live.iter().any(|e| matches!(e.tool, Tool::MarkClicks))
+        && let Some((track, bounds)) = marks
+    {
+        for (click, age) in track.clicks_at(at, MARK) {
+            let Some(spot) = on_screen(click.x, click.y, bounds) else {
+                continue;
+            };
+            let Some(on) = spot_on(rect, shown, spot) else {
+                continue;
+            };
+            let grow = rect.width().min(rect.height()) * 0.04;
+            let fade = (1.0 - age as f32).clamp(0.0, 1.0);
+            painter.circle_stroke(
+                on,
+                grow * (0.35 + age as f32),
+                egui::Stroke::new(2.5 * fade, p.signal),
+            );
+        }
+    }
+}
+
+/// Where one point lands on screen, given which part of the picture is
+/// shown. `None` once the zoom has pushed it out of view. A point has no
+/// width, so it cannot go through `place`, which measures what is left of
+/// a rectangle after clipping.
+fn spot_on(rect: egui::Rect, shown: egui::Rect, at: egui::Pos2) -> Option<egui::Pos2> {
+    let x = rect.left() + (at.x - shown.left()) / shown.width() * rect.width();
+    let y = rect.top() + (at.y - shown.top()) / shown.height() * rect.height();
+    let p = egui::pos2(x, y);
+    rect.contains(p).then_some(p)
 }
 
 /// Where an area lands on screen, given which part of the picture is shown.
@@ -387,7 +457,7 @@ mod tests {
     #[test]
     fn with_no_effects_the_whole_picture_is_shown() {
         assert_eq!(
-            lens(&[], SETTLED),
+            lens_following(&[], SETTLED, None),
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
         );
     }
@@ -395,8 +465,8 @@ mod tests {
     #[test]
     fn closeness_decides_how_near_the_zoom_gets() {
         let area = Area::new(0.4, 0.4, 0.2, 0.2);
-        let near = lens(&[&zoom_on(area, 3.0)], SETTLED);
-        let far = lens(&[&zoom_on(area, 1.5)], SETTLED);
+        let near = lens_following(&[&zoom_on(area, 3.0)], SETTLED, None);
+        let far = lens_following(&[&zoom_on(area, 1.5)], SETTLED, None);
         assert!((near.width() - 1.0 / 3.0).abs() < 1e-5);
         assert!((far.width() - 1.0 / 1.5).abs() < 1e-5);
         assert!(
@@ -408,7 +478,7 @@ mod tests {
     #[test]
     fn the_zoom_is_centred_on_what_was_clicked() {
         let e = zoom_on(Area::new(0.3, 0.2, 0.2, 0.2), 2.0);
-        let shown = lens(&[&e], SETTLED);
+        let shown = lens_following(&[&e], SETTLED, None);
         assert!((shown.center().x - 0.4).abs() < 1e-5);
         assert!((shown.center().y - 0.3).abs() < 1e-5);
     }
@@ -416,7 +486,7 @@ mod tests {
     #[test]
     fn a_zoom_near_an_edge_is_pulled_back_onto_the_picture() {
         let e = zoom_on(Area::new(0.0, 0.0, 0.05, 0.05), 2.0);
-        let shown = lens(&[&e], SETTLED);
+        let shown = lens_following(&[&e], SETTLED, None);
         assert!(shown.left() >= -1e-6 && shown.top() >= -1e-6);
         assert!(shown.right() <= 1.0 + 1e-6 && shown.bottom() <= 1.0 + 1e-6);
         assert!(
@@ -429,10 +499,10 @@ mod tests {
     fn a_zoom_eases_in_and_out_rather_than_snapping() {
         let e = zoom_on(Area::new(0.4, 0.4, 0.2, 0.2), 2.0);
         let whole = 1.0;
-        let at_start = lens(&[&e], 0.0).width();
-        let early = lens(&[&e], 0.15).width();
-        let settled = lens(&[&e], SETTLED).width();
-        let at_end = lens(&[&e], 5.0).width();
+        let at_start = lens_following(&[&e], 0.0, None).width();
+        let early = lens_following(&[&e], 0.15, None).width();
+        let settled = lens_following(&[&e], SETTLED, None).width();
+        let at_end = lens_following(&[&e], 5.0, None).width();
         assert!(
             (at_start - whole).abs() < 1e-6,
             "it starts from the whole picture"
@@ -446,6 +516,53 @@ mod tests {
             "and reaches the full closeness"
         );
         assert!((at_end - whole).abs() < 1e-6, "then lets go again");
+    }
+
+    #[test]
+    fn following_centres_on_the_pointer_rather_than_the_click() {
+        let mut edits = EditList::default();
+        let id = edits.add(
+            0.0,
+            5.0,
+            Tool::Zoom {
+                area: Area::new(0.1, 0.1, 0.1, 0.1),
+                follow: true,
+                scale: 2.0,
+            },
+        );
+        let e = edits.get(id).unwrap().clone();
+        let at_pointer = egui::pos2(0.8, 0.6);
+        let shown = lens_following(&[&e], SETTLED, Some(at_pointer));
+        // Pulled back inside the picture, so it cannot centre exactly.
+        assert!((shown.center().x - 0.75).abs() < 1e-5);
+        assert!((shown.center().y - 0.6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn without_a_path_following_holds_where_it_was_placed() {
+        let mut edits = EditList::default();
+        let id = edits.add(
+            0.0,
+            5.0,
+            Tool::Zoom {
+                area: Area::new(0.3, 0.3, 0.2, 0.2),
+                follow: true,
+                scale: 2.0,
+            },
+        );
+        let e = edits.get(id).unwrap().clone();
+        let shown = lens_following(&[&e], SETTLED, None);
+        assert!((shown.center().x - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_pointer_on_another_screen_is_not_placed_on_this_one() {
+        let left = screenilux_core::Rect::new(0, 0, 1920, 1080);
+        assert!(on_screen(100, 100, left).is_some());
+        assert!(
+            on_screen(2500, 100, left).is_none(),
+            "that is the other monitor"
+        );
     }
 
     #[test]

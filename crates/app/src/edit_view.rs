@@ -170,6 +170,29 @@ impl EditView {
             .map(|l| l.edits.active_at(at).cloned().collect())
             .unwrap_or_default();
         player.set_live(live);
+        self.share_path(player);
+    }
+
+    /// Hand over the pointer's path and where the screens were, so a zoom
+    /// can follow it and clicks can be marked.
+    fn share_path(&self, player: &mut PlayerView) {
+        let (path, desks) = match self.loaded.as_ref() {
+            Some(l) => (
+                l.manifest.pointer.clone(),
+                l.manifest
+                    .screens
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.file.clone(),
+                            screenilux_core::Rect::new(s.left, s.top, s.width, s.height),
+                        )
+                    })
+                    .collect(),
+            ),
+            None => (None, Vec::new()),
+        };
+        player.set_path(path, desks);
     }
 
     pub fn follow(&mut self, player: &PlayerView) {
