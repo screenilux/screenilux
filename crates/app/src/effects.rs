@@ -11,7 +11,7 @@
 //! will and cost nothing per frame, which is what a scrubbing editor needs.
 
 use eframe::egui;
-use screenilux_core::edit::{Area, Effect, Place, Tool};
+use screenilux_core::edit::{Area, Backdrop, Effect, Place, Tool};
 
 use crate::theme;
 
@@ -31,31 +31,119 @@ pub fn for_screen<'a>(live: &'a [Effect], screen: Option<&str>) -> Vec<&'a Effec
         .collect()
 }
 
+/// How long a zoom takes to come on, and to let go again. Short enough not
+/// to be waited through, long enough that the eye follows the picture in
+/// rather than being dropped into it.
+const RAMP: f64 = 0.45;
+
+/// How far through an effect's own span `at` is, as a weight from 0 to 1
+/// that rises at the start and falls at the end.
+///
+/// Without this an effect snaps on: one frame the picture is whole, the
+/// next it is magnified, and the viewer has to work out what they are
+/// looking at. The curve is a smoothstep, so it leaves and arrives at rest.
+pub fn ramp(at: f64, start: f64, end: f64) -> f32 {
+    let span = (end - start).max(1e-6);
+    // A short effect never reaches full strength rather than snapping: it
+    // gets half its length to rise and half to fall.
+    let r = RAMP.min(span / 2.0).max(1e-6);
+    let rise = ((at - start) / r).clamp(0.0, 1.0);
+    let fall = ((end - at) / r).clamp(0.0, 1.0);
+    let x = rise.min(fall) as f32;
+    x * x * (3.0 - 2.0 * x)
+}
+
 /// The part of the texture to draw, which is the whole of it unless a zoom
-/// is on. Returned in texture coordinates, so the picture magnifies without
-/// anything being resampled.
-pub fn lens(live: &[&Effect]) -> egui::Rect {
+/// is on.
+///
+/// How close it gets is the effect's own `scale`, not the size of the
+/// rectangle that was clicked: a click says *where* to look, and the
+/// Closeness slider says *how near*. Using the clicked rectangle as the
+/// viewport is what made every zoom the same hard jump whatever the slider
+/// said.
+pub fn lens(live: &[&Effect], at: f64) -> egui::Rect {
     let whole = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-    let Some(area) = live.iter().find_map(|e| match &e.tool {
-        Tool::Zoom { area, .. } => Some(*area),
+    let Some((area, scale, start, end)) = live.iter().find_map(|e| match &e.tool {
+        Tool::Zoom { area, scale, .. } => Some((*area, *scale, e.start, e.end)),
         _ => None,
     }) else {
         return whole;
     };
-    // The area is a fraction of the screen, which is what texture
-    // coordinates are, so it is already the rectangle to sample.
-    let r = egui::Rect::from_min_max(
-        egui::pos2(area.x.clamp(0.0, 1.0), area.y.clamp(0.0, 1.0)),
-        egui::pos2(
-            (area.x + area.w).clamp(0.0, 1.0),
-            (area.y + area.h).clamp(0.0, 1.0),
-        ),
-    );
-    if r.width() < 0.02 || r.height() < 0.02 {
-        whole
-    } else {
-        r
+    let t = ramp(at, start, end);
+    if t <= 0.0 {
+        return whole;
     }
+    // Closeness is how many times nearer, so the slice shown is its
+    // reciprocal. The same fraction on both axes keeps the picture's shape.
+    let side = (1.0 / scale.max(1.01)).clamp(0.08, 1.0);
+    let half = side / 2.0;
+    // Centred on what was clicked, pulled back inside the picture so a zoom
+    // near an edge shows picture rather than nothing.
+    let cx = (area.x + area.w / 2.0).clamp(half, 1.0 - half);
+    let cy = (area.y + area.h / 2.0).clamp(half, 1.0 - half);
+    let near = egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(side, side));
+    egui::Rect::from_min_max(
+        whole.min + (near.min - whole.min) * t,
+        whole.max + (near.max - whole.max) * t,
+    )
+}
+
+/// Where the picture sits once a backdrop has inset it, and what is drawn
+/// behind. `None` when no backdrop is on, which is the ordinary case.
+///
+/// This is the look most demos are published in: the recording pulled off
+/// the edges of the frame so it reads as a thing being shown rather than a
+/// screen you are sitting at.
+pub fn backdrop(
+    painter: &egui::Painter,
+    p: &theme::Palette,
+    rect: egui::Rect,
+    live: &[&Effect],
+    at: f64,
+) -> egui::Rect {
+    let Some((pad, style, start, end)) = live.iter().find_map(|e| match &e.tool {
+        Tool::Backdrop { pad, style } => Some((*pad, *style, e.start, e.end)),
+        _ => None,
+    }) else {
+        return rect;
+    };
+    let t = ramp(at, start, end);
+    if t <= 0.0 {
+        return rect;
+    }
+    let inset = rect.width().min(rect.height()) * pad.clamp(0.0, 0.3) * t;
+    let inner = rect.shrink(inset);
+    if inner.width() < 8.0 || inner.height() < 8.0 {
+        return rect;
+    }
+    match style {
+        Backdrop::Solid => {
+            painter.rect_filled(rect, 0.0, p.stage);
+        }
+        Backdrop::Gradient | Backdrop::Blurred => {
+            // A gradient in bands: a painter has no shader, and at this
+            // size the steps are below what the eye picks out. The blurred
+            // style falls back to it until the picture can be sampled
+            // behind itself.
+            let bands = 24;
+            let top = theme::blend(p.stage, p.signal, 0.35);
+            for i in 0..bands {
+                let f = i as f32 / bands as f32;
+                let next = (i + 1) as f32 / bands as f32;
+                let band = egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), rect.top() + f * rect.height()),
+                    egui::pos2(rect.right(), rect.top() + next * rect.height()),
+                );
+                painter.rect_filled(band, 0.0, theme::blend(top, p.stage, f));
+            }
+        }
+    }
+    painter.rect_filled(
+        inner.expand(1.0),
+        egui::CornerRadius::same((inset * 0.35).clamp(0.0, 18.0) as u8),
+        egui::Color32::from_black_alpha(40),
+    );
+    inner
 }
 
 /// Everything that is painted over the picture rather than sampled out of
@@ -71,8 +159,16 @@ pub fn over(
     shown: egui::Rect,
     texture: Option<egui::TextureId>,
     live: &[&Effect],
+    at: f64,
 ) {
     for effect in live {
+        // Overlays come and go on the same curve as the zoom, so a stretch
+        // with several effects on it reads as one move rather than a set of
+        // things switching on at slightly different moments.
+        let t = ramp(at, effect.start, effect.end);
+        if t <= 0.0 {
+            continue;
+        }
         let Some(area) = effect.tool.area() else {
             continue;
         };
@@ -93,7 +189,7 @@ pub fn over(
             Tool::Spotlight { dim, .. } => {
                 // The dark is painted as the four panes around the lit part,
                 // since a painter has no hole to punch.
-                let veil = egui::Color32::from_black_alpha((dim.clamp(0.0, 1.0) * 255.0) as u8);
+                let veil = egui::Color32::from_black_alpha((dim.clamp(0.0, 1.0) * t * 255.0) as u8);
                 for pane in around(rect, on) {
                     painter.rect_filled(pane, 0.0, veil);
                 }
@@ -106,7 +202,11 @@ pub fn over(
             }
             Tool::Callout { text, .. } => {
                 for pane in around(rect, on) {
-                    painter.rect_filled(pane, 0.0, egui::Color32::from_black_alpha(96));
+                    painter.rect_filled(
+                        pane,
+                        0.0,
+                        egui::Color32::from_black_alpha((96.0 * t) as u8),
+                    );
                 }
                 painter.rect_stroke(
                     on,
@@ -267,7 +367,7 @@ mod tests {
     use super::*;
     use screenilux_core::edit::EditList;
 
-    fn zoom_on(area: Area) -> Effect {
+    fn zoom_on(area: Area, scale: f32) -> Effect {
         let mut edits = EditList::default();
         let id = edits.add(
             0.0,
@@ -275,34 +375,102 @@ mod tests {
             Tool::Zoom {
                 area,
                 follow: false,
-                scale: 2.0,
+                scale,
             },
         );
         edits.get(id).unwrap().clone()
     }
 
+    /// Halfway through a span long enough to have a flat middle.
+    const SETTLED: f64 = 2.5;
+
     #[test]
     fn with_no_effects_the_whole_picture_is_shown() {
         assert_eq!(
-            lens(&[]),
+            lens(&[], SETTLED),
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
         );
     }
 
     #[test]
-    fn a_zoom_shows_the_part_it_was_placed_on() {
-        let e = zoom_on(Area::new(0.25, 0.1, 0.5, 0.4));
-        let shown = lens(&[&e]);
-        assert!((shown.left() - 0.25).abs() < 1e-6);
-        assert!((shown.top() - 0.1).abs() < 1e-6);
-        assert!((shown.width() - 0.5).abs() < 1e-6);
-        assert!((shown.height() - 0.4).abs() < 1e-6);
+    fn closeness_decides_how_near_the_zoom_gets() {
+        let area = Area::new(0.4, 0.4, 0.2, 0.2);
+        let near = lens(&[&zoom_on(area, 3.0)], SETTLED);
+        let far = lens(&[&zoom_on(area, 1.5)], SETTLED);
+        assert!((near.width() - 1.0 / 3.0).abs() < 1e-5);
+        assert!((far.width() - 1.0 / 1.5).abs() < 1e-5);
+        assert!(
+            near.width() < far.width(),
+            "a higher closeness has to show less of the picture"
+        );
     }
 
     #[test]
-    fn a_zoom_too_small_to_sample_is_ignored() {
-        let e = zoom_on(Area::new(0.5, 0.5, 0.001, 0.001));
-        assert_eq!(lens(&[&e]).width(), 1.0, "a sliver would magnify to mush");
+    fn the_zoom_is_centred_on_what_was_clicked() {
+        let e = zoom_on(Area::new(0.3, 0.2, 0.2, 0.2), 2.0);
+        let shown = lens(&[&e], SETTLED);
+        assert!((shown.center().x - 0.4).abs() < 1e-5);
+        assert!((shown.center().y - 0.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_zoom_near_an_edge_is_pulled_back_onto_the_picture() {
+        let e = zoom_on(Area::new(0.0, 0.0, 0.05, 0.05), 2.0);
+        let shown = lens(&[&e], SETTLED);
+        assert!(shown.left() >= -1e-6 && shown.top() >= -1e-6);
+        assert!(shown.right() <= 1.0 + 1e-6 && shown.bottom() <= 1.0 + 1e-6);
+        assert!(
+            (shown.width() - 0.5).abs() < 1e-5,
+            "and keeps its closeness"
+        );
+    }
+
+    #[test]
+    fn a_zoom_eases_in_and_out_rather_than_snapping() {
+        let e = zoom_on(Area::new(0.4, 0.4, 0.2, 0.2), 2.0);
+        let whole = 1.0;
+        let at_start = lens(&[&e], 0.0).width();
+        let early = lens(&[&e], 0.15).width();
+        let settled = lens(&[&e], SETTLED).width();
+        let at_end = lens(&[&e], 5.0).width();
+        assert!(
+            (at_start - whole).abs() < 1e-6,
+            "it starts from the whole picture"
+        );
+        assert!(
+            early < whole && early > settled,
+            "part way in it is part way zoomed: {early}"
+        );
+        assert!(
+            (settled - 0.5).abs() < 1e-5,
+            "and reaches the full closeness"
+        );
+        assert!((at_end - whole).abs() < 1e-6, "then lets go again");
+    }
+
+    #[test]
+    fn the_ramp_leaves_and_arrives_at_rest() {
+        assert_eq!(ramp(0.0, 0.0, 4.0), 0.0);
+        assert_eq!(ramp(4.0, 0.0, 4.0), 0.0);
+        assert_eq!(ramp(2.0, 0.0, 4.0), 1.0);
+        // Monotonic on the way up, so nothing jitters.
+        let mut last = 0.0;
+        for i in 0..=20 {
+            let now = ramp(f64::from(i) * 0.02, 0.0, 4.0);
+            assert!(now >= last, "the ramp went backwards at {i}");
+            last = now;
+        }
+    }
+
+    #[test]
+    fn an_effect_too_short_to_ramp_still_behaves() {
+        let mut edits = EditList::default();
+        let id = edits.add(1.0, 1.1, Tool::Mute);
+        let e = edits.get(id).unwrap();
+        let peak = ramp(1.05, e.start, e.end);
+        assert!((0.0..=1.0).contains(&peak), "weight out of range: {peak}");
+        assert_eq!(ramp(1.0, e.start, e.end), 0.0);
+        assert_eq!(ramp(1.1, e.start, e.end), 0.0);
     }
 
     #[test]

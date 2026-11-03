@@ -649,7 +649,6 @@ impl EditView {
 
         let mut remove: Option<u32> = None;
         let mut seek: Option<f64> = None;
-        let mut refit: Option<u32> = None;
 
         egui::ScrollArea::vertical()
             .max_height(tall)
@@ -709,7 +708,7 @@ impl EditView {
                             }
                             if open {
                                 ui.add_space(6.0);
-                                self.editor(ui, p, m, duration, &mut remove, &mut seek, &mut refit);
+                                self.editor(ui, p, m, duration, &mut remove, &mut seek);
                             }
                         });
                     ui.add_space(5.0);
@@ -719,16 +718,6 @@ impl EditView {
         let Some(l) = self.loaded.as_mut() else {
             return;
         };
-        if let Some(id) = refit {
-            // Put the end back where the recording says it belongs. Without a
-            // pointer track this is the placed default; with one it becomes
-            // the effect the pointer actually left the area.
-            if let Some(m) = l.edits.get(id).cloned() {
-                let end = (m.start + 6.0).min(l.duration);
-                l.edits.update(id, |m| m.end = end);
-                self.saved = false;
-            }
-        }
         if let Some(t) = seek {
             clock.seek(t);
         }
@@ -751,7 +740,6 @@ impl EditView {
         duration: f64,
         remove: &mut Option<u32>,
         seek: &mut Option<f64>,
-        refit: &mut Option<u32>,
     ) {
         let Some(l) = self.loaded.as_mut() else {
             return;
@@ -812,23 +800,27 @@ impl EditView {
                     });
                     self.saved = false;
                 }
-                if theme::setting(ui, &mut follow, "Follow the pointer").changed() {
-                    l.edits.update(id, |m| {
-                        m.tool = Tool::Zoom {
-                            area,
-                            follow,
-                            scale,
-                        };
-                    });
-                    self.saved = false;
-                }
-                if ui
-                    .add(theme::outline("Re-fit to the pointer"))
-                    .on_hover_text("Put the end where the pointer left this area")
-                    .clicked()
-                {
-                    *refit = Some(id);
-                }
+                // Following needs a note of where the pointer was, which
+                // the recorder does not keep yet. The switch is shown
+                // rather than hidden, because the choice is saved and will
+                // start working on recordings made after it does; but it
+                // says so instead of looking like it is already on.
+                ui.add_enabled_ui(false, |ui| {
+                    if theme::setting(ui, &mut follow, "Follow the pointer").changed() {
+                        l.edits.update(id, |m| {
+                            m.tool = Tool::Zoom {
+                                area,
+                                follow,
+                                scale,
+                            };
+                        });
+                        self.saved = false;
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Not yet: following needs the recorder to keep track of where the                      pointer was, which it does not do. The zoom holds on this area.",
+                );
             }
             Tool::Callout { area, text } => {
                 let area = *area;

@@ -631,8 +631,18 @@ impl PlayerView {
         };
         let rec = &l.opened.recording;
         let sizes: Vec<(u32, u32)> = rec.tracks.iter().map(|t| (t.width, t.height)).collect();
-        let active = self
-            .pinned
+        // A "show one screen" effect overrides what the pointer chose; it
+        // is the one thing the edit list has to say about which screen is
+        // on, so it outranks the recording's own focus track.
+        let forced = self.live.iter().find_map(|e| match &e.tool {
+            screenilux_core::edit::Tool::Screen { file } => rec
+                .tracks
+                .iter()
+                .position(|t| t.path.file_name().is_some_and(|n| n == file.as_str())),
+            _ => None,
+        });
+        let active = forced
+            .or(self.pinned)
             .unwrap_or_else(|| rec.active_at(l.player.clock().position()));
         arrange(
             &sizes,
@@ -695,11 +705,15 @@ impl PlayerView {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned());
             let live = crate::effects::for_screen(&self.live, screen.as_deref());
-            let shown = crate::effects::lens(&live);
+            let at = loaded.player.clock().position();
+            let shown = crate::effects::lens(&live, at);
+            // A backdrop insets the picture, so it decides the rectangle
+            // everything else is measured against.
+            let r = crate::effects::backdrop(&painter, &pal, r, &live, at);
             match &loaded.textures[p.track] {
                 Some((_, tex)) => {
                     painter.image(tex.id(), r, shown, egui::Color32::WHITE);
-                    crate::effects::over(&painter, &pal, r, shown, Some(tex.id()), &live);
+                    crate::effects::over(&painter, &pal, r, shown, Some(tex.id()), &live, at);
                 }
                 None => {
                     painter.text(
