@@ -22,8 +22,12 @@ pub struct Overlay {
     last_seq: u64,
     hwnd: Option<isize>,
     excluded: bool,
-    /// Clipped to a circle, which needs the window to exist first.
+    /// Corners rounded, which needs the window to exist first.
     shaped: bool,
+    /// The camera's own shape, once a frame has shown what it is. The
+    /// bubble is sized to it rather than to a square, so faces are not
+    /// cropped to fit a circle that nothing was framed for.
+    aspect: Option<f32>,
     /// Set once if the platform refuses the exclusion, so the UI can say so
     /// rather than silently recording a doubled camera.
     pub exclusion_error: Option<String>,
@@ -38,6 +42,7 @@ impl Overlay {
             hwnd: None,
             excluded: false,
             shaped: false,
+            aspect: None,
             exclusion_error: None,
             position,
         }
@@ -49,7 +54,27 @@ impl Overlay {
 
     /// Draw the bubble and keep its capture exclusion applied.
     pub fn show(&mut self, ctx: &egui::Context, feed: &Arc<CameraFeed>, size: (u32, u32)) {
-        self.position = Rect::new(self.position.left, self.position.top, size.0, size.1);
+        // The first frame says what shape the camera actually is; the
+        // bubble takes that shape, scaled down to the size asked for, so a
+        // widescreen camera is not squeezed into a square.
+        if self.aspect.is_none()
+            && let Some(f) = feed.latest()
+            && f.height > 0
+        {
+            self.aspect = Some(f.width as f32 / f.height as f32);
+        }
+        let (w, h) = match self.aspect {
+            Some(a) if a > 0.0 => {
+                let long = size.0.max(size.1) as f32;
+                if a >= 1.0 {
+                    (long.round() as u32, (long / a).round() as u32)
+                } else {
+                    ((long * a).round() as u32, long.round() as u32)
+                }
+            }
+            _ => size,
+        };
+        self.position = Rect::new(self.position.left, self.position.top, w.max(2), h.max(2));
         let pos = self.position;
 
         ctx.show_viewport_immediate(
@@ -60,7 +85,7 @@ impl Overlay {
                 .with_always_on_top()
                 .with_resizable(false)
                 .with_taskbar(false)
-                .with_inner_size([size.0 as f32, size.1 as f32])
+                .with_inner_size([self.position.width as f32, self.position.height as f32])
                 .with_position([pos.left as f32, pos.top as f32]),
             |vp_ctx, _class| {
                 let vp = vp_ctx.clone();
@@ -173,7 +198,7 @@ impl Overlay {
         let Some(h) = self.hwnd else { return };
         if !self.shaped {
             // SAFETY: as below.
-            unsafe { screenilux_platform::set_circular(h) };
+            unsafe { screenilux_platform::set_rounded(h, true) };
             self.shaped = true;
         }
         // Where the system cannot hide it, the preview is what the recording

@@ -1,16 +1,14 @@
 //! Keeping our own windows out of the recording, and the look of the
 //! recording bar.
 
-use windows::Win32::Foundation::{COLORREF, HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, HWND};
 use windows::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_ROUND,
     DwmSetWindowAttribute,
 };
-use windows::Win32::Graphics::Gdi::{CreateEllipticRgn, SetWindowRgn};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GWL_EXSTYLE, GetAncestor, GetWindowLongPtrW, GetWindowRect, LWA_ALPHA,
-    SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowLongPtrW,
-    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_LAYERED,
+    GA_ROOT, GWL_EXSTYLE, GetAncestor, GetWindowLongPtrW, LWA_ALPHA, SetLayeredWindowAttributes,
+    SetWindowDisplayAffinity, SetWindowLongPtrW, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_LAYERED,
 };
 
 /// Windows can keep a window out of screen capture, so the recording bar and
@@ -131,31 +129,6 @@ pub unsafe fn set_rounded(hwnd: isize, rounded: bool) {
             (&preference as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
             size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
         );
-    }
-}
-
-/// Clip a window to the circle that fits its current size, for the camera
-/// bubble. Call again after the window is resized.
-///
-/// # Safety
-///
-/// `hwnd` must be a live top-level window handle.
-pub unsafe fn set_circular(hwnd: isize) {
-    if hwnd == 0 {
-        return;
-    }
-    let handle = HWND(hwnd as *mut std::ffi::c_void);
-    // SAFETY: a live handle; the region is handed to Windows, which owns it
-    // from then on.
-    unsafe {
-        let mut r = RECT::default();
-        if GetWindowRect(handle, &mut r).is_err() {
-            return;
-        }
-        let (w, h) = (r.right - r.left, r.bottom - r.top);
-        let d = w.min(h);
-        let region = CreateEllipticRgn((w - d) / 2, (h - d) / 2, (w + d) / 2 + 1, (h + d) / 2 + 1);
-        SetWindowRgn(handle, Some(region), true);
     }
 }
 

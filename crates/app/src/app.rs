@@ -170,6 +170,11 @@ impl App {
             return;
         }
 
+        // The camera is released when a recording ends, so a setting left
+        // switched on has to open it again here.
+        if self.settings.effects.camera && self.runtime.camera_feed.is_none() {
+            self.toggle_camera(true);
+        }
         let camera = self
             .runtime
             .camera_feed
@@ -240,6 +245,13 @@ impl App {
                 self.player.recordings_changed();
             }
             Err(e) => self.status = format!("Could not save: {e}"),
+        }
+        // Let the camera go. Holding it open between recordings leaves the
+        // light on and the device busy for other apps, for a preview nobody
+        // asked to keep; the setting stays on and `start` opens it again.
+        if self.settings.effects.camera {
+            self.runtime.stop_camera();
+            self.overlay = None;
         }
         self.phase = Phase::Idle;
         self.started_at = None;

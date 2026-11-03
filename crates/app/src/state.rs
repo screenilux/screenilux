@@ -9,7 +9,10 @@ use screenilux_core::geometry::Monitor;
 
 /// The camera bubble, in pixels: a circle big enough to read a face, small
 /// enough to leave the screen readable.
-pub const CAMERA_SIZE: (u32, u32) = (240, 240);
+/// The bubble's long side. The short side follows the camera's own
+/// shape once a frame has arrived; until then this is a sensible
+/// widescreen guess, which is what nearly every webcam is.
+pub const CAMERA_SIZE: (u32, u32) = (320, 180);
 pub const CAMERA_MARGIN: i32 = 28;
 pub const FPS_CHOICES: [u32; 5] = [10, 15, 24, 30, 60];
 
@@ -271,9 +274,14 @@ mod tests {
     }
 
     #[test]
-    fn the_camera_bubble_is_round() {
+    fn the_camera_bubble_starts_widescreen() {
         let (w, h) = CAMERA_SIZE;
-        assert_eq!(w, h, "a square bubble clips to a circle");
+        assert!(w > h, "nearly every webcam is wider than it is tall");
+        let aspect = w as f32 / h as f32;
+        assert!(
+            (aspect - 16.0 / 9.0).abs() < 0.05,
+            "a guess worth making until a frame says otherwise: {aspect}"
+        );
     }
 
     #[test]
