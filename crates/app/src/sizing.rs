@@ -18,6 +18,10 @@ use eframe::egui;
 /// so on a wide window the column is centred rather than stretched.
 pub const COLUMN: f32 = 460.0;
 
+/// The width the Record tab lays its screens out at. A live preview is the
+/// thing being judged, so it gets more room than a column of settings.
+pub const STAGE: f32 = 920.0;
+
 /// The smallest the window can be made, other than as the bar.
 pub const MIN_SIZE: egui::Vec2 = egui::vec2(560.0, 420.0);
 

@@ -462,6 +462,8 @@ impl App {
 
     /// The Record tab. Returns how tall it would like to be, to show
     /// everything without scrolling.
+    /// The Record tab: a question, the screens it is asking about, and one
+    /// row along the bottom holding what gets recorded with them.
     fn record_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = theme::palette(ui);
         egui::Panel::bottom("transport")
@@ -469,10 +471,10 @@ impl App {
                 left: MARGIN,
                 right: MARGIN,
                 top: 12,
-                bottom: 20,
+                bottom: 18,
             }))
             .show_separator_line(false)
-            .show(ui, |ui| column(ui, |ui| self.transport(ui, ctx)));
+            .show(ui, |ui| self.deck(ui, ctx));
 
         egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(p.base).inner_margin(egui::Margin {
@@ -485,25 +487,110 @@ impl App {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
-                        column(ui, |ui| {
-                            ui.spacing_mut().item_spacing.y = 10.0;
+                        stage(ui, |ui| {
                             self.warnings(ui);
                             if self.phase == Phase::Idle
                                 && let Some(saved) =
                                     self.last_save.clone().filter(|_| self.status.is_empty())
                             {
                                 self.saved_card(ui, ctx, saved);
-                                ui.add_space(4.0);
+                                ui.add_space(10.0);
+                            }
+                            if self.phase == Phase::Idle {
+                                self.ask(ui);
                             }
                             self.screens(ui);
-                            ui.add_space(6.0);
-                            self.sources(ui);
-                            ui.add_space(4.0);
-                            self.more_options(ui);
-                            ui.add_space(8.0);
+                            ui.add_space(14.0);
                         });
                     });
             });
+    }
+
+    /// The question at the top of the Record tab. It names the job rather
+    /// than the controls, so the screens below it read as the answer.
+    fn ask(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        let many = self.settings.monitors.len() > 1;
+        ui.vertical_centered(|ui| {
+            ui.add_space(26.0);
+            ui.label(
+                egui::RichText::new("What would you like to record?")
+                    .font(egui::FontId::new(27.0, theme::bold()))
+                    .color(p.text),
+            );
+            ui.add_space(6.0);
+            theme::hint(
+                ui,
+                if many {
+                    "Tick a screen, or several. Each one is recorded at its own size."
+                } else {
+                    "Your screen, recorded at its own size."
+                },
+            );
+            ui.add_space(26.0);
+        });
+    }
+
+    /// The row along the bottom: what is recorded alongside the screens, and
+    /// the one button that starts it.
+    fn deck(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.phase != Phase::Idle {
+            stage(ui, |ui| self.transport(ui, ctx));
+            return;
+        }
+        // The deck runs the width of the window while the screens stay in
+        // the middle: a row of switches has no reading measure to keep, and
+        // crowding them would make the one that is on harder to spot.
+        const ROW: f32 = 44.0;
+        const BUTTON: f32 = 196.0;
+        const GAP: f32 = 12.0;
+        let full = ui.available_width();
+        let beside = full - BUTTON - GAP;
+
+        if beside < 520.0 {
+            // Too narrow for both on one line: the switches wrap and the
+            // button takes a line of its own underneath.
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                self.sources(ui, false);
+            });
+            ui.add_space(10.0);
+            if theme::big_button(ui, "Start recording", true).clicked() {
+                self.start(ctx);
+            }
+        } else {
+            // The row is split by hand rather than by nesting one layout
+            // inside its opposite: the button's room is taken out first, so
+            // the switches cannot run under it and the row keeps its height.
+            let (band, _) = ui.allocate_exact_size(egui::vec2(full, ROW), egui::Sense::hover());
+            let left = egui::Rect::from_min_size(band.min, egui::vec2(beside.max(0.0), ROW));
+            let right = egui::Rect::from_min_size(
+                egui::pos2(band.right() - BUTTON, band.top()),
+                egui::vec2(BUTTON, ROW),
+            );
+
+            let mut switches = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(left)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            switches.spacing_mut().item_spacing.x = 10.0;
+            // The device names are the first thing to go when the row is
+            // tight: which switch is on matters more than what it would use.
+            self.sources(&mut switches, beside > 760.0);
+
+            let mut go = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(right)
+                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            );
+            if theme::go_button(&mut go, "Start recording").clicked() {
+                self.start(ctx);
+            }
+        }
+
+        ui.add_space(10.0);
+        self.more_options(ui);
     }
 
     fn warnings(&self, ui: &mut egui::Ui) {
@@ -587,10 +674,11 @@ impl App {
         ui.vertical_centered(|ui| theme::hint(ui, &summary));
     }
 
-    /// The camera, the microphone and the computer's own sound, each a row
-    /// that switches on and off.
-    fn sources(&mut self, ui: &mut egui::Ui) {
+    /// The camera, the microphone and the computer's own sound, each a pill
+    /// that says what it would use and switches on and off.
+    fn sources(&mut self, ui: &mut egui::Ui, names: bool) {
         let busy = self.busy();
+
         let camera_name = self
             .probes
             .cameras
@@ -598,58 +686,77 @@ impl App {
             .cloned()
             .unwrap_or_else(|| {
                 if self.probes.ready {
-                    "No camera found".into()
+                    "none found".into()
                 } else {
-                    "Looking for cameras…".into()
+                    "looking…".into()
                 }
             });
         let can_camera = !busy && !self.probes.cameras.is_empty();
         let on = self.settings.effects.camera;
-        let row = ui.add_enabled_ui(can_camera, |ui| {
-            theme::source_row(ui, icon::CAMERA, "Camera", &camera_name, on)
+        let hit = ui.add_enabled_ui(can_camera, |ui| {
+            theme::pill(
+                ui,
+                icon::CAMERA,
+                if on { "Camera on" } else { "Camera off" },
+                if names { &camera_name } else { "" },
+                on,
+            )
         });
-        if row.inner.clicked() {
+        if hit.inner.clicked() {
             self.settings.effects.camera = !on;
             self.toggle_camera(!on);
         }
 
         let mic = self.probes.has_microphone;
         let detail = if mic {
-            "Default microphone"
+            "default microphone"
         } else if self.probes.ready {
-            "No microphone found"
+            "none found"
         } else {
-            "Looking for a microphone…"
+            "looking…"
         };
         let on = self.settings.microphone && mic;
-        let row = ui.add_enabled_ui(!busy && mic, |ui| {
-            theme::source_row(ui, icon::MIC, "Microphone", detail, on)
+        let hit = ui.add_enabled_ui(!busy && mic, |ui| {
+            theme::pill(
+                ui,
+                icon::MIC,
+                if on {
+                    "Microphone on"
+                } else {
+                    "Microphone off"
+                },
+                if names { detail } else { "" },
+                on,
+            )
         });
-        if row.inner.clicked() {
+        if hit.inner.clicked() {
             self.settings.microphone = !self.settings.microphone;
         }
 
         let speakers = self.probes.has_system_sound;
         let detail = if speakers {
-            "What your PC plays: videos, calls, apps"
+            "videos, calls, apps"
         } else if self.probes.ready {
-            "No speakers or headphones found"
+            "none found"
         } else {
-            "Looking for speakers…"
+            "looking…"
         };
         let on = self.settings.system_sound && speakers;
-        let row = ui.add_enabled_ui(!busy && speakers, |ui| {
-            theme::source_row(ui, icon::SPEAKER, "System sound", detail, on)
-        });
-        if row.inner.clicked() {
-            self.settings.system_sound = !self.settings.system_sound;
-        }
-        if self.settings.effects.camera {
-            theme::hint(
+        let hit = ui.add_enabled_ui(!busy && speakers, |ui| {
+            theme::pill(
                 ui,
-                "Drag the camera bubble anywhere, even while recording. It is recorded into \
-                 the screen it sits on.",
-            );
+                icon::SPEAKER,
+                if on {
+                    "System sound on"
+                } else {
+                    "System sound off"
+                },
+                if names { detail } else { "" },
+                on,
+            )
+        });
+        if hit.inner.clicked() {
+            self.settings.system_sound = !self.settings.system_sound;
         }
     }
 
@@ -1597,12 +1704,23 @@ impl eframe::App for App {
     }
 }
 
+/// Lay `add` out at the width the Record tab's pictures want: wider than a
+/// settings column, because a live preview is the thing being judged.
+fn stage<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    hold(ui, sizing::STAGE, add)
+}
+
 /// Lay `add` out as a column of at most `sizing::COLUMN` points, centred in
 /// whatever width there is. A full-screen window should not stretch a row of
 /// settings across a metre of desk: the reach from a label to the switch it
 /// belongs to is the thing being kept short.
 fn column<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let width = ui.available_width().min(sizing::COLUMN);
+    hold(ui, sizing::COLUMN, add)
+}
+
+/// `add`, at most `most` points wide and centred in whatever room there is.
+fn hold<R>(ui: &mut egui::Ui, most: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let width = ui.available_width().min(most);
     let side = ((ui.available_width() - width) / 2.0).max(0.0);
     let rect = egui::Rect::from_min_size(
         ui.max_rect().min + egui::vec2(side, 0.0),
