@@ -3,6 +3,27 @@
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// The most real time one pass will make up by repeating the held frame.
+/// Beyond this the gap is stepped over instead; see [`FramePacer::owed`].
+pub const CATCH_UP: Duration = Duration::from_secs(2);
+
+/// What a pass owes the segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Owed {
+    /// Frames to write now.
+    pub write: u64,
+    /// Frames the clock moved past that will not be written.
+    pub skipped: u64,
+}
+
+impl Owed {
+    /// Everything the clock accounted for, written or not. What the pacer
+    /// must be advanced by, or the same debt comes back next pass.
+    pub fn counted(&self) -> u64 {
+        self.write + self.skipped
+    }
+}
+
 /// Decides how many frames a segment owes at a given moment.
 ///
 /// Pacing is pegged to the wall clock rather than counting iterations: the
@@ -37,6 +58,38 @@ impl FramePacer {
         let target = (elapsed.as_secs_f64() * self.fps as f64).floor();
         let target = if target <= 0.0 { 0 } else { target as u64 };
         target.saturating_sub(self.frames)
+    }
+
+    /// What one pass owes: frames to write now, and frames the clock has
+    /// moved past that will never be written.
+    ///
+    /// The debt is capped because paying an arbitrarily large one is how a
+    /// stall turns into a crash. `due` is `floor(elapsed * fps) - written`,
+    /// so anything that stops the loop for a while — the machine sleeping,
+    /// a graphics driver reset, a capture that stops answering — leaves a
+    /// debt proportional to the gap. Writing a frame for each would push
+    /// tens of thousands of uncompressed frames into the encoder as fast as
+    /// the loop can run, and the memory that takes is enough to bring the
+    /// whole machine down rather than just the recording.
+    ///
+    /// So a gap longer than [`CATCH_UP`] is treated as a discontinuity: a
+    /// bounded run of held frames is written and the rest of the gap is
+    /// stepped over, which costs some real time in the finished video and
+    /// keeps everything else alive.
+    pub fn owed(&self, elapsed: Duration) -> Owed {
+        let due = self.due(elapsed);
+        let cap = ((self.fps as f64 * CATCH_UP.as_secs_f64()) as u64).max(1);
+        if due <= cap {
+            Owed {
+                write: due,
+                skipped: 0,
+            }
+        } else {
+            Owed {
+                write: cap,
+                skipped: due - cap,
+            }
+        }
     }
 
     /// Record that `n` frames were written.
@@ -181,6 +234,59 @@ impl std::fmt::Debug for SyncClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ordinary_pass_owes_what_it_is_due() {
+        let pacer = FramePacer::new(60);
+        let owed = pacer.owed(Duration::from_millis(100));
+        assert_eq!(owed.write, 6);
+        assert_eq!(owed.skipped, 0);
+        assert_eq!(owed.counted(), 6);
+    }
+
+    #[test]
+    fn a_long_stall_is_stepped_over_rather_than_written_out() {
+        // Five minutes of nothing: the machine slept, or the driver reset.
+        let pacer = FramePacer::new(60);
+        let owed = pacer.owed(Duration::from_secs(300));
+        assert_eq!(
+            owed.write, 120,
+            "two seconds of held frame, not five minutes of it"
+        );
+        assert_eq!(owed.skipped, 300 * 60 - 120);
+        assert_eq!(
+            owed.counted(),
+            pacer.due(Duration::from_secs(300)),
+            "the whole gap is accounted for, or the debt returns next pass"
+        );
+    }
+
+    #[test]
+    fn paying_a_capped_debt_clears_it() {
+        let mut pacer = FramePacer::new(30);
+        let gap = Duration::from_secs(60);
+        let owed = pacer.owed(gap);
+        pacer.advance(owed.counted());
+        assert_eq!(
+            pacer.owed(gap).write,
+            0,
+            "the same stall must not be paid twice"
+        );
+    }
+
+    #[test]
+    fn the_cap_holds_at_every_frame_rate() {
+        for fps in [10_u32, 24, 30, 60, 120] {
+            let pacer = FramePacer::new(fps);
+            let owed = pacer.owed(Duration::from_secs(3600));
+            assert!(
+                owed.write <= u64::from(fps) * 2,
+                "{fps} fps wrote {} frames in one pass",
+                owed.write
+            );
+            assert!(owed.write > 0, "{fps} fps wrote nothing at all");
+        }
+    }
     use std::sync::Arc;
     use std::thread;
 

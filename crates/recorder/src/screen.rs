@@ -16,7 +16,7 @@ use screenilux_core::mix::Mixer;
 use screenilux_core::ports::{
     CameraSource, CaptureError, PointerEvent, ScreenSource, SinkError, VideoSink,
 };
-use screenilux_core::timing::{FramePacer, SyncClock};
+use screenilux_core::timing::{CATCH_UP, FramePacer, SyncClock};
 
 use crate::control::{Control, RunState};
 
@@ -166,11 +166,21 @@ impl Sound {
                 } else {
                     recorded.saturating_sub(CUSHION)
                 };
-                let due =
-                    (upto.as_secs_f64() * screenilux_platform::audio::SAMPLE_RATE as f64) as u64;
-                match due.saturating_sub(self.written) {
+                let rate = u64::from(screenilux_platform::audio::SAMPLE_RATE);
+                let due = (upto.as_secs_f64() * rate as f64) as u64;
+                // Capped for the same reason the frame debt is: after a long
+                // stall this asks for every sample the gap was worth, and
+                // pulling minutes of audio in one go is an allocation big
+                // enough to take the machine with it.
+                let cap = rate * CATCH_UP.as_secs();
+                match due.saturating_sub(self.written).min(cap) {
                     0 => Vec::new(),
-                    n => vec![self.bus.pull(n as usize)],
+                    n => {
+                        // Step the clock over whatever is not being pulled,
+                        // or the same debt is owed again on the next pass.
+                        self.written = due.saturating_sub(n);
+                        vec![self.bus.pull(n as usize)]
+                    }
                 }
             }
         };
@@ -219,7 +229,7 @@ fn capture_loop(job: &mut ScreenJob) -> Result<(), ScreenError> {
                 // encoder to finalise its container, and that shutdown time
                 // is not recorded footage.
                 let in_segment = seg_start.elapsed();
-                let owed = pacer.due(in_segment);
+                let owed = pacer.owed(in_segment).write;
                 forward_audio(job, banked + in_segment, true);
                 job.sink.close_segment(owed)?;
                 banked += in_segment;
@@ -251,8 +261,8 @@ fn capture_loop(job: &mut ScreenJob) -> Result<(), ScreenError> {
 
         job.elapsed.set(banked + in_segment);
 
-        let due = pacer.due(in_segment);
-        if due == 0 {
+        let owed = pacer.owed(in_segment);
+        if owed.write == 0 {
             std::thread::sleep(pacer.idle());
             continue;
         }
@@ -292,17 +302,25 @@ fn capture_loop(job: &mut ScreenJob) -> Result<(), ScreenError> {
             }
         };
 
-        // Written `due` times rather than once: when capture falls behind,
-        // repeating the last frame keeps playback at real-time speed instead
-        // of letting it run fast.
-        for _ in 0..due {
+        // Written more than once when capture falls behind: repeating the
+        // last frame keeps playback at real-time speed instead of letting
+        // it run fast. The count is capped, so a stall long enough to owe
+        // thousands of frames does not try to write them all at once.
+        for _ in 0..owed.write {
             job.sink.write(encoded)?;
         }
-        pacer.advance(due);
+        if owed.skipped > 0 {
+            tracing::warn!(
+                skipped = owed.skipped,
+                fps = pacer.fps(),
+                "the recording stalled; stepping over the gap rather than filling it"
+            );
+        }
+        pacer.advance(owed.counted());
     }
 
     let in_segment = seg_start.elapsed();
-    let owed = pacer.due(in_segment);
+    let owed = pacer.owed(in_segment).write;
     forward_audio(job, banked + in_segment, true);
     job.sink.close_segment(owed)?;
     banked += in_segment;
