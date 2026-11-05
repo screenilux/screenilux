@@ -583,7 +583,7 @@ mod tests {
     fn frames_handed_over_flat_out_do_not_pile_up() {
         let (w, h, fps) = (1920u32, 1080u32, 30u32);
         let dest = temp("backpressure");
-        let frame_bytes = (w * h * 4) as u32;
+        let frame_bytes = w * h * 4;
         let _turn = one_encoder_at_a_time();
         let mut sink = NativeSink::new(w, h, fps, false, temp("backpressure-scratch")).unwrap();
         sink.open_segment().unwrap();
