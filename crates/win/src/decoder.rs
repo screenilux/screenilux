@@ -45,7 +45,7 @@ fn read_err(e: windows::core::Error) -> DecodeError {
 /// `MFStartup` is reference-counted and process-wide, so it is called once and
 /// never shut down: the player opens and closes decoders freely and an
 /// accidental final `MFShutdown` would break the next one. COM is per thread.
-fn init_thread() {
+pub(crate) fn init_thread() {
     static STARTUP: Once = Once::new();
     // SAFETY: plain initialisation calls. A thread already in another COM
     // apartment reports RPC_E_CHANGED_MODE, which is fine: COM is usable.

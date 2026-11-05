@@ -461,8 +461,8 @@ pub fn mp4(
 /// Copy a decoded picture into the encoder's buffer: red and blue swapped,
 /// and cropped to the even size the encoder was opened at.
 ///
-/// The sink turns the rows over itself on the way to the encoder, so they
-/// go in the way they came out of the decoder.
+/// Rows go in the order they came out of the decoder, top first, which is
+/// what the sink is told to expect.
 fn into_bgra(rgba: &[u8], source_width: u32, width: u32, height: u32, out: &mut [u8]) {
     let src_stride = source_width as usize * 4;
     let dst_stride = width as usize * 4;
@@ -662,6 +662,50 @@ mod tests {
     fn a_gif_is_named_beside_the_recording_it_came_from() {
         let from = Path::new("C:/demos/monday.mp4");
         assert_eq!(beside(from), Path::new("C:/demos/monday.gif"));
+    }
+
+    /// An MP4 export decodes as fast as the file allows and writes through
+    /// the same sink the recorder uses, which makes it the other place a
+    /// slow encoder could be outrun. Round-trip a short clip so the whole
+    /// path is exercised rather than only its halves.
+    #[test]
+    fn an_mp4_export_round_trips_a_clip() {
+        let dir = std::env::temp_dir().join(format!(
+            "screenilux-export-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("a working directory");
+        let (w, h, fps) = (640u32, 480u32, 30u32);
+
+        let source = dir.join("source.mp4");
+        let mut sink =
+            NativeSink::new(w, h, fps, false, dir.join("source-scratch.mp4")).expect("a sink");
+        if sink.open_segment().is_err() {
+            // No H.264 encoder on this machine, which is a legitimate
+            // outcome rather than a test failure.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        for n in 0..60u32 {
+            sink.write(&flat(w, h, (n * 4) as u8))
+                .expect("a frame goes in");
+        }
+        sink.close_segment(0).expect("the segment closes");
+        sink.finish(&source).expect("the clip is written");
+
+        let out = dir.join("export.mp4");
+        let done = mp4(&source, &out, &EditList::default(), Mp4 { fps }, |_| true)
+            .expect("the export runs");
+
+        assert_eq!((done.width, done.height), (w, h));
+        assert!(
+            (50..=62).contains(&done.frames),
+            "two seconds at {fps}fps, got {} frames",
+            done.frames
+        );
+        assert!(out.is_file() && done.bytes > 1_000);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

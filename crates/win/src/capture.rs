@@ -42,14 +42,16 @@ struct Mailbox {
 }
 
 impl Mailbox {
+    /// A buffer of `len` bytes to copy the next frame into.
+    ///
+    /// Handed back as it is rather than zeroed: `on_frame_arrived` writes
+    /// every byte of it, and clearing first costs a memset of the whole frame
+    /// — a quarter of a gigabyte a second at 1080p30, ten times that at 4K60,
+    /// on the one thread that must keep up with the display.
     fn take_spare(&self, len: usize) -> Vec<u8> {
         let mut st = self.state.lock().expect("mailbox poisoned");
         match st.spare.pop() {
-            Some(mut b) if b.len() == len => {
-                b.clear();
-                b.resize(len, 0);
-                b
-            }
+            Some(b) if b.len() == len => b,
             _ => vec![0u8; len],
         }
     }
@@ -105,10 +107,14 @@ impl GraphicsCaptureApiHandler for Pump {
             let packed = buf.as_nopadding_buffer(&mut tight);
             let n = packed.len().min(out.len());
             out[..n].copy_from_slice(&packed[..n]);
+            // Short frame: black rather than whatever this buffer held last
+            // time round. Normally empty, since the two lengths agree.
+            out[n..].fill(0);
         } else {
             let raw = buf.as_raw_buffer();
             let n = raw.len().min(out.len());
             out[..n].copy_from_slice(&raw[..n]);
+            out[n..].fill(0);
         }
 
         self.mailbox.deliver(out);
