@@ -26,7 +26,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use eframe::egui;
 use screenilux_core::edit::EditList;
 use screenilux_core::session::{MANIFEST_NAME, Manifest};
-use screenilux_export::{Format, Mp4, Written};
+use screenilux_export::{Format, Gif, Mp4, Recording, Shape, Written};
 
 use crate::theme::{self, icon};
 
@@ -35,9 +35,6 @@ const POPUP_W: f32 = 340.0;
 
 /// What an export needs to know about the recording it is writing out.
 pub struct Source {
-    /// The video to read. The first screen: the others are only in a
-    /// package, which copies files rather than reading them.
-    pub video: PathBuf,
     /// The folder holding the tracks and the manifest, which is what a
     /// package is made of.
     pub folder: PathBuf,
@@ -45,6 +42,10 @@ pub struct Source {
     pub stem: String,
     pub edits: EditList,
     pub fps: f64,
+    /// Every screen and what was recorded about the pointer, for drawing
+    /// the video and the GIF.
+    pub recording: Recording,
+    pub shape: Shape,
     /// Where the save dialog opens.
     pub start_in: PathBuf,
 }
@@ -106,10 +107,11 @@ impl Exports {
         let (tx, result) = channel();
         let (ticker, halt, out) = (Arc::clone(&at), Arc::clone(&stop), to.clone());
         let Source {
-            video,
             folder,
             edits,
             fps,
+            recording,
+            shape,
             ..
         } = source;
 
@@ -120,19 +122,23 @@ impl Exports {
             };
             let written = match format {
                 Format::Mp4 => screenilux_export::mp4(
-                    &video,
+                    &recording,
                     &out,
                     &edits,
                     Mp4 {
                         fps: fps.round().clamp(1.0, 240.0) as u32,
+                        shape,
                     },
                     &mut tick,
                 ),
                 Format::Gif => screenilux_export::gif(
-                    &video,
+                    &recording,
                     &out,
                     &edits,
-                    screenilux_export::Gif::default(),
+                    Gif {
+                        shape,
+                        ..Gif::default()
+                    },
                     &mut tick,
                 ),
                 Format::Package => screenilux_export::package(&folder, &out, &mut tick),

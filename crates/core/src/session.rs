@@ -108,6 +108,23 @@ pub struct Manifest {
     /// follow it and its clicks cannot be marked.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pointer: Option<crate::pointer::Track>,
+    /// Whether the pointer was drawn into the videos while recording.
+    /// Everything recorded before the pointer was drawn on playback has it
+    /// in the picture; since then it is left out and drawn from `pointer`,
+    /// so it can be smoothed, sized and hidden.
+    #[serde(default = "in_picture", skip_serializing_if = "is_true")]
+    pub cursor_in_picture: bool,
+    /// Shortcuts pressed while recording.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shortcuts: Vec<crate::keys::Shortcut>,
+}
+
+fn in_picture() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -136,6 +153,8 @@ impl Manifest {
             focus: None,
             edits: None,
             pointer: None,
+            cursor_in_picture: true,
+            shortcuts: Vec::new(),
         }
     }
 

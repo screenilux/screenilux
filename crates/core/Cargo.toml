@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Pure domain logic for Screenilux: geometry, frame pacing, pointer focus, session manifest."
 
 [dependencies]
+ab_glyph = "0.2.32"
 fast_image_resize = "6.1"
 serde = { workspace = true }
 serde_json = { workspace = true }

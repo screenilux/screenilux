@@ -24,14 +24,19 @@
 //! it was placed on. A spatial edit does know which screen it belongs to:
 //! the click that placed it says which picture it landed on.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eframe::egui;
 use screenilux_core::edit::{
     Area, Backdrop, EditList, Effect, MIN_SPAN, Place, Problem, Tool, trim_zero,
 };
+use screenilux_core::redact;
 use screenilux_core::session::{MANIFEST_NAME, Manifest};
+use screenilux_core::text::TextIndex;
 use screenilux_player::SharedClock;
+use screenilux_player::text::{INDEX_INTERVAL, Indexer};
 
 use crate::exporting::{Exports, Source};
 use crate::player_view::PlayerView;
@@ -76,6 +81,10 @@ pub struct EditView {
     /// Writing the recording out: which format, how far along, and what
     /// came of it.
     exports: Exports,
+    /// Reading the screen to find what to blur, while it runs.
+    redacting: Option<Indexer>,
+    /// What the last search for private details came to.
+    redact_note: Option<String>,
     /// What is typed into the effect menu's search box.
     find: String,
     /// Whether that box has been given focus since the menu opened.
@@ -108,6 +117,8 @@ impl EditView {
             wants_save: false,
             track_at: None,
             exports: Exports::default(),
+            redacting: None,
+            redact_note: None,
             find: String::new(),
             found_focus: false,
         }
@@ -149,6 +160,19 @@ impl EditView {
             None => (None, Vec::new()),
         };
         player.set_path(path, desks);
+        let (pointer, shortcuts) = match self.loaded.as_ref() {
+            Some(l) => (
+                (!l.manifest.cursor_in_picture && l.manifest.pointer.is_some())
+                    .then_some(l.edits.pointer),
+                if l.edits.hide_shortcuts {
+                    Vec::new()
+                } else {
+                    l.manifest.shortcuts.clone()
+                },
+            ),
+            None => (None, Vec::new()),
+        };
+        player.set_drawn(pointer, shortcuts);
     }
 
     pub fn follow(&mut self, player: &PlayerView) {
@@ -161,6 +185,8 @@ impl EditView {
                 self.loaded = None;
                 self.track.clear();
                 self.asking = None;
+                self.redacting = None;
+                self.redact_note = None;
             }
             Some(path) => self.adopt(&path, player),
         }
@@ -172,6 +198,8 @@ impl EditView {
         self.error = None;
         self.track.clear();
         self.asking = None;
+        self.redacting = None;
+        self.redact_note = None;
         let duration = player
             .clock()
             .map_or(MIN_SPAN, |c| c.duration())
@@ -264,10 +292,228 @@ impl EditView {
         }
 
         self.save_row(ui, p);
+        self.redact_row(ui, p, player);
         ui.add_space(14.0);
         let Some(clock) = player.clock() else { return };
         let rest = ui.available_height().max(LIST_MIN);
         self.list(ui, p, clock, rest);
+    }
+
+    /// Finding what should not be shown and blurring it: the button, the
+    /// screen being read while that runs, and what it came to.
+    fn redact_row(&mut self, ui: &mut egui::Ui, p: &theme::Palette, player: &mut PlayerView) {
+        if self.loaded.is_none() {
+            return;
+        }
+        if let Some(result) = self.redacting.as_ref().and_then(Indexer::finished) {
+            self.redacting = None;
+            match result {
+                Ok(index) => {
+                    player.keep_text(&index);
+                    self.blur_private(&index, player);
+                }
+                Err(e) => self.redact_note = Some(format!("Could not read the screen: {e}")),
+            }
+        }
+
+        ui.add_space(10.0);
+        self.pointer_row(ui, p);
+        self.click_zooms(ui);
+        ui.add_space(6.0);
+        if let Some(reading) = &self.redacting {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Reading the screen for private details, {:.0}%",
+                        reading.progress() * 100.0
+                    ))
+                    .size(13.0)
+                    .color(p.weak),
+                );
+            });
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
+        } else if ui
+            .add(theme::outline(format!(
+                "{}  Blur private details",
+                icon::LOCK
+            )))
+            .on_hover_text(
+                "Find email addresses, keys, passwords and card numbers on screen, and blur \
+                 each one where and while it shows",
+            )
+            .clicked()
+        {
+            self.redact_note = None;
+            match player.stored_text() {
+                // Read before: no need to read it again.
+                Some(index) => self.blur_private(&index, player),
+                None => {
+                    if let Some(recording) = player.recording() {
+                        let ctx = ui.ctx().clone();
+                        self.redacting = Some(Indexer::start(
+                            recording,
+                            INDEX_INTERVAL,
+                            Arc::new(move || ctx.request_repaint()),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(note) = &self.redact_note {
+            ui.add_space(4.0);
+            theme::hint(ui, note);
+        }
+    }
+
+    /// How the pointer and the shortcuts are drawn, for a recording that left
+    /// them out of the picture. Older recordings have the pointer in the
+    /// picture, and nothing here applies to them.
+    fn pointer_row(&mut self, ui: &mut egui::Ui, p: &theme::Palette) {
+        let Some(l) = self.loaded.as_mut() else {
+            return;
+        };
+        let drawn = !l.manifest.cursor_in_picture && l.manifest.pointer.is_some();
+        let has_keys = !l.manifest.shortcuts.is_empty();
+        if !drawn && !has_keys {
+            return;
+        }
+        let before = (l.edits.pointer, l.edits.hide_shortcuts);
+        if drawn {
+            let style = &mut l.edits.pointer;
+            let mut show = !style.hidden;
+            theme::setting(ui, &mut show, "Show the pointer");
+            style.hidden = !show;
+            if show {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Size").size(13.0).color(p.weak));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        const SIZES: [f32; 3] = [1.0, 1.5, 2.2];
+                        let chosen = SIZES
+                            .iter()
+                            .position(|s| (s - style.size).abs() < 0.05)
+                            .unwrap_or(1);
+                        if let Some(i) = theme::segmented(ui, &["Small", "Medium", "Large"], chosen)
+                        {
+                            style.size = SIZES[i];
+                        }
+                    });
+                });
+                theme::setting(ui, &mut style.smooth, "Smooth its movement");
+                theme::setting(ui, &mut style.hide_idle, "Hide it while it rests");
+            }
+        }
+        if has_keys {
+            let mut show = !l.edits.hide_shortcuts;
+            theme::setting(ui, &mut show, "Show shortcuts pressed");
+            l.edits.hide_shortcuts = !show;
+        }
+        if (l.edits.pointer, l.edits.hide_shortcuts) != before {
+            self.saved = false;
+        }
+        ui.add_space(6.0);
+    }
+
+    /// The button that zooms in on every click, and what it did.
+    fn click_zooms(&mut self, ui: &mut egui::Ui) {
+        let Some(l) = self.loaded.as_mut() else {
+            return;
+        };
+        let clicks = l
+            .manifest
+            .pointer
+            .as_ref()
+            .map_or(0, |track| track.clicks.len());
+        let button = theme::outline(format!("{}  Zoom in on clicks", icon::SEARCH));
+        let response = ui
+            .add_enabled(clicks > 0, button)
+            .on_hover_text("Add a zoom that follows the pointer wherever you clicked")
+            .on_disabled_hover_text("This recording kept no clicks to zoom in on");
+        if !response.clicked() {
+            return;
+        }
+        let screens: Vec<(String, screenilux_core::Rect)> = l
+            .manifest
+            .screens
+            .iter()
+            .map(|s| {
+                (
+                    s.file.clone(),
+                    screenilux_core::Rect::new(s.left, s.top, s.width, s.height),
+                )
+            })
+            .collect();
+        let Some(track) = l.manifest.pointer.as_ref() else {
+            return;
+        };
+        let planned =
+            screenilux_core::autozoom::plan(track, &screens, l.duration, &l.edits.effects);
+        for zoom in &planned {
+            l.edits.add_on(
+                zoom.start,
+                zoom.end,
+                zoom.tool(true),
+                Some(zoom.screen.clone()),
+            );
+        }
+        self.redact_note = Some(match planned.len() {
+            0 => "Every click is in a zoom already.".to_string(),
+            1 => "Added 1 zoom. Drag it on the timeline to change when it happens.".to_string(),
+            n => format!("Added {n} zooms. Drag one on the timeline to change when it happens."),
+        });
+        if !planned.is_empty() {
+            self.saved = false;
+        }
+    }
+
+    /// Blur everything private in `index`, where and while it shows, unless a
+    /// blur already covers it. Each is an ordinary Blur effect, so one that
+    /// is not private after all is deleted like any other.
+    fn blur_private(&mut self, index: &TextIndex, player: &PlayerView) {
+        let Some(l) = self.loaded.as_mut() else {
+            return;
+        };
+        let sizes = player.screen_sizes();
+        let found = redact::find(index, |screen| {
+            sizes
+                .iter()
+                .find(|(name, _)| name == screen)
+                .map(|(_, size)| *size)
+        });
+        let mut added: BTreeMap<redact::Kind, usize> = BTreeMap::new();
+        for f in &found {
+            let end = f.end.min(l.duration);
+            let covered = l.edits.effects.iter().any(|e| {
+                e.screen.as_deref() == Some(f.screen.as_str())
+                    && e.start <= f.start + 0.01
+                    && e.end >= end - 0.01
+                    && matches!(&e.tool, Tool::Blur { area, .. } if redact::covers(area, &f.area))
+            });
+            if covered || end <= f.start {
+                continue;
+            }
+            l.edits
+                .add_on(f.start, end, Tool::blur(f.area), Some(f.screen.clone()));
+            *added.entry(f.kind).or_default() += 1;
+        }
+        self.redact_note = Some(if added.is_empty() {
+            if found.is_empty() {
+                "Nothing private was found on screen.".to_string()
+            } else {
+                "Everything private on screen is blurred already.".to_string()
+            }
+        } else {
+            self.saved = false;
+            let parts: Vec<String> = added
+                .iter()
+                .map(|(kind, n)| format!("{n} {}", kind.noun(*n)))
+                .collect();
+            format!(
+                "Blurred {}. Check them on the timeline; any that is not private can be deleted.",
+                join(&parts)
+            )
+        });
     }
 
     /// Keep up with an export and let the title row know whether one is
@@ -284,7 +530,12 @@ impl EditView {
     }
 
     /// Ask where the recording should go, and start writing it there.
-    pub fn start_export(&mut self, format: screenilux_export::Format, player: &mut PlayerView) {
+    pub fn start_export(
+        &mut self,
+        format: screenilux_export::Format,
+        shape: screenilux_export::Shape,
+        player: &mut PlayerView,
+    ) {
         let (Some(video), Some(l)) = (player.track_file(0), self.loaded.as_ref()) else {
             return;
         };
@@ -302,15 +553,58 @@ impl EditView {
             .filter(|d| d.is_dir())
             .map_or_else(|| folder.clone(), Path::to_path_buf);
 
+        // Each screen where it stood on the desktop, which is how the
+        // pointer's path lands on it. A plain video has no record of that,
+        // and its one screen is the whole of where the pointer could be.
+        let screens: Vec<screenilux_export::Screen> = player
+            .export_screens()
+            .into_iter()
+            .map(|(name, path, (w, h))| {
+                let desk = l
+                    .manifest
+                    .screens
+                    .iter()
+                    .find(|s| s.file == name)
+                    .map_or(screenilux_core::Rect::new(0, 0, w, h), |s| {
+                        screenilux_core::Rect::new(s.left, s.top, s.width, s.height)
+                    });
+                screenilux_export::Screen { name, path, desk }
+            })
+            .collect();
+        // The sound is in the screen marked as carrying it; a plain video, or
+        // a recording made before screens said so, has it in its first.
+        let sound = l
+            .manifest
+            .screens
+            .iter()
+            .find(|s| s.audio)
+            .and_then(|s| screens.iter().find(|e| e.name == s.file))
+            .or(screens.first())
+            .map(|s| s.path.clone());
+        let recording = screenilux_export::Recording {
+            screens,
+            sound,
+            pointer: l.manifest.pointer.clone(),
+            focus: l.manifest.focus.clone(),
+            cursor: (!l.manifest.cursor_in_picture && !l.edits.pointer.hidden)
+                .then_some(l.edits.pointer),
+            shortcuts: if l.edits.hide_shortcuts {
+                Vec::new()
+            } else {
+                l.manifest.shortcuts.clone()
+            },
+        };
+
         self.exports.start(
             format,
             Source {
-                video,
                 folder,
                 stem: friendly_stem(&l.path),
                 edits: l.edits.clone(),
                 fps: f64::from(l.manifest.fps.max(1)),
                 start_in,
+                recording,
+                shape,
             },
         );
     }
@@ -1142,25 +1436,44 @@ pub(crate) fn stamp_short(t: f64) -> String {
 }
 
 /// The manifest beside a recording, whether it is a folder or a package.
-fn read_manifest(path: &Path) -> Option<Manifest> {
-    let file = if path.is_dir() {
+/// Where a recording's details and edits are kept: inside a session
+/// folder, or in a file of its own beside a package or a video, named after
+/// it. Never a file shared by the recordings in one folder, which is how one
+/// recording's edits used to turn up on another.
+fn details_file(path: &Path) -> PathBuf {
+    if path.is_dir() {
         path.join(MANIFEST_NAME)
     } else {
-        path.parent()?.join(MANIFEST_NAME)
-    };
-    Manifest::from_json(&std::fs::read_to_string(file).ok()?).ok()
+        screenilux_recorder::session::details_path(path)
+    }
+}
+
+/// The recording's details: its own file if it has one, else what a package
+/// carries inside it. A video with neither has none.
+fn read_manifest(path: &Path) -> Option<Manifest> {
+    if let Some(m) = std::fs::read_to_string(details_file(path))
+        .ok()
+        .and_then(|json| Manifest::from_json(&json).ok())
+    {
+        return Some(m);
+    }
+    screenilux_core::package::is_package(path)
+        .then(|| screenilux_core::package::read_manifest(path).ok())
+        .flatten()
 }
 
 fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), String> {
-    let file = if path.is_dir() {
-        path.join(MANIFEST_NAME)
-    } else {
-        path.parent()
-            .ok_or_else(|| "this recording has nowhere to save edits".to_string())?
-            .join(MANIFEST_NAME)
-    };
     let json = manifest.to_json().map_err(|e| e.to_string())?;
-    std::fs::write(file, json).map_err(|e| format!("could not save edits: {e}"))
+    std::fs::write(details_file(path), json).map_err(|e| format!("could not save edits: {e}"))
+}
+
+/// "a", "a and b", "a, b and c".
+fn join(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 #[cfg(test)]

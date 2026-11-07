@@ -7,17 +7,22 @@
 
 #![forbid(unsafe_code)]
 
+pub mod autozoom;
 pub mod camera;
 pub mod click;
 pub mod compositor;
+pub mod dress;
 pub mod edit;
 pub mod focus;
 pub mod geometry;
+pub mod keys;
+pub mod look;
 pub mod mix;
 pub mod package;
 pub mod playback;
 pub mod pointer;
 pub mod ports;
+pub mod redact;
 pub mod session;
 pub mod text;
 pub mod timing;
