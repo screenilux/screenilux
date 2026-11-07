@@ -78,6 +78,13 @@ pub enum PointerEvent {
     },
     /// Reset zoom to 1x.
     Reset,
+    /// A key pressed, with the modifiers held (`keys::CTRL` and the rest).
+    /// The hook only reports keys that could make a shortcut; whether one
+    /// is kept is `keys::shortcut`'s call.
+    Key {
+        mods: u8,
+        key: crate::keys::Key,
+    },
 }
 
 /// The global pointer hook.

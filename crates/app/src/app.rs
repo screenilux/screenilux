@@ -1290,8 +1290,8 @@ impl App {
         }
         match (player.take_asked(), open) {
             (Some(Asked::Share), Some(path)) => self.share(&path),
-            (Some(Asked::Export(format)), _) => {
-                self.editor.start_export(format, &mut self.player);
+            (Some(Asked::Export(format, shape)), _) => {
+                self.editor.start_export(format, shape, &mut self.player);
             }
             // Going back puts the recording away, which is what returns the
             // tab to its list. Effects are written first: they are data

@@ -21,6 +21,7 @@ mod blur;
 mod caption;
 mod geometry;
 mod marks;
+pub mod pointer;
 mod region;
 mod zoom;
 
@@ -34,39 +35,9 @@ use crate::theme;
 pub use backdrop::backdrop;
 pub use zoom::lens_following;
 
-/// How long an effect takes to come on, and to let go again. Short enough
-/// not to be waited through, long enough that the eye follows the picture
-/// in rather than being dropped into it.
-const RAMP: f64 = 0.45;
-
-/// The effects that apply to one screen: those naming it, and those naming
-/// no screen at all.
-pub fn for_screen<'a>(live: &'a [Effect], screen: Option<&str>) -> Vec<&'a Effect> {
-    live.iter()
-        .filter(|e| match (&e.screen, screen) {
-            (None, _) => true,
-            (Some(want), Some(have)) => want == have,
-            (Some(_), None) => false,
-        })
-        .collect()
-}
-
-/// How far through an effect's own span `at` is, as a weight from 0 to 1
-/// that rises at the start and falls at the end.
-///
-/// Without this an effect snaps on: one frame the picture is whole, the
-/// next it is magnified, and the viewer has to work out what they are
-/// looking at. The curve is a smoothstep, so it leaves and arrives at rest.
-pub fn ramp(at: f64, start: f64, end: f64) -> f32 {
-    let span = (end - start).max(1e-6);
-    // A short effect never reaches full strength rather than snapping: it
-    // gets half its length to rise and half to fall.
-    let r = RAMP.min(span / 2.0).max(1e-6);
-    let rise = ((at - start) / r).clamp(0.0, 1.0);
-    let fall = ((end - at) / r).clamp(0.0, 1.0);
-    let x = rise.min(fall) as f32;
-    x * x * (3.0 - 2.0 * x)
-}
+// Which effects apply to a screen, and how far through its span each one
+// is, are worked out in core, so the export draws from the same numbers.
+pub use screenilux_core::look::{for_screen, ramp};
 
 /// Paint everything that goes over the picture, in painting order.
 ///
@@ -132,50 +103,4 @@ pub fn over(
 /// recording wrote its path down.
 pub fn pointer_on(track: Option<&Track>, bounds: Desktop, at: f64) -> Option<egui::Pos2> {
     geometry::on_screen(track?.at(at)?.x, track?.at(at)?.y, bounds)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use screenilux_core::edit::EditList;
-
-    #[test]
-    fn the_ramp_leaves_and_arrives_at_rest() {
-        assert_eq!(ramp(0.0, 0.0, 4.0), 0.0);
-        assert_eq!(ramp(4.0, 0.0, 4.0), 0.0);
-        assert_eq!(ramp(2.0, 0.0, 4.0), 1.0);
-        // Monotonic on the way up, so nothing jitters.
-        let mut last = 0.0;
-        for i in 0..=20 {
-            let now = ramp(f64::from(i) * 0.02, 0.0, 4.0);
-            assert!(now >= last, "the ramp went backwards at {i}");
-            last = now;
-        }
-    }
-
-    #[test]
-    fn an_effect_too_short_to_ramp_still_behaves() {
-        let mut edits = EditList::default();
-        let id = edits.add(1.0, 1.1, Tool::Mute);
-        let e = edits.get(id).unwrap();
-        let peak = ramp(1.05, e.start, e.end);
-        assert!((0.0..=1.0).contains(&peak), "weight out of range: {peak}");
-        assert_eq!(ramp(1.0, e.start, e.end), 0.0);
-        assert_eq!(ramp(1.1, e.start, e.end), 0.0);
-    }
-
-    #[test]
-    fn an_effect_only_lands_on_the_screen_it_names() {
-        let mut edits = EditList::default();
-        let one = edits.add_on(0.0, 1.0, Tool::MarkClicks, Some("screen1.mp4".into()));
-        let any = edits.add(0.0, 1.0, Tool::Mute);
-        let all: Vec<Effect> = edits.effects.clone();
-        assert_eq!(for_screen(&all, Some("screen1.mp4")).len(), 2);
-        assert_eq!(
-            for_screen(&all, Some("screen2.mp4")).len(),
-            1,
-            "only the one naming no screen"
-        );
-        let _ = (one, any);
-    }
 }

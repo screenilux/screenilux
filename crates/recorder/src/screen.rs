@@ -282,6 +282,7 @@ fn capture_loop(job: &mut ScreenJob) -> Result<(), ScreenError> {
                     for event in rx.try_iter() {
                         match event {
                             PointerEvent::Wheel { steps } => c.on_wheel(steps),
+                            PointerEvent::Key { .. } => {}
                             PointerEvent::Reset => c.on_reset(),
                             PointerEvent::Click { at } => c.on_click(at),
                         }

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use eframe::egui;
 use screenilux_core::playback::{Area, Layout, arrange};
-use screenilux_export::Format;
+use screenilux_export::{Format, Shape};
 use screenilux_player::Player;
 use screenilux_player::open::{Opened, Origin};
 
@@ -78,6 +78,9 @@ pub struct PlayerView {
     /// last said; and sharing it, if asked for.
     link: (Link, bool),
     asked: Option<Asked>,
+    /// The shape the export menu is set to: kept, so the next export is
+    /// the same shape as the last.
+    export_shape: Shape,
     /// The editor is showing, so a plain click on the paused picture places
     /// an edit instead of clearing the text selection.
     editing: bool,
@@ -99,6 +102,10 @@ pub struct PlayerView {
     /// is recorded in desktop coordinates, so placing it on a picture needs
     /// to know which part of the desktop that picture was.
     desks: Vec<(String, screenilux_core::Rect)>,
+    /// How to draw the pointer, for a recording that left it out of the
+    /// picture, and the shortcuts to show.
+    drawn_pointer: Option<screenilux_core::edit::PointerStyle>,
+    shortcuts: Vec<screenilux_core::keys::Shortcut>,
     /// Whether an export is being written, as the editor last reported it.
     /// The menu stands down while one is, so a second cannot be started on
     /// top of the first.
@@ -117,6 +124,7 @@ impl PlayerView {
             recents: None,
             link: (Link::None, false),
             asked: None,
+            export_shape: Shape::Wide,
             editing: false,
             placed: None,
             stage: None,
@@ -125,6 +133,8 @@ impl PlayerView {
             live: Vec::new(),
             path: None,
             desks: Vec::new(),
+            drawn_pointer: None,
+            shortcuts: Vec::new(),
             exporting: false,
         }
     }
@@ -155,6 +165,17 @@ impl PlayerView {
     ) {
         self.path = path;
         self.desks = desks;
+    }
+
+    /// What to draw that the recording left out of the picture: the
+    /// pointer, in this style, and these shortcuts.
+    pub fn set_drawn(
+        &mut self,
+        pointer: Option<screenilux_core::edit::PointerStyle>,
+        shortcuts: Vec<screenilux_core::keys::Shortcut>,
+    ) {
+        self.drawn_pointer = pointer;
+        self.shortcuts = shortcuts;
     }
 
     /// Tell the title row whether an export is running, so the menu can
@@ -197,6 +218,59 @@ impl PlayerView {
     pub fn track_file(&self, track: usize) -> Option<PathBuf> {
         let l = self.loaded.as_ref()?;
         l.opened.recording.tracks.get(track).map(|t| t.path.clone())
+    }
+
+    /// Every screen of the open recording, for writing it out: its name,
+    /// the file its video was decoded from and its size.
+    pub fn export_screens(&self) -> Vec<(String, PathBuf, (u32, u32))> {
+        self.loaded.as_ref().map_or_else(Vec::new, |l| {
+            l.opened
+                .recording
+                .tracks
+                .iter()
+                .map(|t| {
+                    let name = t
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| t.id.clone());
+                    (name, t.path.clone(), (t.width, t.height))
+                })
+                .collect()
+        })
+    }
+
+    /// The open recording, for reading its text.
+    pub fn recording(&self) -> Option<screenilux_core::playback::Recording> {
+        self.loaded.as_ref().map(|l| l.opened.recording.clone())
+    }
+
+    /// Each screen's name, as the text read off it names it, and its size
+    /// in pixels.
+    pub fn screen_sizes(&self) -> Vec<(String, (u32, u32))> {
+        self.loaded.as_ref().map_or_else(Vec::new, |l| {
+            l.opened
+                .recording
+                .tracks
+                .iter()
+                .map(|t| (t.id.clone(), (t.width, t.height)))
+                .collect()
+        })
+    }
+
+    /// The text read off the open recording before, if it has been.
+    pub fn stored_text(&self) -> Option<screenilux_core::text::TextIndex> {
+        screenilux_player::open::stored_text(&self.shareable()?)
+    }
+
+    /// Keep the text read off the open recording with it, so it is not read
+    /// again and a link to it can be searched.
+    pub fn keep_text(&self, index: &screenilux_core::text::TextIndex) {
+        if let Some(l) = &self.loaded
+            && let Err(e) = screenilux_player::open::save_text(&l.opened.origin, index)
+        {
+            tracing::warn!(error = %e, "could not keep the text read off the recording");
+        }
     }
 
     pub fn screen_names(&self) -> Vec<String> {
@@ -469,8 +543,24 @@ impl PlayerView {
         }
         let label = format!("{}  Export  {}", icon::EXPORT, icon::CHEVRON_DOWN);
         let mut picked = None;
+        let shape = &mut self.export_shape;
         egui::containers::menu::MenuButton::from_button(theme::outline(label)).ui(ui, |ui| {
             ui.set_width(EXPORT_MENU_W);
+            // The shape first: it applies to the video and the GIF alike,
+            // and is the question people forget to ask before exporting.
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new("Shape").size(13.0).color(p.weak));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(10.0);
+                    let labels: Vec<&str> = Shape::ALL.iter().map(|s| s.label()).collect();
+                    let chosen = Shape::ALL.iter().position(|s| s == shape).unwrap_or(0);
+                    if let Some(i) = theme::segmented(ui, &labels, chosen) {
+                        *shape = Shape::ALL[i];
+                    }
+                });
+            });
+            ui.add_space(6.0);
             // The rows carry their own spacing, so the style's does not
             // stack on top of it.
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -482,7 +572,7 @@ impl PlayerView {
             }
         });
         if let Some(format) = picked {
-            self.asked = Some(Asked::Export(format));
+            self.asked = Some(Asked::Export(format, self.export_shape));
         }
     }
 
@@ -734,6 +824,11 @@ impl PlayerView {
                         at,
                         marks,
                     );
+                    if let (Some(style), Some(track), Some(b)) =
+                        (self.drawn_pointer.as_ref(), self.path.as_ref(), bounds)
+                    {
+                        crate::effects::pointer::cursor(&painter, r, shown, track, b, at, style);
+                    }
                 }
                 None => {
                     painter.text(
@@ -759,6 +854,9 @@ impl PlayerView {
                 chip(&painter, r.left_top() + egui::vec2(8.0, 8.0), label, &pal);
             }
         }
+
+        let at = loaded.player.clock().position();
+        crate::effects::pointer::shortcut(&painter, rect, &self.shortcuts, at);
 
         let paused = !loaded.player.clock().is_playing();
 
