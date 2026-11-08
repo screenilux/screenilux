@@ -59,9 +59,20 @@ pub struct Sizer {
     current: Fit,
     /// The window as it was before it became the bar, to be put back.
     before: Option<Shape>,
-    /// Where the bar was last left, so dragging it somewhere sticks.
+    /// Where the bar was dragged to during this recording, so going to the
+    /// full window and back does not undo the drag. Each recording starts
+    /// with the bar centred again.
     bar_pos: Option<egui::Pos2>,
+    /// Where the bar was just sent, and how many more frames to insist on
+    /// it. Coming out of maximised, Windows puts the window back where it
+    /// was before maximising a moment after it is asked to move, so the move
+    /// can land first and be undone. Until it has landed, where the window
+    /// happens to be is not somewhere anyone dragged it.
+    settling: Option<(egui::Pos2, u8)>,
 }
+
+/// How many frames the bar insists on its place before giving up.
+const SETTLE_TRIES: u8 = 20;
 
 impl Sizer {
     pub fn new() -> Self {
@@ -69,7 +80,14 @@ impl Sizer {
             current: Fit::Window,
             before: None,
             bar_pos: None,
+            settling: None,
         }
+    }
+
+    /// The recording is over: the next one starts with the bar centred.
+    pub fn forget_bar(&mut self) {
+        self.bar_pos = None;
+        self.settling = None;
     }
 
     /// Shape the window for `fit`, if it is not already.
@@ -84,9 +102,19 @@ impl Sizer {
         let maximised = vp.maximized == Some(true);
 
         if self.current == fit {
-            // The bar can be dragged anywhere; remember where it was left.
             if fit == Fit::Bar {
-                self.bar_pos = Some(outer.min);
+                match self.settling {
+                    Some((target, tries)) if tries > 0 && (outer.min - target).length() > 2.0 => {
+                        use egui::ViewportCommand as C;
+                        ctx.send_viewport_cmd(C::InnerSize(BAR_SIZE));
+                        ctx.send_viewport_cmd(C::OuterPosition(target));
+                        self.settling = Some((target, tries - 1));
+                    }
+                    Some(_) => self.settling = None,
+                    // The bar can be dragged anywhere; remember where it was
+                    // left.
+                    None => self.bar_pos = Some(outer.min),
+                }
             }
             return;
         }
@@ -106,16 +134,18 @@ impl Sizer {
                         work.bottom() - BAR_SIZE.y - BAR_MARGIN,
                     )
                 });
+                let pos = clamp_onto(work, pos, BAR_SIZE);
                 dress(ctx, false);
                 apply(
                     ctx,
                     Shape {
-                        pos: clamp_onto(work, pos, BAR_SIZE),
+                        pos,
                         size: BAR_SIZE,
                         maximised: false,
                     },
                     maximised,
                 );
+                self.settling = Some((pos, SETTLE_TRIES));
             }
             Fit::Window => {
                 dress(ctx, true);
