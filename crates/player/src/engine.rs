@@ -152,6 +152,8 @@ pub struct Player {
     recording: Recording,
     clock: Arc<SharedClock>,
     feeds: Vec<Arc<Feed>>,
+    /// The camera's own video, when it was recorded apart from the screens.
+    camera: Option<Arc<Feed>>,
     sound_error: Arc<Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
@@ -192,6 +194,39 @@ impl Player {
             }
         }
 
+        // The camera is one more video on the same clock, drawn over the
+        // screens by whoever shows them.
+        let camera = recording.camera.as_ref().map(|cam| {
+            let feed = Arc::new(Feed::default());
+            let track = Track {
+                path: cam.path.clone(),
+                id: cam.video.file.clone(),
+                label: "Camera".into(),
+                width: cam.video.width,
+                height: cam.video.height,
+                audio: false,
+            };
+            let (out, clock, stop, repaint) = (
+                Arc::clone(&feed),
+                Arc::clone(&clock),
+                Arc::clone(&stop),
+                Arc::clone(&repaint),
+            );
+            let spawned = std::thread::Builder::new()
+                .name("screenilux-play-camera".into())
+                .spawn(move || {
+                    if let Err(e) = play_video(&track, fps, &clock, &out, &stop, &*repaint) {
+                        tracing::error!(error = %e, "camera playback failed");
+                        out.fail(e);
+                        repaint();
+                    }
+                });
+            if let Ok(h) = spawned {
+                threads.push(h);
+            }
+            feed
+        });
+
         let sound_error = Arc::new(Mutex::new(None));
         if let Some(track) = recording.tracks.iter().find(|t| t.audio).cloned() {
             let (clock, stop, err) = (
@@ -218,6 +253,7 @@ impl Player {
             recording,
             clock,
             feeds,
+            camera,
             sound_error,
             stop,
             threads,
@@ -234,6 +270,11 @@ impl Player {
 
     pub fn feed(&self, track: usize) -> Option<&Feed> {
         self.feeds.get(track).map(|f| &**f)
+    }
+
+    /// The camera's video, when the recording has one of its own.
+    pub fn camera_feed(&self) -> Option<&Feed> {
+        self.camera.as_deref()
     }
 
     pub fn sound_error(&self) -> Option<String> {

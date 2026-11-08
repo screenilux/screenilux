@@ -173,6 +173,7 @@ impl EditView {
             None => (None, Vec::new()),
         };
         player.set_drawn(pointer, shortcuts);
+        player.set_camera_shown(self.loaded.as_ref().is_none_or(|l| !l.edits.hide_camera));
     }
 
     pub fn follow(&mut self, player: &PlayerView) {
@@ -376,10 +377,16 @@ impl EditView {
         };
         let drawn = !l.manifest.cursor_in_picture && l.manifest.pointer.is_some();
         let has_keys = !l.manifest.shortcuts.is_empty();
-        if !drawn && !has_keys {
+        let has_camera = l.manifest.camera_video.is_some();
+        if !drawn && !has_keys && !has_camera {
             return;
         }
-        let before = (l.edits.pointer, l.edits.hide_shortcuts);
+        let before = (l.edits.pointer, l.edits.hide_shortcuts, l.edits.hide_camera);
+        if has_camera {
+            let mut show = !l.edits.hide_camera;
+            theme::setting(ui, &mut show, "Show the camera");
+            l.edits.hide_camera = !show;
+        }
         if drawn {
             let style = &mut l.edits.pointer;
             let mut show = !style.hidden;
@@ -409,7 +416,7 @@ impl EditView {
             theme::setting(ui, &mut show, "Show shortcuts pressed");
             l.edits.hide_shortcuts = !show;
         }
-        if (l.edits.pointer, l.edits.hide_shortcuts) != before {
+        if (l.edits.pointer, l.edits.hide_shortcuts, l.edits.hide_camera) != before {
             self.saved = false;
         }
         ui.add_space(6.0);
@@ -592,6 +599,12 @@ impl EditView {
                 Vec::new()
             } else {
                 l.manifest.shortcuts.clone()
+            },
+            // Read from wherever the player unpacked it, as the screens are.
+            camera: if l.edits.hide_camera {
+                None
+            } else {
+                player.recording().and_then(|r| r.camera)
             },
         };
 

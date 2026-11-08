@@ -17,17 +17,26 @@ use screenilux_core::geometry::Monitor;
 use screenilux_core::keys::Shortcut;
 use screenilux_core::ports::VideoSink;
 use screenilux_core::ports::{CameraSource, PointerEvent};
-use screenilux_core::session::{Focus, FocusEntry, Manifest, Role, Screen};
+use screenilux_core::session::{
+    BubbleMove, CameraVideo, Focus, FocusEntry, Manifest, Role, Screen,
+};
 use screenilux_core::timing::SyncClock;
 use screenilux_platform::capture::ScreenCapture;
 use screenilux_platform::encoder::{ENCODER_LABEL, NativeSink};
 
+use crate::camera::{CameraScreen, bubble_size};
 use crate::paths::{TempDir, unique_path};
 
 use crate::control::Control;
 use crate::screen::{Elapsed, ScreenJob, Sound, run};
 
 const FOCUS_INTERVAL: Duration = Duration::from_millis(80);
+/// The camera is recorded at no more than this many frames a second: few
+/// webcams deliver more, and anything above it would be the same picture
+/// written again.
+const CAMERA_FPS: u32 = 30;
+/// What the camera's own video is called inside a recording.
+pub const CAMERA_FILE: &str = "camera.mp4";
 const MANIFEST_NAME: &str = screenilux_core::session::MANIFEST_NAME;
 
 #[derive(Debug, thiserror::Error)]
@@ -104,6 +113,8 @@ pub struct Session {
     control: Arc<Control>,
     sync: Arc<SyncClock>,
     screens: Vec<ScreenSlot>,
+    /// The camera, recorded beside the screens rather than into them.
+    camera: Option<CameraSlot>,
     /// Kept alive for the session; removes the scratch files when dropped.
     workspace: TempDir,
     focus: Option<FocusWorker>,
@@ -115,6 +126,14 @@ pub struct Session {
     shortcuts: Arc<Mutex<Vec<Shortcut>>>,
     sampler: Option<RouterWorker>,
     started: std::time::SystemTime,
+}
+
+/// The camera's recording, and where its bubble was put while it ran.
+struct CameraSlot {
+    slot: ScreenSlot,
+    /// The bubble's size on the desktop.
+    size: (u32, u32),
+    moves: Arc<Mutex<Vec<BubbleMove>>>,
 }
 
 /// Fans one global hook out to the screen each event belongs to.
@@ -155,7 +174,19 @@ impl Session {
         // and the finished files are moved out.
         let workspace = TempDir::new("screenilux-session")?;
         let control = Arc::new(Control::new());
-        let sync = Arc::new(SyncClock::new(config.monitors.len()));
+        // The camera starts with the screens, so it is opened first: it is
+        // one more party to the shared start.
+        let camera_screen = if config.camera_enabled() {
+            let cam = config.camera.clone().and_then(CameraScreen::start);
+            if cam.is_none() {
+                tracing::warn!("the camera showed nothing; recording without it");
+            }
+            cam
+        } else {
+            None
+        };
+        let parties = config.monitors.len() + usize::from(camera_screen.is_some());
+        let sync = Arc::new(SyncClock::new(parties));
 
         let mut screens = Vec::new();
         let mut event_senders: Vec<(screenilux_core::geometry::Rect, Sender<PointerEvent>)> =
@@ -192,10 +223,12 @@ impl Session {
             let elapsed = Arc::new(Elapsed::default());
             let (give_back, take_back) = crossbeam_channel::bounded(1);
 
-            // The pointer is drawn on playback from its path, not into the
-            // picture; the rest of the live effects still are.
+            // The pointer is drawn on playback from its path, and the camera
+            // from its own video, not into the picture; the rest of the live
+            // effects still are.
             let drawn = EffectOptions {
                 cursor: false,
+                camera: false,
                 ..config.effects
             };
             let compositor = drawn.any().then(|| Compositor::new(monitor.bounds, drawn));
@@ -215,11 +248,6 @@ impl Session {
                 compositor,
                 events: Some(event_rx),
                 pointer: Arc::new(screenilux_platform::cursor_pos),
-                camera: if config.camera_enabled() {
-                    config.camera.clone()
-                } else {
-                    None
-                },
                 sound: audio.then(|| {
                     Sound::new(
                         config
@@ -253,6 +281,11 @@ impl Session {
             });
         }
 
+        let camera = match camera_screen {
+            Some(cam) => Some(start_camera(cam, &config, &workspace, &control, &sync)?),
+            None => None,
+        };
+
         let watcher = Arc::new(Mutex::new(screenilux_core::pointer::Watcher::new()));
         let shortcuts = Arc::new(Mutex::new(Vec::new()));
 
@@ -264,6 +297,12 @@ impl Session {
             let flag = Arc::clone(&stop);
             let watcher = Arc::clone(&watcher);
             let clock = screens.first().map(|s| Arc::clone(&s.elapsed));
+            // Where the bubble is dragged to while recording, noted as it
+            // moves so playback puts it in the same places.
+            let bubble = camera
+                .as_ref()
+                .zip(config.camera.clone())
+                .map(|(c, src)| (Arc::clone(&c.moves), src));
             let handle = std::thread::Builder::new()
                 .name("screenilux-pointer".into())
                 .spawn(move || {
@@ -274,6 +313,9 @@ impl Session {
                             let at = screenilux_platform::cursor_pos();
                             if let Ok(mut w) = watcher.lock() {
                                 w.saw(t, at);
+                            }
+                            if let Some((moves, src)) = &bubble {
+                                note_bubble(moves, src.rect(), t);
                             }
                         }
                         std::thread::sleep(step);
@@ -326,6 +368,7 @@ impl Session {
             control,
             sync,
             screens,
+            camera,
             workspace,
             focus,
             router,
@@ -370,7 +413,8 @@ impl Session {
         self.sync.abort();
 
         let mut failures = Vec::new();
-        for slot in &mut self.screens {
+        let camera = self.camera.as_mut().map(|c| &mut c.slot);
+        for slot in self.screens.iter_mut().chain(camera) {
             if let Some(h) = slot.handle.take() {
                 match h.join() {
                     Ok(Ok(_)) => {}
@@ -440,7 +484,9 @@ impl Session {
             manifest.edits = Some(edits);
         }
 
-        if self.screens.len() == 1 {
+        // A plain video has nowhere to keep the camera's own video, so a
+        // recording with the camera is always a package.
+        if self.screens.len() == 1 && self.camera.is_none() {
             let dest = unique_path(outdir, &format!("recording_{stamp}"), "mp4");
             let slot = &mut self.screens[0];
             finish_sink(slot, &dest)
@@ -511,6 +557,21 @@ impl Session {
         }
         manifest.assign_order();
 
+        if let Some(cam) = &mut self.camera {
+            match finish_sink(&mut cam.slot, &folder.join(CAMERA_FILE)) {
+                Ok(()) => {
+                    let moves = cam.moves.lock().map(|m| m.clone()).unwrap_or_default();
+                    manifest.camera_video = Some(CameraVideo {
+                        file: CAMERA_FILE.to_string(),
+                        width: cam.size.0,
+                        height: cam.size.1,
+                        moves,
+                    });
+                }
+                Err(e) => lost.push(format!("Camera: {e}")),
+            }
+        }
+
         if !focus_timeline.is_empty() {
             let by_index: std::collections::HashMap<usize, String> =
                 saved_files.into_iter().collect();
@@ -545,6 +606,91 @@ impl Session {
             .map_err(|e| SessionError::Manifest(e.to_string()))?;
         Ok(dest)
     }
+}
+
+/// Open the camera's encoder and start it through the same loop a screen
+/// runs, on the session's shared start.
+fn start_camera(
+    cam: CameraScreen,
+    config: &SessionConfig,
+    workspace: &TempDir,
+    control: &Arc<Control>,
+    sync: &Arc<SyncClock>,
+) -> Result<CameraSlot, SessionError> {
+    let (w, h) = cam.size();
+    let fps = config.fps.clamp(1, CAMERA_FPS);
+    let sink = NativeSink::new(w, h, fps, false, workspace.path().join(CAMERA_FILE))
+        .map_err(|e| SessionError::Capture(format!("camera: {e}")))?;
+    let asked = config
+        .camera
+        .as_ref()
+        .map_or(screenilux_core::geometry::Rect::new(0, 0, w, h), |c| {
+            c.rect()
+        });
+    // Noted from the start, so the bubble always has a place.
+    let moves = Arc::new(Mutex::new(vec![BubbleMove {
+        t: 0.0,
+        left: asked.left,
+        top: asked.top,
+    }]));
+
+    let elapsed = Arc::new(Elapsed::default());
+    let (give_back, take_back) = crossbeam_channel::bounded(1);
+    let job = ScreenJob {
+        source: Box::new(cam),
+        sink: Box::new(SinkCarrier {
+            inner: Some(Box::new(sink)),
+            give_back: Some(give_back),
+        }),
+        fps,
+        control: Arc::clone(control),
+        sync: Arc::clone(sync),
+        elapsed: Arc::clone(&elapsed),
+        compositor: None,
+        events: None,
+        pointer: Arc::new(screenilux_platform::cursor_pos),
+        sound: None,
+    };
+    let handle = std::thread::Builder::new()
+        .name("screenilux-capture-camera".into())
+        .spawn(move || {
+            let r = run(job);
+            if let Err(e) = &r {
+                tracing::error!(error = %e, "camera thread failed");
+            }
+            r
+        })?;
+    Ok(CameraSlot {
+        slot: ScreenSlot {
+            monitor: Monitor::new(
+                "Camera",
+                screenilux_core::geometry::Rect::new(0, 0, w, h),
+                false,
+            ),
+            elapsed,
+            audio: false,
+            handle: Some(handle),
+            sink: SinkHandle::Pending(take_back),
+        },
+        size: bubble_size(asked, (w, h)),
+        moves,
+    })
+}
+
+/// Write down where the bubble is at `t`, if it has moved since last noted.
+fn note_bubble(moves: &Mutex<Vec<BubbleMove>>, at: screenilux_core::geometry::Rect, t: f64) {
+    let Ok(mut moves) = moves.lock() else { return };
+    if moves
+        .last()
+        .is_some_and(|m| (m.left, m.top) == (at.left, at.top))
+    {
+        return;
+    }
+    moves.push(BubbleMove {
+        t: round3(t),
+        left: at.left,
+        top: at.top,
+    });
 }
 
 fn join_errors(failures: &[String], e: &str) -> String {

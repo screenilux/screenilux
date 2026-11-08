@@ -117,6 +117,84 @@ pub struct Manifest {
     /// Shortcuts pressed while recording.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shortcuts: Vec<crate::keys::Shortcut>,
+    /// The camera, recorded to a video of its own and laid over the screens
+    /// on playback and export. Absent when the camera was off, and on
+    /// recordings made while it was still drawn into the screens' pictures.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub camera_video: Option<CameraVideo>,
+}
+
+/// The camera as a video of its own, and where its bubble sat while
+/// recording, so it can be drawn over the screens, moved or left out later
+/// rather than being part of their pictures for good.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CameraVideo {
+    /// Filename within the session folder, e.g. `camera.mp4`.
+    pub file: String,
+    /// The bubble's size on the desktop, in pixels.
+    pub width: u32,
+    pub height: u32,
+    /// Where the bubble's top-left corner was on the desktop, each from its
+    /// `t` (recorded seconds) on. Never empty: the first is at 0.
+    pub moves: Vec<BubbleMove>,
+}
+
+/// The bubble put somewhere new.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BubbleMove {
+    pub t: f64,
+    pub left: i32,
+    pub top: i32,
+}
+
+impl CameraVideo {
+    /// The bubble on the desktop at `t` recorded seconds.
+    pub fn rect_at(&self, t: f64) -> crate::geometry::Rect {
+        let at = self
+            .moves
+            .iter()
+            .take_while(|m| m.t <= t)
+            .last()
+            .or(self.moves.first())
+            .map_or((0, 0), |m| (m.left, m.top));
+        crate::geometry::Rect::new(at.0, at.1, self.width, self.height)
+    }
+
+    /// Where to draw the bubble at `t` over a picture of the screen `desk`
+    /// (where that screen sat on the desktop), the picture being `pic` —
+    /// `(x, y, width, height)` in whatever units it is drawn in. `None` when
+    /// the bubble was on another screen.
+    ///
+    /// It keeps its place on the screen, measured from its centre, and its
+    /// size against the screen's shorter side, so a vertical or square cut
+    /// of a wide screen still has it in the same corner and at a sensible
+    /// size. It is not zoomed with the picture: it is laid over it.
+    pub fn placed(
+        &self,
+        t: f64,
+        desk: crate::geometry::Rect,
+        pic: (f32, f32, f32, f32),
+    ) -> Option<(f32, f32, f32, f32)> {
+        let r = self.rect_at(t);
+        let overlaps = r.left < desk.left + desk.width as i32
+            && desk.left < r.left + r.width as i32
+            && r.top < desk.top + desk.height as i32
+            && desk.top < r.top + r.height as i32;
+        if !overlaps || desk.width == 0 || desk.height == 0 {
+            return None;
+        }
+        let (px, py, pw, ph) = pic;
+        let scale = pw.min(ph) / desk.width.min(desk.height) as f32;
+        let (bw, bh) = (
+            (r.width as f32 * scale).min(pw),
+            (r.height as f32 * scale).min(ph),
+        );
+        let cx = ((r.left - desk.left) as f32 + r.width as f32 / 2.0) / desk.width as f32;
+        let cy = ((r.top - desk.top) as f32 + r.height as f32 / 2.0) / desk.height as f32;
+        let x = (px + cx.clamp(0.0, 1.0) * pw - bw / 2.0).clamp(px, px + pw - bw);
+        let y = (py + cy.clamp(0.0, 1.0) * ph - bh / 2.0).clamp(py, py + ph - bh);
+        Some((x, y, bw, bh))
+    }
 }
 
 fn in_picture() -> bool {
@@ -155,6 +233,7 @@ impl Manifest {
             pointer: None,
             cursor_in_picture: true,
             shortcuts: Vec::new(),
+            camera_video: None,
         }
     }
 
@@ -167,6 +246,15 @@ impl Manifest {
         for (rank, i) in ranked.into_iter().enumerate() {
             self.screens[i].order = rank as u32 + 1;
         }
+    }
+
+    /// Every video the recording is made of: the screens', then the
+    /// camera's if it has one of its own.
+    pub fn videos(&self) -> impl Iterator<Item = &str> {
+        self.screens
+            .iter()
+            .map(|s| s.file.as_str())
+            .chain(self.camera_video.as_ref().map(|c| c.file.as_str()))
     }
 
     /// Screens in display priority.
@@ -319,6 +407,76 @@ mod tests {
         m.edits = Some(list);
         let back = Manifest::from_json(&m.to_json().unwrap()).unwrap();
         assert_eq!(back.edits.map(|e| e.len()), Some(1));
+    }
+
+    fn camera(moves: Vec<BubbleMove>) -> CameraVideo {
+        CameraVideo {
+            file: "camera.mp4".into(),
+            width: 320,
+            height: 180,
+            moves,
+        }
+    }
+
+    #[test]
+    fn the_camera_round_trips_and_stays_out_when_there_is_none() {
+        let mut m = sample();
+        assert!(!m.to_json().unwrap().contains("camera_video"));
+        m.camera_video = Some(camera(vec![BubbleMove {
+            t: 0.0,
+            left: 10,
+            top: 20,
+        }]));
+        let back = Manifest::from_json(&m.to_json().unwrap()).unwrap();
+        assert_eq!(back.camera_video, m.camera_video);
+    }
+
+    #[test]
+    fn the_bubble_is_where_it_was_last_put() {
+        let cam = camera(vec![
+            BubbleMove {
+                t: 0.0,
+                left: 100,
+                top: 100,
+            },
+            BubbleMove {
+                t: 2.0,
+                left: 500,
+                top: 300,
+            },
+        ]);
+        assert_eq!(cam.rect_at(1.9).left, 100);
+        assert_eq!(cam.rect_at(2.0).left, 500);
+        assert_eq!(cam.rect_at(99.0).top, 300);
+    }
+
+    #[test]
+    fn the_bubble_lands_where_it_was_on_a_picture_the_screens_shape() {
+        let desk = crate::geometry::Rect::new(1920, 0, 1920, 1080);
+        let cam = camera(vec![BubbleMove {
+            t: 0.0,
+            left: 1920 + 1500,
+            top: 800,
+        }]);
+        // The picture at half size: the bubble halves and keeps its place.
+        let (x, y, w, h) = cam.placed(0.0, desk, (0.0, 0.0, 960.0, 540.0)).unwrap();
+        assert_eq!((x, y, w, h), (750.0, 400.0, 160.0, 90.0));
+        // On the other screen, it is not on this one.
+        let left = crate::geometry::Rect::new(0, 0, 1920, 1080);
+        assert!(cam.placed(0.0, left, (0.0, 0.0, 960.0, 540.0)).is_none());
+    }
+
+    #[test]
+    fn the_bubble_stays_inside_a_narrow_cut() {
+        let desk = crate::geometry::Rect::new(0, 0, 1920, 1080);
+        let cam = camera(vec![BubbleMove {
+            t: 0.0,
+            left: 1592,
+            top: 872,
+        }]);
+        let (x, y, w, h) = cam.placed(0.0, desk, (0.0, 0.0, 1080.0, 1920.0)).unwrap();
+        assert!(x >= 0.0 && x + w <= 1080.0 && y >= 0.0 && y + h <= 1920.0);
+        assert_eq!((w, h), (320.0, 180.0), "sized against the shorter side");
     }
 
     #[test]

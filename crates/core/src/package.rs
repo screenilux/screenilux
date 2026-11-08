@@ -94,8 +94,8 @@ fn write_atomically(
 pub fn pack(folder: &Path, dest: &Path) -> Result<Manifest, PackageError> {
     let json = std::fs::read_to_string(folder.join(MANIFEST_NAME))?;
     let manifest = Manifest::from_json(&json)?;
-    for s in &manifest.screens {
-        check_name(&s.file)?;
+    for file in manifest.videos() {
+        check_name(file)?;
     }
     let text = std::fs::read(folder.join(TEXT_INDEX_NAME)).ok();
 
@@ -104,9 +104,9 @@ pub fn pack(folder: &Path, dest: &Path) -> Result<Manifest, PackageError> {
         // seeking past gigabytes of video.
         zip.start_file(MANIFEST_NAME, options())?;
         zip.write_all(json.as_bytes())?;
-        for s in &manifest.screens {
-            zip.start_file(s.file.as_str(), options())?;
-            let mut src = File::open(folder.join(&s.file))?;
+        for file in manifest.videos() {
+            zip.start_file(file, options())?;
+            let mut src = File::open(folder.join(file))?;
             std::io::copy(&mut src, zip)?;
         }
         if let Some(text) = &text {
@@ -140,8 +140,8 @@ fn read_entry<R: Read + Seek>(
 fn manifest_of<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Result<Manifest, PackageError> {
     let json = read_entry(zip, MANIFEST_NAME)?.ok_or(PackageError::NoManifest)?;
     let manifest = Manifest::from_json(&json)?;
-    for s in &manifest.screens {
-        check_name(&s.file)?;
+    for file in manifest.videos() {
+        check_name(file)?;
     }
     Ok(manifest)
 }
@@ -167,7 +167,7 @@ pub fn unpack(path: &Path, into: &Path) -> Result<Manifest, PackageError> {
     std::fs::create_dir_all(into)?;
     std::fs::write(into.join(MANIFEST_NAME), manifest.to_json()?)?;
 
-    let mut names: Vec<String> = manifest.screens.iter().map(|s| s.file.clone()).collect();
+    let mut names: Vec<String> = manifest.videos().map(str::to_string).collect();
     names.push(TEXT_INDEX_NAME.to_string());
     for name in names {
         let mut entry = match zip.by_name(&name) {

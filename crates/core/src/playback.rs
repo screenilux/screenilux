@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::session::{Focus, Manifest};
+use crate::session::{CameraVideo, Focus, Manifest};
 
 /// One screen's video.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +31,17 @@ pub struct Recording {
     pub tracks: Vec<Track>,
     pub duration: f64,
     pub focus: Option<Focus>,
+    /// The camera's own video and where its bubble sat, when it was
+    /// recorded apart from the screens rather than into them.
+    pub camera: Option<Camera>,
+}
+
+/// The camera, recorded to a video of its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Camera {
+    /// Where the decoder reads it from.
+    pub path: PathBuf,
+    pub video: CameraVideo,
 }
 
 impl Recording {
@@ -52,6 +63,10 @@ impl Recording {
             tracks,
             duration: manifest.duration,
             focus: manifest.focus.clone(),
+            camera: manifest.camera_video.as_ref().map(|v| Camera {
+                path: dir.join(&v.file),
+                video: v.clone(),
+            }),
         }
     }
 
@@ -72,6 +87,7 @@ impl Recording {
             }],
             duration,
             focus: None,
+            camera: None,
         }
     }
 
