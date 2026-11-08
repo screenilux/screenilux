@@ -3849,6 +3849,7 @@ dependencies = [
 name = "screenilux-core"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "fast_image_resize",
  "serde",
  "serde_json",

@@ -1,7 +1,9 @@
-//! The global pointer hook.
+//! The global pointer hook, and the shortcuts pressed.
 //!
 //! It lives on a thread of its own because a `WH_MOUSE_LL` hook is only
-//! serviced while its installing thread pumps messages.
+//! serviced while its installing thread pumps messages. A `WH_KEYBOARD_LL`
+//! hook on the same thread sees keys, and passes on only those that make a
+//! shortcut (see `screenilux_core::keys`): ordinary typing never leaves it.
 //!
 //! The hook callback does nothing but decode and enqueue. Windows silently
 //! removes a low-level hook whose callback is too slow to return, which would
@@ -13,13 +15,17 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use screenilux_core::geometry::Point;
+use screenilux_core::keys::{self, Key};
 use screenilux_core::ports::{PointerEvent, PointerSource};
 use windows::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, HHOOK, KBDLLHOOKSTRUCT_FLAGS, MSG,
-    MSLLHOOKSTRUCT, PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
-    WH_MOUSE_LL, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN,
+    CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, HHOOK, KBDLLHOOKSTRUCT,
+    KBDLLHOOKSTRUCT_FLAGS, MSG, MSLLHOOKSTRUCT, PostThreadMessageW, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_MBUTTONDOWN, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN,
 };
 
 /// Where the hook callback posts what it sees.
@@ -39,6 +45,86 @@ fn ctrl_alt_held() -> bool {
         (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
             && (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0
     }
+}
+
+fn held(vk: u16) -> bool {
+    // SAFETY: reads a process-global key state; no pointers involved.
+    unsafe { (GetAsyncKeyState(i32::from(vk)) as u16 & 0x8000) != 0 }
+}
+
+/// The modifiers held now, as `keys` counts them.
+fn modifiers() -> u8 {
+    let mut m = 0;
+    if held(VK_CONTROL.0) {
+        m |= keys::CTRL;
+    }
+    if held(VK_MENU.0) {
+        m |= keys::ALT;
+    }
+    if held(VK_SHIFT.0) {
+        m |= keys::SHIFT;
+    }
+    if held(VK_LWIN.0) || held(VK_RWIN.0) {
+        m |= keys::SUPER;
+    }
+    m
+}
+
+/// The key a virtual-key code stands for, if it is one a shortcut can end
+/// in. Modifiers themselves are not.
+fn key_of(vk: u32) -> Option<Key> {
+    Some(match vk {
+        0x41..=0x5A => Key::Letter(char::from(vk as u8)),
+        0x30..=0x39 => Key::Digit((vk - 0x30) as u8),
+        0x70..=0x87 => Key::F((vk - 0x70 + 1) as u8),
+        0x0D => Key::Enter,
+        0x1B => Key::Escape,
+        0x09 => Key::Tab,
+        0x20 => Key::Space,
+        0x08 => Key::Backspace,
+        0x2E => Key::Delete,
+        0x25 => Key::Left,
+        0x26 => Key::Up,
+        0x27 => Key::Right,
+        0x28 => Key::Down,
+        0x24 => Key::Home,
+        0x23 => Key::End,
+        0x21 => Key::PageUp,
+        0x22 => Key::PageDown,
+        0xBB => Key::Symbol('+'),
+        0xBD => Key::Symbol('-'),
+        0xBC => Key::Symbol(','),
+        0xBE => Key::Symbol('.'),
+        0xBF => Key::Symbol('/'),
+        0xBA => Key::Symbol(';'),
+        0xDB => Key::Symbol('['),
+        0xDD => Key::Symbol(']'),
+        0xDC => Key::Symbol('\\'),
+        0xDE => Key::Symbol('\''),
+        0xC0 => Key::Symbol('`'),
+        _ => return None,
+    })
+}
+
+/// The low-level keyboard hook. It never swallows a key, and only a key
+/// that makes a shortcut goes any further than this function.
+unsafe extern "system" fn key_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == 0 && matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+        let info = lparam.0 as *const KBDLLHOOKSTRUCT;
+        if !info.is_null() {
+            // SAFETY: for code == 0 Windows guarantees lparam points at a
+            // live KBDLLHOOKSTRUCT for the duration of this call.
+            let vk = unsafe { (*info).vkCode };
+            if let Some(key) = key_of(vk) {
+                let mods = modifiers();
+                if keys::shortcut(mods, key).is_some() {
+                    emit(PointerEvent::Key { mods, key });
+                }
+            }
+        }
+    }
+    // SAFETY: passing the event along is required of every hook.
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
 fn emit(event: PointerEvent) {
@@ -194,6 +280,15 @@ fn pump(ready: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>, tid_out: Threa
             HHOOK::default()
         }
     };
+    // SAFETY: as above, for the keyboard.
+    let key_hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_proc), None, 0) };
+    let key_hook: HHOOK = match key_hook {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not install the keyboard hook; shortcuts are not shown");
+            HHOOK::default()
+        }
+    };
 
     let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
     tid_out.store(tid, Ordering::SeqCst);
@@ -219,10 +314,13 @@ fn pump(ready: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>, tid_out: Threa
         }
     }
 
-    // SAFETY: removing the hook this thread installed.
+    // SAFETY: removing the hooks this thread installed.
     unsafe {
         if !hook.is_invalid() {
             let _ = UnhookWindowsHookEx(hook);
+        }
+        if !key_hook.is_invalid() {
+            let _ = UnhookWindowsHookEx(key_hook);
         }
     }
     tid_out.store(0, Ordering::SeqCst);

@@ -1,4 +1,7 @@
-//! Clicks and the zoom wheel anywhere on the desktop, through XInput 2.
+//! Clicks, the zoom wheel and shortcuts anywhere on the desktop, through
+//! XInput 2. Of the keys, only those that make a shortcut (see
+//! `screenilux_core::keys`) go any further: ordinary typing never leaves
+//! this module.
 //!
 //! Raw button events reach every client that asks for them on the root
 //! window, whichever window is under the pointer. Unlike on Windows they
@@ -12,6 +15,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use screenilux_core::geometry::Point;
+use screenilux_core::keys::{self, Key};
 use screenilux_core::ports::{PointerEvent, PointerSource};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
@@ -106,6 +110,50 @@ fn meaning(button: u32, ctrl_alt: bool, at: Point) -> Option<PointerEvent> {
     }
 }
 
+/// The modifiers held, as `keys` counts them, from the pointer's mask.
+fn modifiers(mask: KeyButMask) -> u8 {
+    let mut m = 0;
+    if mask.contains(KeyButMask::CONTROL) {
+        m |= keys::CTRL;
+    }
+    if mask.contains(KeyButMask::MOD1) {
+        m |= keys::ALT;
+    }
+    if mask.contains(KeyButMask::SHIFT) {
+        m |= keys::SHIFT;
+    }
+    if mask.contains(KeyButMask::MOD4) {
+        m |= keys::SUPER;
+    }
+    m
+}
+
+/// The key a keysym stands for, if a shortcut can end in it.
+fn key_of(sym: u32) -> Option<Key> {
+    Some(match sym {
+        0x61..=0x7A => Key::Letter(char::from(sym as u8)),
+        0x41..=0x5A => Key::Letter(char::from(sym as u8)),
+        0x30..=0x39 => Key::Digit((sym - 0x30) as u8),
+        0xFFBE..=0xFFD5 => Key::F((sym - 0xFFBE + 1) as u8),
+        0xFF0D => Key::Enter,
+        0xFF1B => Key::Escape,
+        0xFF09 => Key::Tab,
+        0x20 => Key::Space,
+        0xFF08 => Key::Backspace,
+        0xFFFF => Key::Delete,
+        0xFF51 => Key::Left,
+        0xFF52 => Key::Up,
+        0xFF53 => Key::Right,
+        0xFF54 => Key::Down,
+        0xFF50 => Key::Home,
+        0xFF57 => Key::End,
+        0xFF55 => Key::PageUp,
+        0xFF56 => Key::PageDown,
+        0x21..=0x7E => Key::Symbol(char::from(sym as u8)),
+        _ => return None,
+    })
+}
+
 fn listen(stop: &AtomicBool, tx: &Sender<PointerEvent>) -> Result<(), String> {
     let d = x11::connect()?;
     d.conn
@@ -118,13 +166,30 @@ fn listen(stop: &AtomicBool, tx: &Sender<PointerEvent>) -> Result<(), String> {
             d.root,
             &[xinput::EventMask {
                 deviceid: xinput::Device::ALL_MASTER.into(),
-                mask: vec![xinput::XIEventMask::RAW_BUTTON_PRESS],
+                mask: vec![
+                    xinput::XIEventMask::RAW_BUTTON_PRESS | xinput::XIEventMask::RAW_KEY_PRESS,
+                ],
             }],
         )
         .map_err(|e| e.to_string())?
         .check()
         .map_err(|e| e.to_string())?;
     d.conn.flush().map_err(|e| e.to_string())?;
+
+    // Which keysym each keycode types, unshifted, read once.
+    let setup = d.conn.setup();
+    let (first, last) = (setup.min_keycode, setup.max_keycode);
+    let mapping = d
+        .conn
+        .get_keyboard_mapping(first, last - first + 1)
+        .map_err(|e| e.to_string())?
+        .reply()
+        .map_err(|e| e.to_string())?;
+    let per = usize::from(mapping.keysyms_per_keycode.max(1));
+    let keysym = |code: u32| -> u32 {
+        let i = (code as usize).saturating_sub(usize::from(first)) * per;
+        mapping.keysyms.get(i).copied().unwrap_or(0)
+    };
 
     while !stop.load(Ordering::Relaxed) {
         match d.conn.poll_for_event().map_err(|e| e.to_string())? {
@@ -136,6 +201,15 @@ fn listen(stop: &AtomicBool, tx: &Sender<PointerEvent>) -> Result<(), String> {
                     mask.contains(KeyButMask::CONTROL) && mask.contains(KeyButMask::MOD1);
                 if let Some(event) = meaning(ev.detail, ctrl_alt, at) {
                     let _ = tx.send(event);
+                }
+            }
+            Some(Event::XinputRawKeyPress(ev)) => {
+                let Some(key) = key_of(keysym(ev.detail)) else {
+                    continue;
+                };
+                let mods = pointer(&d).map_or(0, |(_, mask)| modifiers(mask));
+                if keys::shortcut(mods, key).is_some() {
+                    let _ = tx.send(PointerEvent::Key { mods, key });
                 }
             }
             Some(_) => {}

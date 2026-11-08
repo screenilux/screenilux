@@ -14,6 +14,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use screenilux_core::compositor::{Compositor, EffectOptions};
 use screenilux_core::focus::{DEFAULT_DWELL, FocusTracker};
 use screenilux_core::geometry::Monitor;
+use screenilux_core::keys::Shortcut;
 use screenilux_core::ports::VideoSink;
 use screenilux_core::ports::{CameraSource, PointerEvent};
 use screenilux_core::session::{Focus, FocusEntry, Manifest, Role, Screen};
@@ -110,6 +111,8 @@ pub struct Session {
     /// Where the pointer went, written down as the recording runs so a zoom
     /// can follow it and its clicks can be marked afterwards.
     watcher: Arc<Mutex<screenilux_core::pointer::Watcher>>,
+    /// Shortcuts pressed while recording, to show over the picture.
+    shortcuts: Arc<Mutex<Vec<Shortcut>>>,
     sampler: Option<RouterWorker>,
     started: std::time::SystemTime,
 }
@@ -189,10 +192,13 @@ impl Session {
             let elapsed = Arc::new(Elapsed::default());
             let (give_back, take_back) = crossbeam_channel::bounded(1);
 
-            let compositor = config
-                .effects
-                .any()
-                .then(|| Compositor::new(monitor.bounds, config.effects));
+            // The pointer is drawn on playback from its path, not into the
+            // picture; the rest of the live effects still are.
+            let drawn = EffectOptions {
+                cursor: false,
+                ..config.effects
+            };
+            let compositor = drawn.any().then(|| Compositor::new(monitor.bounds, drawn));
             let (event_tx, event_rx) = unbounded();
             event_senders.push((monitor.bounds, event_tx));
 
@@ -248,6 +254,7 @@ impl Session {
         }
 
         let watcher = Arc::new(Mutex::new(screenilux_core::pointer::Watcher::new()));
+        let shortcuts = Arc::new(Mutex::new(Vec::new()));
 
         // Reading the pointer is worth doing whether or not any effect is
         // switched on: the track is what makes a zoom able to follow it
@@ -282,10 +289,20 @@ impl Session {
             let stop = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&stop);
             let watcher = Arc::clone(&watcher);
+            let shortcuts = Arc::clone(&shortcuts);
             let clock = screens.first().map(|s| Arc::clone(&s.elapsed));
             let handle = std::thread::Builder::new()
                 .name("screenilux-router".into())
-                .spawn(move || route_events(events, event_senders, click_tx, flag, watcher, clock))
+                .spawn(move || {
+                    route_events(
+                        events,
+                        event_senders,
+                        click_tx,
+                        flag,
+                        Written { watcher, shortcuts },
+                        clock,
+                    )
+                })
                 .ok();
             RouterWorker { stop, handle }
         });
@@ -313,6 +330,7 @@ impl Session {
             focus,
             router,
             watcher,
+            shortcuts,
             sampler,
             started: std::time::SystemTime::now(),
         })
@@ -387,29 +405,20 @@ impl Session {
         std::fs::create_dir_all(outdir)?;
         let stamp = timestamp(self.started);
 
-        if self.screens.len() == 1 {
-            let dest = unique_path(outdir, &format!("recording_{stamp}"), "mp4");
-            let slot = &mut self.screens[0];
-            finish_sink(slot, &dest)
-                .map_err(|e| SessionError::Capture(join_errors(&failures, &e)))?;
-            return Ok(dest);
-        }
-
-        // Assembled as a session folder in scratch space, then packed. The
-        // finished videos are moved, not copied, into the folder, so the
-        // only full copy is the one into the package.
-        let folder = self.workspace.path().join("session");
-        std::fs::create_dir_all(&folder)?;
-
-        // The pointer's path, if anything was written down. Taken before the
-        // screens are finished, since nothing moves it after the capture
-        // threads have stopped.
+        // The pointer's path and the shortcuts, if anything was written
+        // down. Taken before the screens are finished, since nothing adds to
+        // them after the capture threads have stopped.
         let pointer = self
             .watcher
             .lock()
             .ok()
             .map(|mut w| std::mem::take(&mut *w).finish())
             .filter(|t| !t.is_empty());
+        let shortcuts = self
+            .shortcuts
+            .lock()
+            .map(|mut s| std::mem::take(&mut *s))
+            .unwrap_or_default();
 
         let mut manifest = Manifest::new(
             iso_timestamp(self.started),
@@ -418,8 +427,55 @@ impl Session {
             ENCODER_LABEL.to_string(),
             self.config.camera_enabled(),
         );
-
+        // The pointer is no longer drawn into the picture: it is drawn on
+        // playback from its path, so it can be smoothed, sized and hidden.
+        manifest.cursor_in_picture = false;
         manifest.pointer = pointer;
+        manifest.shortcuts = shortcuts;
+        if !self.config.effects.cursor {
+            // "Show the pointer" was off: start the recording with it hidden,
+            // which the editor can still turn back on.
+            let mut edits = screenilux_core::edit::EditList::default();
+            edits.pointer.hidden = true;
+            manifest.edits = Some(edits);
+        }
+
+        if self.screens.len() == 1 {
+            let dest = unique_path(outdir, &format!("recording_{stamp}"), "mp4");
+            let slot = &mut self.screens[0];
+            finish_sink(slot, &dest)
+                .map_err(|e| SessionError::Capture(join_errors(&failures, &e)))?;
+            // A plain video has nowhere inside it for the pointer's path, so
+            // that is written beside it. The video still plays anywhere.
+            let b = slot.monitor.bounds;
+            manifest.screens.push(Screen {
+                file: dest
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                label: slot.monitor.label.clone(),
+                width: b.width,
+                height: b.height,
+                left: b.left,
+                top: b.top,
+                primary: slot.monitor.is_primary,
+                audio: slot.audio,
+                role: Role::Primary,
+                order: 1,
+            });
+            if let Ok(json) = manifest.to_json()
+                && let Err(e) = std::fs::write(details_path(&dest), json)
+            {
+                tracing::warn!(error = %e, "could not write the recording's details beside it");
+            }
+            return Ok(dest);
+        }
+
+        // Assembled as a session folder in scratch space, then packed. The
+        // finished videos are moved, not copied, into the folder, so the
+        // only full copy is the one into the package.
+        let folder = self.workspace.path().join("session");
+        std::fs::create_dir_all(&folder)?;
 
         let mut saved_files = Vec::new();
         let mut lost = failures;
@@ -538,15 +594,32 @@ impl Drop for SinkCarrier {
     }
 }
 
+/// Where a recording's details are kept beside a plain video: the pointer's
+/// path, the shortcuts and, once edited, its effects. The video's own name
+/// with `.json` after it, so the two stay together and never collide with
+/// another recording's.
+pub fn details_path(video: &Path) -> PathBuf {
+    let mut name = video.as_os_str().to_owned();
+    name.push(".json");
+    PathBuf::from(name)
+}
+
+/// What the router writes down as it goes.
+struct Written {
+    watcher: Arc<Mutex<screenilux_core::pointer::Watcher>>,
+    shortcuts: Arc<Mutex<Vec<Shortcut>>>,
+}
+
 /// Drain the global hook and hand each event to the screen it belongs to.
 fn route_events(
     events: Receiver<PointerEvent>,
     screens: Vec<(screenilux_core::geometry::Rect, Sender<PointerEvent>)>,
     clicks: Option<Sender<()>>,
     stop: Arc<AtomicBool>,
-    watcher: Arc<Mutex<screenilux_core::pointer::Watcher>>,
+    written: Written,
     clock: Option<Arc<crate::screen::Elapsed>>,
 ) {
+    let Written { watcher, shortcuts } = written;
     while !stop.load(Ordering::Relaxed) {
         // A short block keeps the thread responsive to stop without spinning.
         let Ok(event) = events.recv_timeout(Duration::from_millis(50)) else {
@@ -578,6 +651,17 @@ fn route_events(
                     let at = screenilux_platform::cursor_pos();
                     if let Some((_, tx)) = screens.iter().find(|(b, _)| b.contains(at)) {
                         let _ = tx.send(event);
+                    }
+                }
+                PointerEvent::Key { mods, key } => {
+                    if let (Some(clock), Some(keys)) =
+                        (&clock, screenilux_core::keys::shortcut(mods, key))
+                        && let Ok(mut list) = shortcuts.lock()
+                    {
+                        list.push(Shortcut {
+                            t: (clock.get().as_secs_f64() * 1000.0).round() / 1000.0,
+                            keys,
+                        });
                     }
                 }
             }

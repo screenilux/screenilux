@@ -93,6 +93,36 @@ impl Track {
         ))
     }
 
+    /// Where the pointer was around `t`, eased: its path averaged over
+    /// `window` seconds either side, weighted toward `t`.
+    ///
+    /// A hand's path jitters and a reading ten times a second is coarse.
+    /// This is the line the eye draws through it, which is what a pointer
+    /// drawn into a video, and a view that follows it, should move along.
+    pub fn smooth_at(&self, t: f64, window: f64) -> Option<(f64, f64)> {
+        self.moves.first()?;
+        const TAPS: i32 = 6;
+        let (mut x, mut y, mut total) = (0.0, 0.0, 0.0);
+        for k in -TAPS..=TAPS {
+            let w = f64::from(TAPS + 1 - k.abs());
+            let p = self.at(t + window * f64::from(k) / f64::from(TAPS))?;
+            x += f64::from(p.x) * w;
+            y += f64::from(p.y) * w;
+            total += w;
+        }
+        Some((x / total, y / total))
+    }
+
+    /// How long the pointer had been still at `t`, in seconds. Readings are
+    /// only written when it moves, so this is the time since the last one.
+    pub fn resting_for(&self, t: f64) -> f64 {
+        let i = self.moves.partition_point(|m| m.t <= t);
+        match i.checked_sub(1) {
+            Some(last) => (t - self.moves[last].t).max(0.0),
+            None => 0.0,
+        }
+    }
+
     /// Clicks within `window` seconds after `t`, which is how a mark is
     /// drawn: it appears when the click happens and fades over the window.
     pub fn clicks_at(&self, t: f64, window: f64) -> impl Iterator<Item = (&Where, f64)> {

@@ -16,13 +16,15 @@
 //! Every export reports how far along it is and can be told to stop, since
 //! a long recording takes long enough that somebody will want to.
 //!
-//! One limit runs through all of them: effects that change *pixels* rather
-//! than *time* — a zoom, a blur, a caption — are not drawn yet, here or
-//! anywhere else, so an export shows the recording cut to shape but not
-//! dressed. The MP4 is also silent for now; the package is the one that
-//! keeps the sound.
+//! The MP4 and the GIF are drawn frame by frame through
+//! [`frames`]: every screen in step, the one on show dressed with the
+//! effects live on it (see `screenilux_core::dress`), in the shape asked
+//! for. The package copies files and changes nothing.
 
 #![forbid(unsafe_code)]
+
+mod audio;
+mod frames;
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -32,7 +34,9 @@ use screenilux_core::edit::EditList;
 use screenilux_core::package;
 use screenilux_core::ports::VideoSink;
 use screenilux_platform::NativeSink;
-use screenilux_platform::decoder::VideoDecoder;
+
+use frames::Frames;
+pub use frames::{PointerStyle, Recording, Screen, Shape, Shortcut};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
@@ -75,7 +79,7 @@ impl Format {
     /// What it is for, in one line, for the menu row under the name.
     pub fn hint(self) -> &'static str {
         match self {
-            Self::Mp4 => "Full quality, to upload or attach. No sound yet.",
+            Self::Mp4 => "Full quality with sound, to upload or attach.",
             Self::Gif => "Small and silent: for a README, a PR or a chat.",
             Self::Package => "Every screen and your effects, to open again later.",
         }
@@ -108,6 +112,7 @@ pub struct Gif {
     /// The widest the picture may be. A demo in a README is read at about
     /// this, and anything wider is paid for on every view.
     pub width: u32,
+    pub shape: Shape,
 }
 
 impl Default for Gif {
@@ -115,6 +120,7 @@ impl Default for Gif {
         Self {
             fps: 10.0,
             width: 720,
+            shape: Shape::Wide,
         }
     }
 }
@@ -140,20 +146,14 @@ pub struct Written {
 /// walked, and may be called many times a second. Returning `false` from it
 /// stops the export and leaves nothing behind.
 pub fn gif(
-    video: &Path,
+    recording: &Recording,
     out: &Path,
     edits: &EditList,
     how: Gif,
     mut progress: impl FnMut(f32) -> bool,
 ) -> Result<Written, ExportError> {
-    let mut decoder = VideoDecoder::open(video).map_err(|e| ExportError::Read(e.to_string()))?;
-    let source_len = decoder.duration().max(0.001);
-    let output_len = edits.output_duration(source_len);
-    if output_len <= 0.0 {
-        return Err(ExportError::Empty);
-    }
-
     let step = 1.0 / how.fps.max(1.0);
+    let mut frames = Frames::open(recording, edits, how.shape, how.fps)?;
     // GIF counts delays in hundredths of a second, so the frame rate that
     // actually plays is the one that survives rounding.
     let delay = ((step * 100.0).round() as u16).max(2);
@@ -162,34 +162,24 @@ pub fn gif(
     // frame says how big the picture is, so both wait together.
     let mut encoder: Option<gif::Encoder<BufWriter<File>>> = None;
     let mut size = (0u32, 0u32);
-    let mut frames = 0u32;
-    // The next point on the finished video's clock that wants a frame.
-    let mut want = 0.0_f64;
+    let mut written = 0u32;
     // The last picture written, to tell what moved since.
     let mut previous: Option<Vec<u8>> = None;
     // Time owed by frames that changed nothing, paid to the next one that
     // does, so a still stretch costs one frame rather than thirty.
     let mut held = 0u16;
+    let (fw, fh) = frames.size();
 
     loop {
-        // Only the frames that are actually used are converted to pixels;
-        // the rest cost a timestamp each.
-        let read = decoder
-            .next_frame_if(|t| edits.to_output(t).is_some_and(|out_t| out_t + 1e-9 >= want))
-            .map_err(|e| ExportError::Read(e.to_string()))?;
-        let Some((t, frame)) = read else { break };
-        if !progress((t / source_len).clamp(0.0, 1.0) as f32) {
+        if !progress(frames.progress()) {
             drop(encoder);
             let _ = std::fs::remove_file(out);
             return Err(ExportError::Stopped);
         }
-
-        let Some(frame) = frame else { continue };
-        let Some(out_t) = edits.to_output(t) else {
-            continue;
+        let Some((_, frame)) = frames.next()? else {
+            break;
         };
-
-        let (small, w, h) = shrink(&frame.rgba, frame.width, frame.height, how.width);
+        let (small, w, h) = shrink(frame, fw, fh, how.width);
         // Only what moved. A screen recording is mostly still, so writing
         // the whole picture every tenth of a second spends almost all of
         // the file on pixels that did not change. Everything outside the
@@ -232,22 +222,17 @@ pub fn gif(
         gf.dispose = gif::DisposalMethod::Keep;
         enc.write_frame(&gf)
             .map_err(|e| ExportError::Write(e.to_string()))?;
-        frames += 1;
-
-        want = (out_t + step).max(want + step);
-        if want > output_len {
-            break;
-        }
+        written += 1;
     }
 
     drop(encoder);
     let bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
     progress(1.0);
-    if frames == 0 {
+    if written == 0 {
         return Err(ExportError::Empty);
     }
     Ok(Written {
-        frames,
+        frames: written,
         bytes,
         width: size.0,
         height: size.1,
@@ -358,11 +343,15 @@ pub struct Mp4 {
     /// the right answer: anything lower throws motion away, and anything
     /// higher invents frames that were never captured.
     pub fps: u32,
+    pub shape: Shape,
 }
 
 impl Default for Mp4 {
     fn default() -> Self {
-        Self { fps: 30 }
+        Self {
+            fps: 30,
+            shape: Shape::Wide,
+        }
     }
 }
 
@@ -370,78 +359,57 @@ impl Default for Mp4 {
 ///
 /// This is the demo itself rather than a picture of it: the recording's own
 /// resolution, its own frame rate, encoded by whatever the operating system
-/// encodes with. It is silent — carrying the sound through a list of cuts,
-/// speed-ups and mutes is a job of its own, and a package is the export
-/// that keeps it meanwhile.
+/// encodes with. The sound goes through the same edits as the picture (see
+/// [`audio`]): cut where it is cut, silent where it is muted, and quicker
+/// where it is sped up, at the voice's own pitch.
 ///
 /// The video comes out at a constant frame rate, so a source frame that
 /// covers several output frames is written once for each of them. That is
 /// what makes a held frame hold and a speed-up actually run faster, rather
 /// than the file merely claiming to.
 pub fn mp4(
-    video: &Path,
+    recording: &Recording,
     out: &Path,
     edits: &EditList,
     how: Mp4,
     mut progress: impl FnMut(f32) -> bool,
 ) -> Result<Written, ExportError> {
-    let mut decoder = VideoDecoder::open(video).map_err(|e| ExportError::Read(e.to_string()))?;
-    let source_len = decoder.duration().max(0.001);
-    let output_len = edits.output_duration(source_len);
-    if output_len <= 0.0 {
-        return Err(ExportError::Empty);
-    }
-
-    // Encoders want even sides, and a recording of an odd-sized window is
-    // rare but not impossible, so give up the last row or column rather
-    // than the whole export.
-    let (width, height) = (decoder.width() & !1, decoder.height() & !1);
-    if width == 0 || height == 0 {
-        return Err(ExportError::Empty);
-    }
-
     let fps = how.fps.max(1);
-    let step = 1.0 / fps as f64;
-    let mut sink = NativeSink::new(width, height, fps, false, scratch_mp4())
+    let mut frames = Frames::open(recording, edits, how.shape, f64::from(fps))?;
+    let (width, height) = frames.size();
+    let mut sound = match &recording.sound {
+        Some(path) => audio::Soundtrack::open(path, edits)?,
+        None => None,
+    };
+    let mut sink = NativeSink::new(width, height, fps, sound.is_some(), scratch_mp4())
         .map_err(|e| ExportError::Write(e.to_string()))?;
     sink.open_segment()
         .map_err(|e| ExportError::Write(e.to_string()))?;
 
-    let mut frames = 0u32;
-    // The next point on the finished video's clock that wants a frame.
-    let mut want = 0.0_f64;
+    let mut written = 0u32;
     let mut bgra = vec![0u8; width as usize * height as usize * 4];
-
     loop {
-        // Only the frames that are actually used are converted to pixels;
-        // the rest cost a timestamp each.
-        let read = decoder
-            .next_frame_if(|t| edits.to_output(t).is_some_and(|out_t| out_t + 1e-9 >= want))
-            .map_err(|e| ExportError::Read(e.to_string()))?;
-        let Some((t, frame)) = read else { break };
-        if !progress((t / source_len).clamp(0.0, 1.0) as f32) {
+        if !progress(frames.progress()) {
             return Err(ExportError::Stopped);
         }
-
-        let Some(frame) = frame else { continue };
-        let Some(out_t) = edits.to_output(t) else {
-            continue;
-        };
-        into_bgra(&frame.rgba, frame.width, width, height, &mut bgra);
-
-        // Every output frame this one is still the latest for.
-        while want <= out_t + 1e-9 && want < output_len {
-            sink.write(&bgra)
-                .map_err(|e| ExportError::Write(e.to_string()))?;
-            frames += 1;
-            want += step;
-        }
-        if want >= output_len {
+        let Some((_, frame)) = frames.next()? else {
             break;
+        };
+        into_bgra(frame, width, width, height, &mut bgra);
+        sink.write(&bgra)
+            .map_err(|e| ExportError::Write(e.to_string()))?;
+        written += 1;
+        // The sound up to the end of this frame, so the two stay together.
+        if let Some(sound) = sound.as_mut() {
+            let pcm = sound.take_until(f64::from(written) / f64::from(fps))?;
+            if !pcm.is_empty() {
+                sink.write_audio(&pcm)
+                    .map_err(|e| ExportError::Write(e.to_string()))?;
+            }
         }
     }
 
-    if frames == 0 {
+    if written == 0 {
         return Err(ExportError::Empty);
     }
     sink.close_segment(0)
@@ -451,7 +419,7 @@ pub fn mp4(
     progress(1.0);
 
     Ok(Written {
-        frames,
+        frames: written,
         bytes: std::fs::metadata(out).map(|m| m.len()).unwrap_or(0),
         width,
         height,
@@ -694,10 +662,19 @@ mod tests {
         sink.close_segment(0).expect("the segment closes");
         sink.finish(&source).expect("the clip is written");
 
+        let recording = Recording::single(source.clone(), w, h);
         let out = dir.join("export.mp4");
-        let done = mp4(&source, &out, &EditList::default(), Mp4 { fps }, |_| true)
-            .expect("the export runs");
-
+        let done = mp4(
+            &recording,
+            &out,
+            &EditList::default(),
+            Mp4 {
+                fps,
+                ..Mp4::default()
+            },
+            |_| true,
+        )
+        .expect("the export runs");
         assert_eq!((done.width, done.height), (w, h));
         assert!(
             (50..=62).contains(&done.frames),
@@ -705,6 +682,139 @@ mod tests {
             done.frames
         );
         assert!(out.is_file() && done.bytes > 1_000);
+
+        // Effects are drawn into the file: a Hide over the whole picture
+        // comes back as the dark it is filled with, not the grey under it.
+        let mut edits = EditList::default();
+        edits.add(
+            0.0,
+            2.0,
+            screenilux_core::edit::Tool::Hide {
+                area: screenilux_core::edit::Area::new(0.0, 0.0, 1.0, 1.0),
+            },
+        );
+        let hidden = dir.join("hidden.mp4");
+        mp4(&recording, &hidden, &edits, Mp4::default(), |_| true).expect("the export runs");
+        let mut back = screenilux_platform::decoder::VideoDecoder::open(&hidden).expect("it reads");
+        let mut middle = None;
+        while let Ok(Some((t, frame))) = back.next_frame_if(|t| t > 0.9) {
+            if t > 0.9 {
+                middle = frame;
+                break;
+            }
+        }
+        let frame = middle.expect("a frame from the middle");
+        let i = ((frame.height / 2 * frame.width + frame.width / 2) * 4) as usize;
+        assert!(
+            frame.rgba[i] < 40 && frame.rgba[i + 1] < 70,
+            "the middle should be hidden: {:?}",
+            &frame.rgba[i..i + 3]
+        );
+
+        // A vertical export is phone-shaped whatever the recording was.
+        let tall = dir.join("tall.mp4");
+        let done = mp4(
+            &recording,
+            &tall,
+            &EditList::default(),
+            Mp4 {
+                fps,
+                shape: Shape::Vertical,
+            },
+            |_| true,
+        )
+        .expect("the export runs");
+        assert_eq!((done.width, done.height), (1080, 1920));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sound goes through the edits with the picture: muted where it is
+    /// muted, gone where it is cut, and quicker but not higher where it is
+    /// sped up.
+    #[test]
+    fn an_mp4_export_carries_the_sound_through_the_edits() {
+        use screenilux_core::edit::Tool;
+        let dir =
+            std::env::temp_dir().join(format!("screenilux-sound-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a working directory");
+        let (w, h, fps) = (320u32, 240u32, 30u32);
+        let rate = audio::RATE as usize;
+
+        // Four seconds of a 440 Hz tone under a grey picture.
+        let source = dir.join("source.mp4");
+        let mut sink =
+            NativeSink::new(w, h, fps, true, dir.join("source-scratch.mp4")).expect("a sink");
+        if sink.open_segment().is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let per_frame = rate / fps as usize;
+        for n in 0..(4 * fps) as usize {
+            sink.write(&flat(w, h, 90)).expect("a frame goes in");
+            let pcm: Vec<u8> = (0..per_frame)
+                .flat_map(|i| {
+                    let t = (n * per_frame + i) as f64 / rate as f64;
+                    let v = ((t * 440.0 * std::f64::consts::TAU).sin() * 8000.0) as i16;
+                    let b = v.to_le_bytes();
+                    [b[0], b[1], b[0], b[1]]
+                })
+                .collect();
+            sink.write_audio(&pcm).expect("sound goes in");
+        }
+        sink.close_segment(0).expect("the segment closes");
+        sink.finish(&source).expect("the clip is written");
+
+        // Muted for the first half second, the second second cut, and the
+        // last two played twice as fast: two seconds in all.
+        let mut edits = EditList::default();
+        edits.add(0.0, 0.5, Tool::Mute);
+        edits.add(1.0, 2.0, Tool::Cut);
+        edits.add(2.0, 4.0, Tool::Speed { rate: 2.0 });
+        let out = dir.join("export.mp4");
+        mp4(
+            &Recording::single(source, w, h),
+            &out,
+            &edits,
+            Mp4 {
+                fps,
+                ..Mp4::default()
+            },
+            |_| true,
+        )
+        .expect("the export runs");
+
+        let mut back =
+            screenilux_platform::decoder::AudioDecoder::open(&out).expect("the export has sound");
+        let mut left = Vec::new();
+        while let Ok(Some((_, bytes))) = back.next_chunk() {
+            left.extend(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|f| i16::from_le_bytes([f[0], f[1]])),
+            );
+        }
+        let secs = left.len() as f64 / rate as f64;
+        assert!(
+            (secs - 2.0).abs() < 0.15,
+            "two seconds of sound, got {secs:.2}"
+        );
+
+        let loudness = |from: f64, to: f64| {
+            let part = &left[(from * rate as f64) as usize..(to * rate as f64) as usize];
+            (part.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / part.len() as f64).sqrt()
+        };
+        assert!(loudness(0.05, 0.4) < 300.0, "muted at the start");
+        assert!(loudness(0.6, 0.95) > 3000.0, "heard after the mute");
+
+        let sped = &left[(1.1 * rate as f64) as usize..(1.9 * rate as f64) as usize];
+        let rises = sped.windows(2).filter(|p| p[0] < 0 && p[1] >= 0).count();
+        let pitch = rises as f64 / 0.8;
+        assert!(
+            (pitch - 440.0).abs() < 25.0,
+            "sped up at its own pitch, got {pitch:.0} Hz"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -723,13 +833,12 @@ mod against_a_real_recording {
         };
         let out = std::env::var("SCREENILUX_GIF_OUT").expect("SCREENILUX_GIF_OUT");
         let edits = EditList::default();
-        let done = gif(
-            Path::new(&input),
-            Path::new(&out),
-            &edits,
-            Gif::default(),
-            |_| true,
-        )
+        let path = std::path::PathBuf::from(&input);
+        let info = screenilux_platform::probe(&path).expect("a video");
+        let recording = Recording::single(path, info.width, info.height);
+        let done = gif(&recording, Path::new(&out), &edits, Gif::default(), |_| {
+            true
+        })
         .expect("the GIF is written");
         println!("{done:?}");
         assert!(done.frames > 1);

@@ -154,6 +154,47 @@ pub enum Tool {
     Screen { file: String },
 }
 
+impl Tool {
+    /// A blur over `area` at the strength one placed by hand starts at.
+    pub fn blur(area: Area) -> Self {
+        Tool::Blur {
+            area,
+            strength: default_blur(),
+        }
+    }
+}
+
+/// How the pointer is drawn on playback and in an export.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PointerStyle {
+    /// Leave it out altogether.
+    pub hidden: bool,
+    /// 1 is an ordinary pointer.
+    pub size: f32,
+    /// Move along the eased path rather than every reading.
+    pub smooth: bool,
+    /// Fade it out while it rests.
+    pub hide_idle: bool,
+}
+
+impl Default for PointerStyle {
+    fn default() -> Self {
+        Self {
+            hidden: false,
+            size: 1.5,
+            smooth: true,
+            hide_idle: true,
+        }
+    }
+}
+
+impl PointerStyle {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// `4.0` reads as "4", `2.5` stays "2.5".
 /// A rate without a pointless trailing zero: 4 rather than 4.0.
 pub fn trim_zero(v: f32) -> String {
@@ -298,6 +339,13 @@ impl std::fmt::Display for Problem {
 pub struct EditList {
     #[serde(default)]
     pub effects: Vec<Effect>,
+    /// How the pointer is drawn, for a recording that left it out of the
+    /// picture.
+    #[serde(default, skip_serializing_if = "PointerStyle::is_default")]
+    pub pointer: PointerStyle,
+    /// Leave the shortcuts pressed while recording off the picture.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide_shortcuts: bool,
     /// Highest id handed out, so ids stay unique across sessions.
     #[serde(default)]
     next_id: u32,
