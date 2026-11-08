@@ -294,6 +294,9 @@ mod tests {
     fn a_tiny_stretch_still_comes_out_the_right_length() {
         let input = tone(440.0, 0.01);
         let out = stretch(&input, 3.0);
-        assert_eq!(out.len() / 2, ((input.len() / 2) as f64 / 3.0).round() as usize);
+        assert_eq!(
+            out.len() / 2,
+            ((input.len() / 2) as f64 / 3.0).round() as usize
+        );
     }
 }

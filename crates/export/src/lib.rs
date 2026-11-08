@@ -734,7 +734,8 @@ mod tests {
     #[test]
     fn an_mp4_export_carries_the_sound_through_the_edits() {
         use screenilux_core::edit::Tool;
-        let dir = std::env::temp_dir().join(format!("screenilux-sound-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("screenilux-sound-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("a working directory");
         let (w, h, fps) = (320u32, 240u32, 30u32);
         let rate = audio::RATE as usize;
@@ -795,7 +796,10 @@ mod tests {
             );
         }
         let secs = left.len() as f64 / rate as f64;
-        assert!((secs - 2.0).abs() < 0.15, "two seconds of sound, got {secs:.2}");
+        assert!(
+            (secs - 2.0).abs() < 0.15,
+            "two seconds of sound, got {secs:.2}"
+        );
 
         let loudness = |from: f64, to: f64| {
             let part = &left[(from * rate as f64) as usize..(to * rate as f64) as usize];
@@ -807,7 +811,10 @@ mod tests {
         let sped = &left[(1.1 * rate as f64) as usize..(1.9 * rate as f64) as usize];
         let rises = sped.windows(2).filter(|p| p[0] < 0 && p[1] >= 0).count();
         let pitch = rises as f64 / 0.8;
-        assert!((pitch - 440.0).abs() < 25.0, "sped up at its own pitch, got {pitch:.0} Hz");
+        assert!(
+            (pitch - 440.0).abs() < 25.0,
+            "sped up at its own pitch, got {pitch:.0} Hz"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
