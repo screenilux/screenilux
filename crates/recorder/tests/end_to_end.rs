@@ -415,3 +415,93 @@ fn system_sound_lands_in_the_recording_at_the_right_time() {
         "sound {audio:.2}s and picture {video:.2}s should match"
     );
 }
+
+#[test]
+#[ignore = "records the real screen for several seconds"]
+fn the_camera_is_recorded_beside_the_screen_not_into_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    set_dpi_awareness();
+    let dir = TempDir::new("screenilux-e2e-camera").expect("scratch");
+    let Ok(all) = display::monitors() else { return };
+    let primary: Vec<_> = all.into_iter().filter(|m| m.is_primary).collect();
+    let desk = primary[0].bounds;
+
+    // A stand-in camera: grey frames at 30 a second, its bubble moved once.
+    let start = screenilux_core::Rect::new(desk.left + 100, desk.top + 100, 320, 180);
+    let feed = Arc::new(screenilux_core::camera::CameraFeed::new(start));
+    let running = Arc::new(AtomicBool::new(true));
+    let pump = {
+        let (feed, running) = (Arc::clone(&feed), Arc::clone(&running));
+        std::thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                feed.publish(vec![128; 640 * 360 * 4], 640, 360);
+                std::thread::sleep(Duration::from_millis(33));
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(100));
+
+    let mut effects = effects();
+    effects.camera = true;
+    let config = SessionConfig {
+        monitors: primary,
+        fps: 30,
+        microphone: false,
+        system_sound: false,
+        click_sound: false,
+        effects,
+        camera: Some(Arc::clone(&feed) as Arc<dyn screenilux_core::ports::CameraSource>),
+        pointer_events: None,
+    };
+    let session = Session::start(config).expect("session should start");
+    std::thread::sleep(Duration::from_millis(1500));
+    feed.move_to(desk.left + 400, desk.top + 300);
+    std::thread::sleep(Duration::from_millis(1000));
+    session.pause();
+    std::thread::sleep(Duration::from_millis(800)); // excluded
+    session.resume();
+    std::thread::sleep(Duration::from_millis(1000));
+    let recorded = session.duration().as_secs_f64();
+    let package = session.finish(dir.path()).expect("should save");
+    running.store(false, Ordering::Relaxed);
+    let _ = pump.join();
+
+    assert!(
+        screenilux_core::package::is_package(&package),
+        "a recording with the camera is a package, got {}",
+        package.display()
+    );
+    let folder = dir.path().join("unpacked");
+    let manifest = screenilux_core::package::unpack(&package, &folder).expect("should unpack");
+    let cam = manifest.camera_video.expect("the camera is listed");
+    assert_eq!((cam.width, cam.height), (320, 180));
+    assert_eq!(
+        cam.moves.first().map(|m| (m.left, m.top)),
+        Some((start.left, start.top))
+    );
+    assert!(
+        cam.moves
+            .iter()
+            .any(|m| (m.left, m.top) == (desk.left + 400, desk.top + 300) && m.t > 1.0),
+        "the move is noted when it happened: {:?}",
+        cam.moves
+    );
+
+    let video = screenilux_platform::probe(&folder.join(&cam.file)).expect("the camera plays");
+    assert_eq!((video.width, video.height), (640, 360));
+    assert!(
+        (video.duration - recorded).abs() < 0.5,
+        "the camera is {:.2}s but {recorded:.2}s was recorded",
+        video.duration
+    );
+    let screen = screenilux_platform::probe(&folder.join(&manifest.screens[0].file))
+        .expect("the screen plays");
+    assert!(
+        (screen.duration - video.duration).abs() < 0.5,
+        "screen {:.2}s and camera {:.2}s should match",
+        screen.duration,
+        video.duration
+    );
+}

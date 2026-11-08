@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use screenilux_core::dress::{Cursor, Dresser, Scene};
+use screenilux_core::dress::{Bubble, Cursor, Dresser, Scene};
 use screenilux_core::edit::{EditList, Effect, Tool};
 use screenilux_core::geometry::Rect;
 use screenilux_core::look;
@@ -37,6 +37,7 @@ pub struct Screen {
 
 pub use screenilux_core::edit::PointerStyle;
 pub use screenilux_core::keys::Shortcut;
+pub use screenilux_core::playback::Camera;
 
 /// What a recording is made of, for drawing it out.
 #[derive(Debug, Clone, Default)]
@@ -54,6 +55,9 @@ pub struct Recording {
     /// The file the recording's sound is in, if any: only one screen of a
     /// recording carries it.
     pub sound: Option<PathBuf>,
+    /// The camera's own video, laid over the screens, when it was recorded
+    /// apart from them and has not been left out.
+    pub camera: Option<Camera>,
 }
 
 impl Recording {
@@ -165,6 +169,8 @@ pub(crate) struct Frames<'a> {
     recording: &'a Recording,
     edits: &'a EditList,
     feeds: Vec<Feed>,
+    /// The camera's video, read in step with the screens.
+    camera: Option<Feed>,
     dresser: Dresser,
     size: (u32, u32),
     step: f64,
@@ -194,6 +200,19 @@ impl<'a> Frames<'a> {
                 done: false,
             });
         }
+        // A camera video that cannot be read costs the bubble, not the
+        // export.
+        let camera = recording.camera.as_ref().and_then(|cam| {
+            VideoDecoder::open(&cam.path)
+                .map_err(|e| tracing::warn!(error = %e, "leaving the camera out of the export"))
+                .ok()
+                .map(|decoder| Feed {
+                    decoder,
+                    pending: None,
+                    latest: None,
+                    done: false,
+                })
+        });
         let source_len = feeds
             .iter()
             .map(|f| f.decoder.duration())
@@ -210,6 +229,7 @@ impl<'a> Frames<'a> {
             recording,
             edits,
             feeds,
+            camera,
             dresser: Dresser::new(screenilux_core::dress::system_font()),
             size,
             step,
@@ -251,6 +271,11 @@ impl<'a> Frames<'a> {
         let shown = self.screen_at(s);
         for (i, feed) in self.feeds.iter_mut().enumerate() {
             feed.advance(held, i == shown, self.tolerance)?;
+        }
+        // The camera carries on through a held frame, as what is laid over
+        // it does.
+        if let Some(cam) = &mut self.camera {
+            cam.advance(s, true, self.tolerance)?;
         }
 
         let all: Vec<Effect> = self.edits.active_at(s).cloned().collect();
@@ -298,6 +323,18 @@ impl<'a> Frames<'a> {
         let Some(frame) = frame else {
             return Err(ExportError::Read("no frame could be read".into()));
         };
+        let camera = self
+            .camera
+            .as_ref()
+            .and_then(Feed::frame)
+            .zip(self.recording.camera.as_ref())
+            .map(|(f, cam)| Bubble {
+                rgba: &f.rgba,
+                width: f.width,
+                height: f.height,
+                video: &cam.video,
+                desk,
+            });
         let scene = Scene {
             at: s,
             live: &live,
@@ -305,6 +342,7 @@ impl<'a> Frames<'a> {
             clicks: &clicks,
             cursor,
             keys,
+            camera,
         };
         let (w, h) = self.size;
         let out = self

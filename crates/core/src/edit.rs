@@ -346,6 +346,10 @@ pub struct EditList {
     /// Leave the shortcuts pressed while recording off the picture.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hide_shortcuts: bool,
+    /// Leave the camera bubble off the picture, for a recording that has
+    /// the camera as a video of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide_camera: bool,
     /// Highest id handed out, so ids stay unique across sessions.
     #[serde(default)]
     next_id: u32,

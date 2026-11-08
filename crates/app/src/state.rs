@@ -14,6 +14,9 @@ use screenilux_core::geometry::Monitor;
 /// widescreen guess, which is what nearly every webcam is.
 pub const CAMERA_SIZE: (u32, u32) = (320, 180);
 pub const CAMERA_MARGIN: i32 = 28;
+/// How much higher than the bottom margin the bubble opens, clear of the
+/// taskbar and of whatever sits along a window's bottom edge.
+pub const CAMERA_LIFT: i32 = 100;
 pub const FPS_CHOICES: [u32; 5] = [10, 15, 24, 30, 60];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,7 +208,8 @@ impl Settings {
         CAMERA_SIZE
     }
 
-    /// Bottom-right of the primary screen, inset by a margin.
+    /// Bottom-right of the primary screen, inset by a margin and lifted a
+    /// little further off the bottom.
     pub fn default_bubble(&self) -> screenilux_core::Rect {
         let (w, h) = self.camera_dimensions();
         let target = self
@@ -216,7 +220,7 @@ impl Settings {
         match target {
             Some(m) => screenilux_core::Rect::new(
                 m.bounds.left + m.bounds.width as i32 - w as i32 - CAMERA_MARGIN,
-                m.bounds.top + m.bounds.height as i32 - h as i32 - CAMERA_MARGIN,
+                m.bounds.top + m.bounds.height as i32 - h as i32 - CAMERA_MARGIN - CAMERA_LIFT,
                 w,
                 h,
             ),

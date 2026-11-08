@@ -82,7 +82,7 @@ impl Contents {
             .map_err(|e| read(&e))?;
 
         let mut names = vec![MANIFEST_NAME.to_string()];
-        names.extend(manifest.screens.iter().map(|s| s.file.clone()));
+        names.extend(manifest.videos().map(str::to_string));
         if zip.index_for_name(TEXT_INDEX_NAME).is_some() {
             names.push(TEXT_INDEX_NAME.to_string());
         }

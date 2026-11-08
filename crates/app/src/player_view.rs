@@ -48,6 +48,8 @@ struct Loaded {
     player: Player,
     /// Per track: the feed serial uploaded, and the texture.
     textures: Vec<Option<(u64, egui::TextureHandle)>>,
+    /// The same for the camera's own video, when there is one.
+    camera: Option<(u64, egui::TextureHandle)>,
 }
 
 /// A click on the paused picture while the editor is showing: which screen
@@ -106,6 +108,9 @@ pub struct PlayerView {
     /// picture, and the shortcuts to show.
     drawn_pointer: Option<screenilux_core::edit::PointerStyle>,
     shortcuts: Vec<screenilux_core::keys::Shortcut>,
+    /// Whether to lay the camera's own video over the picture, as the
+    /// editor last said. Shown unless it has been switched off.
+    camera_shown: bool,
     /// Whether an export is being written, as the editor last reported it.
     /// The menu stands down while one is, so a second cannot be started on
     /// top of the first.
@@ -135,6 +140,7 @@ impl PlayerView {
             desks: Vec::new(),
             drawn_pointer: None,
             shortcuts: Vec::new(),
+            camera_shown: true,
             exporting: false,
         }
     }
@@ -176,6 +182,11 @@ impl PlayerView {
     ) {
         self.drawn_pointer = pointer;
         self.shortcuts = shortcuts;
+    }
+
+    /// Lay the camera's own video over the picture, or leave it off.
+    pub fn set_camera_shown(&mut self, shown: bool) {
+        self.camera_shown = shown;
     }
 
     /// Tell the title row whether an export is running, so the menu can
@@ -344,7 +355,9 @@ impl PlayerView {
                     opened,
                     player,
                     textures: (0..n).map(|_| None).collect(),
+                    camera: None,
                 });
+                self.camera_shown = true;
             }
             Err(e) => self.status = Some(format!("Could not open it: {e}")),
         }
@@ -792,6 +805,10 @@ impl PlayerView {
             }
         }
 
+        if let Some(feed) = loaded.player.camera_feed() {
+            upload(ctx, "camera", feed, &mut loaded.camera);
+        }
+
         let multi = placements.len() > 1;
         for p in &placements {
             let r = to_rect(p.area);
@@ -824,6 +841,16 @@ impl PlayerView {
                         at,
                         marks,
                     );
+                    // Over the picture and under the pointer, unmoved by a zoom.
+                    if self.camera_shown
+                        && let (Some(cam), Some((_, face))) =
+                            (&loaded.opened.recording.camera, &loaded.camera)
+                    {
+                        let t = &loaded.opened.recording.tracks[p.track];
+                        let desk = bounds
+                            .unwrap_or_else(|| screenilux_core::Rect::new(0, 0, t.width, t.height));
+                        bubble(&painter, face, &cam.video, at, desk, r);
+                    }
                     if let (Some(style), Some(track), Some(b)) =
                         (self.drawn_pointer.as_ref(), self.path.as_ref(), bounds)
                     {
@@ -1130,6 +1157,81 @@ impl PlayerView {
 }
 
 /// "2 screens, 17 seconds".
+/// Put a feed's newest frame into `slot`'s texture, if it has moved on.
+fn upload(
+    ctx: &egui::Context,
+    name: &str,
+    feed: &screenilux_player::Feed,
+    slot: &mut Option<(u64, egui::TextureHandle)>,
+) {
+    let serial = feed.serial();
+    if slot.as_ref().is_some_and(|(s, _)| *s == serial) {
+        return;
+    }
+    let Some(frame) = feed.frame() else { return };
+    // Frames are opaque, so premultiplied and straight alpha agree and the
+    // cheaper conversion is exact.
+    let image = egui::ColorImage::from_rgba_premultiplied(
+        [frame.width as usize, frame.height as usize],
+        &frame.rgba,
+    );
+    match slot {
+        Some((s, handle)) => {
+            handle.set(image, egui::TextureOptions::LINEAR);
+            *s = serial;
+        }
+        None => {
+            let handle = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
+            *slot = Some((serial, handle));
+        }
+    }
+}
+
+/// The camera in its pill over the picture `pic` of the screen that sat at
+/// `desk`, where it was at `at`, its middle cropped to the pill's shape.
+fn bubble(
+    painter: &egui::Painter,
+    face: &egui::TextureHandle,
+    video: &screenilux_core::session::CameraVideo,
+    at: f64,
+    desk: screenilux_core::Rect,
+    pic: egui::Rect,
+) {
+    let Some((x, y, w, h)) =
+        video.placed(at, desk, (pic.min.x, pic.min.y, pic.width(), pic.height()))
+    else {
+        return;
+    };
+    let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+    let [tw, th] = face.size().map(|v| v as f32);
+    let (want, have) = (w / h.max(1.0), tw / th.max(1.0));
+    let uv = if have > want {
+        let k = want / have;
+        egui::Rect::from_min_max(
+            egui::pos2((1.0 - k) / 2.0, 0.0),
+            egui::pos2((1.0 + k) / 2.0, 1.0),
+        )
+    } else {
+        let k = have / want;
+        egui::Rect::from_min_max(
+            egui::pos2(0.0, (1.0 - k) / 2.0),
+            egui::pos2(1.0, (1.0 + k) / 2.0),
+        )
+    };
+    let round = egui::CornerRadius::same((w.min(h) / 2.0).min(255.0) as u8);
+    painter.add(
+        egui::epaint::RectShape::filled(rect, round, egui::Color32::WHITE)
+            .with_texture(face.id(), uv),
+    );
+    // The same faint rim the export draws.
+    painter.rect_stroke(
+        rect,
+        round,
+        egui::Stroke::new(1.5, egui::Color32::from_black_alpha(60)),
+        egui::StrokeKind::Inside,
+    );
+}
+
 fn describe(screens: usize, duration: f64) -> String {
     let screens = match screens {
         1 => "1 screen".to_string(),

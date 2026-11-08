@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use screenilux_core::ports::{SinkError, VideoSink};
+use screenilux_core::yuv::{Matrix, bgra_to_nv12, nv12_len};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::core::{GUID, HSTRING};
 
@@ -99,24 +100,43 @@ fn media_type(major: &GUID, sub: &GUID) -> windows::core::Result<IMFMediaType> {
     }
 }
 
-/// One frame or one run of PCM, ready to hand to the writer.
-fn sample(bytes: &[u8], time: i64, duration: i64) -> windows::core::Result<IMFSample> {
-    // SAFETY: the buffer is created at `bytes.len()`, locked for exactly that
-    // many bytes, and unlocked before anything else touches it.
+/// A media buffer of `len` bytes, filled by `fill`.
+fn filled(len: usize, fill: impl FnOnce(&mut [u8])) -> windows::core::Result<IMFMediaBuffer> {
+    // SAFETY: the buffer is created at `len`, locked for exactly that many
+    // bytes, and unlocked before anything else touches it.
     unsafe {
-        let buffer = MFCreateMemoryBuffer(bytes.len() as u32)?;
+        let buffer = MFCreateMemoryBuffer(len as u32)?;
         let mut dst = std::ptr::null_mut();
         buffer.Lock(&mut dst, None, None)?;
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        fill(std::slice::from_raw_parts_mut(dst, len));
         buffer.Unlock()?;
-        buffer.SetCurrentLength(bytes.len() as u32)?;
+        buffer.SetCurrentLength(len as u32)?;
+        Ok(buffer)
+    }
+}
 
+/// A sample carrying `buffer` at `time`.
+///
+/// A buffer is never written again once filled, so one can ride in several
+/// samples: that is how a repeated frame costs no copy.
+fn wrap(buffer: &IMFMediaBuffer, time: i64, duration: i64) -> windows::core::Result<IMFSample> {
+    // SAFETY: a fresh sample given a live buffer and its timing.
+    unsafe {
         let sample = MFCreateSample()?;
-        sample.AddBuffer(&buffer)?;
+        sample.AddBuffer(buffer)?;
         sample.SetSampleTime(time)?;
         sample.SetSampleDuration(duration)?;
         Ok(sample)
     }
+}
+
+/// One run of PCM, ready to hand to the writer.
+fn sample(bytes: &[u8], time: i64, duration: i64) -> windows::core::Result<IMFSample> {
+    wrap(
+        &filled(bytes.len(), |dst| dst.copy_from_slice(bytes))?,
+        time,
+        duration,
+    )
 }
 
 /// A started writer and the streams it was given.
@@ -138,10 +158,12 @@ pub struct NativeSink {
     /// Monotonic across pauses: paused time contributes no frames and so
     /// simply does not exist in the output.
     frames: u64,
-    /// The last frame written, so a segment can be topped up without the
-    /// caller having to hand it over again.
-    last: Vec<u8>,
-    has_frame: bool,
+    /// The last frame written, already converted, so a segment can be topped
+    /// up without the caller handing it over again or anything copying it.
+    last: Option<IMFMediaBuffer>,
+    /// How the picture's colours are put into YUV, and declared to the
+    /// encoder so the file says so too.
+    matrix: Matrix,
     audio: bool,
     /// Sample frames of sound handed over, which is the audio clock: the
     /// stream's timestamps are counted rather than taken from the source, so
@@ -171,8 +193,8 @@ impl NativeSink {
             height,
             fps,
             frames: 0,
-            last: vec![0u8; width as usize * height as usize * 4],
-            has_frame: false,
+            last: None,
+            matrix: Matrix::for_height(height),
             audio,
             audio_frames: 0,
         })
@@ -195,23 +217,44 @@ impl NativeSink {
         Ok(ty)
     }
 
-    /// What goes in: the tightly packed BGRA the capture and the compositor
-    /// both work in, top row first.
+    /// The luma row length of what goes in: the width, rounded up to whole
+    /// chroma pairs.
+    fn stride(&self) -> usize {
+        (self.width as usize).next_multiple_of(2)
+    }
+
+    /// The size of one frame as the writer holds it.
+    fn frame_bytes(&self) -> usize {
+        nv12_len(self.stride(), self.height as usize)
+    }
+
+    /// What goes in: NV12, converted here from the BGRA the capture and the
+    /// compositor work in, which is what the hardware encoders take as it is.
     ///
-    /// A positive `MF_MT_DEFAULT_STRIDE` is what says "top row first". The
-    /// old transcoder path wanted the rows the other way up and had to
-    /// reverse every frame to suit it; declaring the layout costs nothing and
-    /// saves a full-frame copy per frame.
+    /// Given BGRA instead, the writer puts Media Foundation's own colour
+    /// converter in front of the encoder. That converter is slow enough that
+    /// playback already avoids it (`screenilux_core::yuv`), and here it was
+    /// most of a recording's processor time, taken from whatever the
+    /// recording was of.
+    ///
+    /// The matrix and range are declared rather than left to the encoder's
+    /// default, so the file says what the conversion did.
     fn video_in(&self) -> windows::core::Result<IMFMediaType> {
-        let ty = media_type(&MFMediaType_Video, &MFVideoFormat_RGB32)?;
-        // SAFETY: documented attributes of an uncompressed RGB input type.
+        let ty = media_type(&MFMediaType_Video, &MFVideoFormat_NV12)?;
+        let matrix = match self.matrix {
+            Matrix::Bt601 => MFVideoTransferMatrix_BT601,
+            Matrix::Bt709 => MFVideoTransferMatrix_BT709,
+        };
+        // SAFETY: documented attributes of an uncompressed YUV input type.
         unsafe {
             ty.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             ty.SetUINT64(&MF_MT_FRAME_SIZE, packed(self.width, self.height))?;
             ty.SetUINT64(&MF_MT_FRAME_RATE, packed(self.fps, 1))?;
             ty.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, packed(1, 1))?;
-            ty.SetUINT32(&MF_MT_DEFAULT_STRIDE, self.width * 4)?;
+            ty.SetUINT32(&MF_MT_DEFAULT_STRIDE, self.stride() as u32)?;
             ty.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
+            ty.SetUINT32(&MF_MT_YUV_MATRIX, matrix.0 as u32)?;
+            ty.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
         }
         Ok(ty)
     }
@@ -307,7 +350,7 @@ impl NativeSink {
     /// "there is room" signal, and a millisecond of granularity is a
     /// thirtieth of a frame.
     fn make_room(&self, writer: &Writer) {
-        let budget = QUEUE_FRAMES * self.width as u64 * self.height as u64 * 4;
+        let budget = QUEUE_FRAMES * self.frame_bytes() as u64;
         let deadline = Instant::now() + ROOM_TIMEOUT;
         // A writer that stops reporting is left to its own throttle.
         while let Some(queued) = queued_bytes(writer) {
@@ -324,7 +367,10 @@ impl NativeSink {
         let duration = HNS_PER_SECOND / self.fps as i64;
         let writer = self.ready()?;
         self.make_room(&writer);
-        let frame = sample(&self.last, time, duration).map_err(died)?;
+        let Some(last) = &self.last else {
+            return Ok(());
+        };
+        let frame = wrap(last, time, duration).map_err(died)?;
         // SAFETY: a sample built for this stream's input type. This is where
         // the encoder's backpressure is felt.
         unsafe { writer.sink.WriteSample(writer.video, &frame) }.map_err(died)?;
@@ -371,16 +417,19 @@ impl VideoSink for NativeSink {
                 frame.len()
             )));
         }
-        self.last.copy_from_slice(frame);
-        self.send_last()?;
-        self.has_frame = true;
-        Ok(())
+        let (w, h, matrix) = (self.width as usize, self.height as usize, self.matrix);
+        let converted = filled(self.frame_bytes(), |nv12| {
+            bgra_to_nv12(frame, w, h, matrix, nv12);
+        })
+        .map_err(died)?;
+        self.last = Some(converted);
+        self.send_last()
     }
 
     /// Top up the owed frames, but keep the encoder open: a pause is not a
     /// boundary in the output, only in the input.
     fn close_segment(&mut self, pad: u64) -> Result<(), SinkError> {
-        if !self.has_frame {
+        if self.last.is_none() {
             return Ok(());
         }
         for _ in 0..pad {
@@ -398,7 +447,7 @@ impl VideoSink for NativeSink {
         // Let go of the file before anything moves or removes it.
         drop(writer);
 
-        if !self.has_frame {
+        if self.last.take().is_none() {
             let _ = std::fs::remove_file(&self.scratch);
             return Err(SinkError::EncoderDied("nothing was recorded".into()));
         }
@@ -576,6 +625,54 @@ mod tests {
         let _ = std::fs::remove_file(&dest);
     }
 
+    /// The conversion to YUV happens here now, so its matrix and range have
+    /// to be the ones the player assumes on the way back: a mismatch moves
+    /// every colour and every grey, which red against blue would not notice.
+    #[test]
+    fn colours_keep_their_values() {
+        // SD and HD heights take different matrices.
+        for (w, h) in [(640u32, 480u32), (1280, 720)] {
+            let dest = temp("colours");
+            let _turn = one_encoder_at_a_time();
+            let mut sink = NativeSink::new(w, h, 30, false, temp("colours-scratch")).unwrap();
+            // Left half orange, right half mid grey, as BGRA.
+            let half = (w / 2) as usize;
+            let row: Vec<u8> = (0..w as usize)
+                .flat_map(|x| {
+                    if x < half {
+                        [40, 120, 200, 255]
+                    } else {
+                        [128, 128, 128, 255]
+                    }
+                })
+                .collect();
+            let picture = row.repeat(h as usize);
+            sink.open_segment().unwrap();
+            for _ in 0..30 {
+                sink.write(&picture).unwrap();
+            }
+            sink.close_segment(0).unwrap();
+            sink.finish(&dest).unwrap();
+
+            let mut dec = crate::decoder::VideoDecoder::open(&dest).unwrap();
+            let f = dec.frame_at(0.5, 30.0).unwrap().unwrap();
+            let px = |x: u32| {
+                let i = (((h / 2) * f.width + x) * 4) as usize;
+                [f.rgba[i], f.rgba[i + 1], f.rgba[i + 2]]
+            };
+            for (got, want) in [
+                (px(w / 4), [200, 120, 40]),
+                (px(w * 3 / 4), [128, 128, 128]),
+            ] {
+                assert!(
+                    got.iter().zip(want).all(|(&a, b)| a.abs_diff(b) <= 6),
+                    "{w}x{h}: {want:?} came back {got:?}"
+                );
+            }
+            let _ = std::fs::remove_file(&dest);
+        }
+    }
+
     /// The property this sink exists for: a caller that outruns the encoder
     /// is made to wait, rather than having its frames taken into a queue
     /// that grows until the machine runs out of memory.
@@ -583,9 +680,10 @@ mod tests {
     fn frames_handed_over_flat_out_do_not_pile_up() {
         let (w, h, fps) = (1920u32, 1080u32, 30u32);
         let dest = temp("backpressure");
-        let frame_bytes = w * h * 4;
         let _turn = one_encoder_at_a_time();
         let mut sink = NativeSink::new(w, h, fps, false, temp("backpressure-scratch")).unwrap();
+        // As the writer holds it, which is NV12 rather than what was handed in.
+        let frame_bytes = sink.frame_bytes() as u32;
         sink.open_segment().unwrap();
 
         // Ten seconds of 1080p30: 2.5GB if none of it is encoded on the way.

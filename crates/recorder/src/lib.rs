@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod camera;
 pub mod control;
 pub mod paths;
 pub mod screen;

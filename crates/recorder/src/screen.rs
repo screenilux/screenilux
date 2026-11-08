@@ -10,12 +10,10 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use screenilux_core::click::ClickMixer;
-use screenilux_core::compositor::{CameraView, Compositor};
+use screenilux_core::compositor::Compositor;
 use screenilux_core::geometry::Point;
 use screenilux_core::mix::Mixer;
-use screenilux_core::ports::{
-    CameraSource, CaptureError, PointerEvent, ScreenSource, SinkError, VideoSink,
-};
+use screenilux_core::ports::{CaptureError, PointerEvent, ScreenSource, SinkError, VideoSink};
 use screenilux_core::timing::{CATCH_UP, FramePacer, SyncClock};
 
 use crate::control::{Control, RunState};
@@ -72,7 +70,6 @@ pub struct ScreenJob {
     pub events: Option<Receiver<PointerEvent>>,
     /// Where the pointer is, sampled per frame for the overlays.
     pub pointer: Arc<dyn Fn() -> Point + Send + Sync>,
-    pub camera: Option<Arc<dyn CameraSource>>,
     /// The sound track, on the one screen that carries it.
     pub sound: Option<Sound>,
 }
@@ -290,16 +287,9 @@ fn capture_loop(job: &mut ScreenJob) -> Result<(), ScreenError> {
                 }
                 let dt = last_draw.elapsed().as_secs_f64();
                 last_draw = Instant::now();
-                // Hold the camera frame alive for the borrow the view takes.
-                let cam_frame = job.camera.as_ref().and_then(|c| c.latest());
-                let cam = match (&cam_frame, &job.camera) {
-                    (Some(f), Some(src)) => Some(CameraView {
-                        frame: f,
-                        rect: src.rect(),
-                    }),
-                    _ => None,
-                };
-                c.render(frame.pixels, (job.pointer)(), dt, cam)
+                // The camera is not drawn in: it is recorded to a video of
+                // its own and laid over the screens on playback.
+                c.render(frame.pixels, (job.pointer)(), dt, None)
             }
         };
 
@@ -450,7 +440,6 @@ mod tests {
                 compositor: None,
                 events: None,
                 pointer: Arc::new(|| Point::new(0, 0)),
-                camera: None,
                 sound: None,
             },
             elapsed,

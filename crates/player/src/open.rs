@@ -78,7 +78,12 @@ fn read_index(path: &Path) -> Option<TextIndex> {
     }
 }
 
-fn check_tracks(recording: &Recording) -> Result<(), OpenError> {
+fn check_tracks(recording: &mut Recording) -> Result<(), OpenError> {
+    // A camera video gone missing costs the bubble, not the recording.
+    if recording.camera.as_ref().is_some_and(|c| !c.path.is_file()) {
+        tracing::warn!("the recording's camera video is missing; playing without it");
+        recording.camera = None;
+    }
     match recording.tracks.iter().find(|t| !t.path.is_file()) {
         Some(t) => Err(OpenError::MissingTrack(t.id.clone())),
         None => Ok(()),
@@ -93,8 +98,8 @@ pub fn open(path: &Path) -> Result<Opened, OpenError> {
     if package::is_package(path) {
         let workspace = TempDir::new("screenilux-play")?;
         let manifest = package::unpack(path, workspace.path())?;
-        let recording = Recording::from_manifest(&manifest, workspace.path());
-        check_tracks(&recording)?;
+        let mut recording = Recording::from_manifest(&manifest, workspace.path());
+        check_tracks(&mut recording)?;
         return Ok(Opened {
             fps: manifest.fps as f64,
             text: read_index(&workspace.path().join(TEXT_INDEX_NAME)),
@@ -114,8 +119,8 @@ pub fn open(path: &Path) -> Result<Opened, OpenError> {
     };
     if let Some(dir) = folder {
         let manifest = read_manifest(&dir)?;
-        let recording = Recording::from_manifest(&manifest, &dir);
-        check_tracks(&recording)?;
+        let mut recording = Recording::from_manifest(&manifest, &dir);
+        check_tracks(&mut recording)?;
         return Ok(Opened {
             fps: manifest.fps as f64,
             text: read_index(&dir.join(TEXT_INDEX_NAME)),

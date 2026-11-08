@@ -14,9 +14,14 @@ use std::time::{Duration, Instant};
 
 use screenilux_core::geometry::Rect;
 use screenilux_core::ports::{CaptureError, Frame, ScreenSource};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_STAGING, ID3D11Texture2D,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame as WcFrame;
-use windows_capture::graphics_capture_api::InternalCaptureControl;
+use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
 use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
@@ -79,16 +84,29 @@ impl Mailbox {
 /// The `windows-capture` side of the bridge.
 struct Pump {
     mailbox: Arc<Mailbox>,
-    bytes: usize,
+    /// The size frames are delivered at, which is the monitor's.
+    width: usize,
+    height: usize,
+    /// Where frames are copied to be read on the CPU, made once and kept.
+    ///
+    /// `windows-capture`'s own `Frame::buffer` makes a new one for every
+    /// frame: a monitor-sized texture created and released dozens of times a
+    /// second, on the graphics device the desktop is composited on.
+    staging: Option<(D3D11_TEXTURE2D_DESC, ID3D11Texture2D)>,
 }
 
 impl GraphicsCaptureApiHandler for Pump {
-    type Flags = (Arc<Mailbox>, usize);
+    type Flags = (Arc<Mailbox>, Rect);
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        let (mailbox, bytes) = ctx.flags;
-        Ok(Self { mailbox, bytes })
+        let (mailbox, bounds) = ctx.flags;
+        Ok(Self {
+            mailbox,
+            width: bounds.width as usize,
+            height: bounds.height as usize,
+            staging: None,
+        })
     }
 
     fn on_frame_arrived(
@@ -96,33 +114,93 @@ impl GraphicsCaptureApiHandler for Pump {
         frame: &mut WcFrame,
         _control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        let mut buf = frame.buffer()?;
-        let mut out = self.mailbox.take_spare(self.bytes);
-
-        if buf.has_padding() {
-            // Row stride can exceed width*4; the encoder needs it tight.
-            // Observed unpadded on the development machine, but that is a
-            // property of the adapter, not a guarantee.
-            let mut tight = Vec::new();
-            let packed = buf.as_nopadding_buffer(&mut tight);
-            let n = packed.len().min(out.len());
-            out[..n].copy_from_slice(&packed[..n]);
-            // Short frame: black rather than whatever this buffer held last
-            // time round. Normally empty, since the two lengths agree.
-            out[n..].fill(0);
-        } else {
-            let raw = buf.as_raw_buffer();
-            let n = raw.len().min(out.len());
-            out[..n].copy_from_slice(&raw[..n]);
-            out[n..].fill(0);
-        }
-
+        let mut out = self.mailbox.take_spare(self.width * self.height * 4);
+        self.read_back(frame, &mut out)?;
         self.mailbox.deliver(out);
         Ok(())
     }
 
     fn on_closed(&mut self) -> Result<(), Self::Error> {
         self.mailbox.close(None);
+        Ok(())
+    }
+}
+
+impl Pump {
+    /// Copy `frame` into `out` as tightly packed BGRA, through the kept
+    /// staging texture.
+    fn read_back(&mut self, frame: &WcFrame, out: &mut [u8]) -> windows::core::Result<()> {
+        let source = frame.as_raw_texture();
+        let context = frame.device_context();
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: a live texture describing itself into a local.
+        unsafe { source.GetDesc(&mut desc) };
+
+        let fits = |kept: &D3D11_TEXTURE2D_DESC| {
+            (kept.Width, kept.Height, kept.Format) == (desc.Width, desc.Height, desc.Format)
+        };
+        let staging = match &self.staging {
+            Some((kept, texture)) if fits(kept) => texture.clone(),
+            _ => {
+                let want = D3D11_TEXTURE2D_DESC {
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    MiscFlags: 0,
+                    ..desc
+                };
+                let mut made = None;
+                // SAFETY: a staging description with no initial data, on the
+                // device the frame came from.
+                unsafe {
+                    frame
+                        .device()
+                        .CreateTexture2D(&want, None, Some(&mut made))?
+                };
+                let made = made.ok_or_else(|| {
+                    windows::core::Error::from(windows::Win32::Foundation::E_POINTER)
+                })?;
+                self.staging = Some((want, made.clone()));
+                made
+            }
+        };
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        // SAFETY: both textures are on this frame's device and the same size
+        // and format; the mapping is released below before anything else
+        // uses the texture.
+        unsafe {
+            context.CopyResource(&staging, source);
+            context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        }
+
+        // Rows can be padded past width * 4, and the frame can differ from
+        // the monitor's size for a moment while it changes mode: copy what
+        // overlaps, and black for the rest rather than whatever the buffer
+        // held last time round.
+        let row = self.width * 4;
+        let copy = (desc.Width as usize).min(self.width) * 4;
+        let rows = (desc.Height as usize).min(self.height);
+        let pitch = mapped.RowPitch as usize;
+        // SAFETY: the mapping holds `pitch` bytes for each of the texture's
+        // rows, `rows` is no more than those, and `copy` is at most a row.
+        let src = unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, pitch * rows) };
+        for (y, dst) in out.chunks_exact_mut(row).enumerate() {
+            if y < rows {
+                dst[..copy].copy_from_slice(&src[y * pitch..][..copy]);
+                dst[copy..].fill(0);
+            } else {
+                dst.fill(0);
+            }
+        }
+        // SAFETY: mapped above, and nothing borrows `src` past here.
+        unsafe { context.Unmap(&staging, 0) };
         Ok(())
     }
 }
@@ -141,27 +219,42 @@ pub struct ScreenCapture {
 }
 
 impl ScreenCapture {
-    /// Start capturing the monitor occupying `bounds`.
+    /// Start capturing the monitor occupying `bounds`, for a recording at
+    /// `fps`.
+    ///
+    /// Windows hands over a frame whenever the screen changes, which on a
+    /// high refresh display is up to 144 or 240 times a second, and each one
+    /// is copied off the graphics device. The recorder takes `fps` of them
+    /// and drops the rest, so asking for more is load on the very device the
+    /// desktop and whatever is being recorded draw with, for nothing. Where
+    /// Windows can be asked for no more than `fps`, it is.
     ///
     /// The cursor is excluded: Windows would composite its own pointer into
     /// the frame, and the recorder draws its own so the marker stays a
     /// constant size under zoom. The capture border is disabled too — it is a
     /// yellow rectangle around the recorded screen, which belongs in a
     /// screen-share, not a recording.
-    pub fn start(bounds: Rect) -> Result<Self, CaptureError> {
+    pub fn start(bounds: Rect, fps: u32) -> Result<Self, CaptureError> {
         let monitor = display::find_raw(bounds)?;
         let bytes = bounds.width as usize * bounds.height as usize * 4;
         let mailbox = Arc::new(Mailbox::default());
 
+        let capped =
+            fps > 0 && GraphicsCaptureApi::is_minimum_update_interval_supported().unwrap_or(false);
+        let interval = if capped {
+            MinimumUpdateIntervalSettings::Custom(Duration::from_secs(1) / fps)
+        } else {
+            MinimumUpdateIntervalSettings::Default
+        };
         let settings = Settings::new(
             monitor,
             CursorCaptureSettings::WithoutCursor,
             DrawBorderSettings::WithoutBorder,
             SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Default,
+            interval,
             DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
-            (Arc::clone(&mailbox), bytes),
+            (Arc::clone(&mailbox), bounds),
         );
 
         let control = Pump::start_free_threaded(settings)
@@ -264,7 +357,7 @@ mod tests {
     #[test]
     fn captures_frames_at_the_monitor_size() {
         let Some(bounds) = primary() else { return };
-        let mut cap = ScreenCapture::start(bounds).expect("capture should start");
+        let mut cap = ScreenCapture::start(bounds, 30).expect("capture should start");
         cap.wait_for_first_frame(Duration::from_secs(5))
             .expect("a frame should arrive");
 
@@ -281,7 +374,7 @@ mod tests {
     #[test]
     fn a_captured_desktop_is_not_uniformly_blank() {
         let Some(bounds) = primary() else { return };
-        let mut cap = ScreenCapture::start(bounds).unwrap();
+        let mut cap = ScreenCapture::start(bounds, 30).unwrap();
         if cap.wait_for_first_frame(Duration::from_secs(5)).is_err() {
             return;
         }
@@ -298,7 +391,7 @@ mod tests {
     #[test]
     fn an_unchanged_screen_reports_not_changed_rather_than_blocking() {
         let Some(bounds) = primary() else { return };
-        let mut cap = ScreenCapture::start(bounds).unwrap();
+        let mut cap = ScreenCapture::start(bounds, 30).unwrap();
         if cap.wait_for_first_frame(Duration::from_secs(5)).is_err() {
             return;
         }
@@ -324,7 +417,7 @@ mod tests {
     #[test]
     fn the_cached_frame_survives_between_calls() {
         let Some(bounds) = primary() else { return };
-        let mut cap = ScreenCapture::start(bounds).unwrap();
+        let mut cap = ScreenCapture::start(bounds, 30).unwrap();
         if cap.wait_for_first_frame(Duration::from_secs(5)).is_err() {
             return;
         }
@@ -344,7 +437,7 @@ mod tests {
         display::set_dpi_awareness();
         let nowhere = Rect::new(-99_000, -99_000, 640, 480);
         assert!(matches!(
-            ScreenCapture::start(nowhere),
+            ScreenCapture::start(nowhere, 30),
             Err(CaptureError::DisplayLost)
         ));
     }
@@ -356,7 +449,7 @@ mod tests {
             return;
         };
         for m in found {
-            let mut cap = ScreenCapture::start(m.bounds)
+            let mut cap = ScreenCapture::start(m.bounds, 30)
                 .unwrap_or_else(|e| panic!("{} failed to start: {e}", m.label));
             cap.wait_for_first_frame(Duration::from_secs(5))
                 .unwrap_or_else(|e| panic!("{} produced no frame: {e}", m.label));

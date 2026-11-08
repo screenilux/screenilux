@@ -65,6 +65,31 @@ pub struct Scene<'a> {
     pub cursor: Option<Cursor>,
     /// A shortcut to show, and how far in it has faded (0 to 1).
     pub keys: Option<(&'a str, f32)>,
+    /// The camera bubble, when the camera was recorded to a video of its own.
+    pub camera: Option<Bubble<'a>>,
+}
+
+/// The camera's picture at this moment, and where its bubble goes.
+#[derive(Clone, Copy)]
+pub struct Bubble<'a> {
+    /// RGBA, `width` by `height`.
+    pub rgba: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    /// Where the bubble sat while recording.
+    pub video: &'a crate::session::CameraVideo,
+    /// Where the screen on show sat on the desktop.
+    pub desk: crate::geometry::Rect,
+}
+
+impl std::fmt::Debug for Bubble<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bubble")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("desk", &self.desk)
+            .finish()
+    }
 }
 
 /// Draws output frames. Holds what is worth keeping between them: the font,
@@ -74,6 +99,8 @@ pub struct Dresser {
     resizer: Resizer,
     canvas: Option<Pixmap>,
     picture: Vec<u8>,
+    /// The camera's picture, scaled to its bubble.
+    face: Vec<u8>,
 }
 
 impl Dresser {
@@ -85,6 +112,7 @@ impl Dresser {
             resizer: Resizer::new(),
             canvas: None,
             picture: Vec::new(),
+            face: Vec::new(),
         }
     }
 
@@ -269,6 +297,18 @@ impl Dresser {
             }
         }
 
+        // The camera sits over the picture, not in it: a zoom does not move
+        // or magnify it. Under the pointer, so it never hides it.
+        if let Some(cam) = &scene.camera
+            && let Some(at) = cam.video.placed(
+                scene.at,
+                cam.desk,
+                (pic.x(), pic.y(), pic.width(), pic.height()),
+            )
+        {
+            self.bubble(&mut canvas, cam, at, ui);
+        }
+
         if let Some(cursor) = scene.cursor
             && cursor.alpha > 0.0
             && let Some(at) = point_on(cursor.at)
@@ -297,6 +337,72 @@ impl Dresser {
 
         self.canvas = Some(canvas);
         self.canvas.as_ref().expect("just put back").data()
+    }
+
+    /// The camera's picture in a pill at `at` (`x, y, width, height`), its
+    /// middle cropped to the pill's shape.
+    fn bubble(&mut self, canvas: &mut Pixmap, cam: &Bubble, at: (f32, f32, f32, f32), ui: f32) {
+        let (x, y) = (at.0.round(), at.1.round());
+        let (bw, bh) = (at.2.round().max(2.0) as u32, at.3.round().max(2.0) as u32);
+        let want = f64::from(bw) / f64::from(bh);
+        let (fw, fh) = (f64::from(cam.width), f64::from(cam.height.max(1)));
+        let (cw, ch) = if fw / fh > want {
+            (fh * want, fh)
+        } else {
+            (fw, fw / want)
+        };
+        self.face.resize(bw as usize * bh as usize * 4, 0);
+        let scaled = ImageRef::new(cam.width, cam.height, cam.rgba, PixelType::U8x4)
+            .ok()
+            .and_then(|src| {
+                let mut dst = Image::from_slice_u8(bw, bh, &mut self.face, PixelType::U8x4).ok()?;
+                let options = ResizeOptions::new()
+                    .resize_alg(ResizeAlg::Convolution(FilterType::Bilinear))
+                    .crop((fw - cw) / 2.0, (fh - ch) / 2.0, cw, ch);
+                self.resizer.resize(&src, &mut dst, &options).ok()
+            });
+        if scaled.is_none() {
+            return;
+        }
+        for px in self.face.as_chunks_mut::<4>().0 {
+            px[3] = 255;
+        }
+        let Some(face) = tiny_skia::IntSize::from_wh(bw, bh)
+            .and_then(|size| Pixmap::from_vec(std::mem::take(&mut self.face), size))
+        else {
+            return;
+        };
+        let pill = rounded(x, y, bw as f32, bh as f32, bw.min(bh) as f32 / 2.0);
+        let mut photo = Paint {
+            anti_alias: true,
+            ..Paint::default()
+        };
+        photo.shader = tiny_skia::Pattern::new(
+            face.as_ref(),
+            SpreadMode::Pad,
+            tiny_skia::FilterQuality::Nearest,
+            1.0,
+            Transform::from_translate(x, y),
+        );
+        canvas.fill_path(
+            &pill,
+            &photo,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+        // A faint dark rim, so it has an edge on a white page.
+        canvas.stroke_path(
+            &pill,
+            &paint([0, 0, 0], 60.0 / 255.0),
+            &Stroke {
+                width: (2.0 * ui).max(1.0),
+                ..Stroke::default()
+            },
+            Transform::identity(),
+            None,
+        );
+        self.face = face.take();
     }
 
     /// The shown part of `frame`, scaled to `w` by `h` into `self.picture`.
@@ -769,7 +875,45 @@ mod tests {
             clicks: &[],
             cursor: None,
             keys: None,
+            camera: None,
         }
+    }
+
+    #[test]
+    fn the_camera_is_laid_over_the_picture_where_it_was() {
+        let video = crate::session::CameraVideo {
+            file: "camera.mp4".into(),
+            width: 40,
+            height: 40,
+            moves: vec![crate::session::BubbleMove {
+                t: 0.0,
+                left: 100,
+                top: 30,
+            }],
+        };
+        // A red camera over the black-and-white halves.
+        let face: Vec<u8> = [255u8, 0, 0, 255].repeat(64 * 64);
+        let mut s = scene(&[]);
+        s.camera = Some(Bubble {
+            rgba: &face,
+            width: 64,
+            height: 64,
+            video: &video,
+            desk: crate::geometry::Rect::new(0, 0, 160, 90),
+        });
+        let mut d = Dresser::new(None);
+        let out = d.dress(&halves(), 160, 90, &s, 160, 90).to_vec();
+        assert_eq!(
+            at(&out, 160, 120, 50),
+            [255, 0, 0, 255],
+            "the middle is the camera"
+        );
+        assert_eq!(
+            at(&out, 160, 101, 31)[1],
+            255,
+            "a round bubble leaves its corner"
+        );
+        assert_eq!(at(&out, 160, 10, 45)[0], 0, "the rest is the picture");
     }
 
     #[test]
