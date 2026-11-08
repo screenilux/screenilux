@@ -169,7 +169,7 @@ impl Session {
         };
         let mut click_rx = click_rx;
         for (i, monitor) in config.monitors.iter().enumerate() {
-            let mut capture = ScreenCapture::start(monitor.bounds)
+            let mut capture = ScreenCapture::start(monitor.bounds, config.fps)
                 .map_err(|e| SessionError::Capture(format!("{}: {e}", monitor.label)))?;
             // A recording must not open on black.
             capture

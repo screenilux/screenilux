@@ -21,7 +21,10 @@ pub struct ScreenCapture {
 
 impl ScreenCapture {
     /// Start capturing the screen occupying `bounds`.
-    pub fn start(bounds: Rect) -> Result<Self, CaptureError> {
+    ///
+    /// `fps` is the Windows backend's: X11 is read only when the recorder
+    /// asks for a frame, so it never captures more than the recording takes.
+    pub fn start(bounds: Rect, _fps: u32) -> Result<Self, CaptureError> {
         let display = x11::connect().map_err(CaptureError::Backend)?;
         Ok(Self {
             display,
@@ -90,7 +93,7 @@ mod tests {
             return; // no X display
         };
         let m = &monitors[0];
-        let mut cap = ScreenCapture::start(m.bounds).expect("a capture of a real screen");
+        let mut cap = ScreenCapture::start(m.bounds, 30).expect("a capture of a real screen");
         cap.wait_for_first_frame(Duration::from_secs(2)).unwrap();
         let frame = cap.next_frame(Duration::from_millis(100)).unwrap();
         assert_eq!(frame.width, m.bounds.width);

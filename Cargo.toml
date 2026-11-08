@@ -32,3 +32,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Core does per-pixel work on every frame a recording takes (colour conversion,
+# effects), and unoptimised it is ten to fifteen times slower: 50ms a 1080p
+# frame, past the 33ms a frame gets at 30fps. Optimised here so a debug build
+# and the tests record in real time like a release does.
+[profile.dev.package.screenilux-core]
+opt-level = 3
