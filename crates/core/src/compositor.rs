@@ -522,11 +522,13 @@ impl Compositor {
             );
 
             let mut border = Paint::default();
-            // A light ring, as in the app, so the bubble reads on any screen.
-            border.set_color_rgba8(243, 255, 254, 255);
+            // A faint dark rim so the bubble still has an edge on a white
+            // page, the same as the preview window draws. Not a light ring:
+            // a white band round a face looks like a sticker.
+            border.set_color_rgba8(0, 0, 0, 60);
             border.anti_alias = true;
             let stroke = Stroke {
-                width: 6.0,
+                width: 2.0,
                 ..Stroke::default()
             };
             pixmap.stroke_path(&path, &border, &stroke, Transform::identity(), None);

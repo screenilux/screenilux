@@ -48,5 +48,5 @@ pub use speaker::Speaker;
 pub use watch::DisplayWatcher;
 pub use window::{
     CAN_HIDE_FROM_CAPTURE, exclude_from_capture, find_window, include_in_capture, set_opacity,
-    set_rounded,
+    set_pill_shape, set_rounded,
 };

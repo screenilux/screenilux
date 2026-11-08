@@ -132,6 +132,41 @@ pub unsafe fn set_rounded(hwnd: isize, rounded: bool) {
     }
 }
 
+/// Cut a borderless window to a pill `width` by `height` physical pixels:
+/// a circle when square, otherwise a rectangle with fully rounded ends.
+/// Everything outside is not part of the window at all, so the desktop shows
+/// through instead of a background, and Windows draws no border round it.
+///
+/// # Safety
+///
+/// `hwnd` must be a live top-level window handle.
+pub unsafe fn set_pill_shape(hwnd: isize, width: u32, height: u32) {
+    use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
+    if hwnd == 0 || width == 0 || height == 0 {
+        return;
+    }
+    let handle = HWND(hwnd as *mut std::ffi::c_void);
+    // A corner preference would round a second time, and Windows 11 draws
+    // its hairline border along it.
+    let none = windows::Win32::Graphics::Dwm::DWMWCP_DONOTROUND;
+    let round = width.min(height) as i32;
+    // SAFETY: a live handle; the region's coordinates are the window's own,
+    // and once set, the window owns the region and frees it.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            handle,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&none as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+        // The far edge is exclusive, hence the extra pixel.
+        let region = CreateRoundRectRgn(0, 0, width as i32 + 1, height as i32 + 1, round, round);
+        if !region.is_invalid() {
+            SetWindowRgn(handle, Some(region), true);
+        }
+    }
+}
+
 /// One of our own top-level windows, found by its title. eframe gives no
 /// handle for a second window such as the camera bubble.
 pub fn find_window(title: &str) -> Option<isize> {
