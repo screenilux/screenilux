@@ -232,6 +232,7 @@ impl App {
         };
         self.phase = Phase::Saving;
         self.compact = false;
+        self.sizer.forget_bar();
         self.set_captured(true);
         // Painted once so the window shows "Saving…" before the blocking work.
         ctx.request_repaint();

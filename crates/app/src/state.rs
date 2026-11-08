@@ -16,7 +16,7 @@ pub const CAMERA_SIZE: (u32, u32) = (320, 180);
 pub const CAMERA_MARGIN: i32 = 28;
 /// How much higher than the bottom margin the bubble opens, clear of the
 /// taskbar and of whatever sits along a window's bottom edge.
-pub const CAMERA_LIFT: i32 = 100;
+pub const CAMERA_LIFT: i32 = 160;
 pub const FPS_CHOICES: [u32; 5] = [10, 15, 24, 30, 60];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
