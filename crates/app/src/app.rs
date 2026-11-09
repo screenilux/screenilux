@@ -71,7 +71,12 @@ pub struct App {
     display_rx: std::sync::mpsc::Receiver<()>,
     /// When the displays last changed and have not been re-read since.
     displays_changed: Option<Instant>,
+    /// When Discard was clicked once, waiting for the click that confirms it.
+    discard_armed: Option<Instant>,
 }
+
+/// How long Discard waits for its second click before standing down.
+const DISCARD_WINDOW: Duration = Duration::from_secs(3);
 
 /// Windows sends several messages for one change, and the new layout can
 /// take a moment to settle; reading once after a short quiet spell catches
@@ -120,6 +125,7 @@ impl App {
             _displays: displays,
             display_rx,
             displays_changed: None,
+            discard_armed: None,
         };
         app.apply_prefs();
         app
@@ -231,9 +237,7 @@ impl App {
             return;
         };
         self.phase = Phase::Saving;
-        self.compact = false;
-        self.sizer.forget_bar();
-        self.set_captured(true);
+        self.leave_bar();
         // Painted once so the window shows "Saving…" before the blocking work.
         ctx.request_repaint();
 
@@ -247,6 +251,48 @@ impl App {
             }
             Err(e) => self.status = format!("Could not save: {e}"),
         }
+        self.wind_down();
+    }
+
+    /// Asked for on the first click of Discard, done on the second. A
+    /// recording is too much to lose to one slip of the mouse beside Stop.
+    fn discard(&mut self) {
+        let armed = self
+            .discard_armed
+            .is_some_and(|at| at.elapsed() < DISCARD_WINDOW);
+        if !armed {
+            self.discard_armed = Some(Instant::now());
+            return;
+        }
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        self.leave_bar();
+        session.cancel();
+        self.status = "Recording discarded".into();
+        self.wind_down();
+    }
+
+    /// Whether Discard has been clicked once and is waiting for the second.
+    fn discard_pending(&self, ctx: &egui::Context) -> bool {
+        match self.discard_armed {
+            Some(at) if at.elapsed() < DISCARD_WINDOW => {
+                ctx.request_repaint_after(DISCARD_WINDOW - at.elapsed());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Back to the full window, visible to capture again.
+    fn leave_bar(&mut self) {
+        self.compact = false;
+        self.sizer.forget_bar();
+        self.set_captured(true);
+    }
+
+    /// What every recording's end shares, kept or not.
+    fn wind_down(&mut self) {
         // Let the camera go. Holding it open between recordings leaves the
         // light on and the device busy for other apps, for a preview nobody
         // asked to keep; the setting stays on and `start` opens it again.
@@ -256,6 +302,7 @@ impl App {
         }
         self.phase = Phase::Idle;
         self.started_at = None;
+        self.discard_armed = None;
     }
 
     /// Upload a recording, if sharing is set up. The link is copied as soon
@@ -379,6 +426,14 @@ impl App {
                         egui::vec2(12.0, 12.0),
                     );
                     ui.painter().rect_filled(square, 3.0, ON_DARK);
+                    let (fill, tip) = if self.discard_pending(ctx) {
+                        (p.signal, "Click again to discard this recording")
+                    } else {
+                        (egui::Color32::TRANSPARENT, "Discard this recording")
+                    };
+                    if theme::round_button(ui, icon::DISCARD, 40.0, fill, ON_DARK, tip).clicked() {
+                        self.discard();
+                    }
                     ui.add_space(6.0);
                     let (dot, _) =
                         ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
@@ -1135,6 +1190,18 @@ impl App {
                         let text = if paused { "Resume" } else { "Pause" };
                         if ui.add(theme::outline(text)).clicked() {
                             self.toggle_pause();
+                        }
+                        let discard = if self.discard_pending(ctx) {
+                            egui::RichText::new("Click again to discard").color(p.signal)
+                        } else {
+                            egui::RichText::new("Discard")
+                        };
+                        if ui
+                            .add(theme::outline(discard))
+                            .on_hover_text("Stop without saving anything")
+                            .clicked()
+                        {
+                            self.discard();
                         }
                     });
                 });
