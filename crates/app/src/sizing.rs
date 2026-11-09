@@ -30,8 +30,8 @@ pub const MIN_SIZE: egui::Vec2 = egui::vec2(560.0, 420.0);
 /// restoring down gives.
 pub const FIRST_RUN: egui::Vec2 = egui::vec2(1180.0, 760.0);
 
-/// The recording bar: stop, the clock, pause and expand in a row.
-pub const BAR_SIZE: egui::Vec2 = egui::vec2(268.0, 56.0);
+/// The recording bar: stop, discard, the clock, pause and expand in a row.
+pub const BAR_SIZE: egui::Vec2 = egui::vec2(314.0, 56.0);
 
 /// The bar's gap above the taskbar.
 const BAR_MARGIN: f32 = 12.0;

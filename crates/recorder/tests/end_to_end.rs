@@ -139,6 +139,27 @@ fn records_the_primary_screen_to_a_single_file() {
 
 #[test]
 #[ignore = "records the real screen for several seconds"]
+fn a_discarded_recording_leaves_nothing_behind() {
+    let Some(f) = fixture() else { return };
+    let Ok(all) = display::monitors() else { return };
+    let primary: Vec<_> = all.into_iter().filter(|m| m.is_primary).collect();
+
+    let session = Session::start(config(&f, primary)).expect("session should start");
+    std::thread::sleep(Duration::from_secs(2));
+    let scratch = session.scratch().to_path_buf();
+    assert!(
+        scratch.is_dir(),
+        "the recording is written somewhere meanwhile"
+    );
+    session.cancel();
+
+    assert!(!scratch.exists(), "the part-written files should be gone");
+    let left = std::fs::read_dir(f.dir.path()).unwrap().count();
+    assert_eq!(left, 0, "nothing should be saved");
+}
+
+#[test]
+#[ignore = "records the real screen for several seconds"]
 fn a_pause_is_excluded_from_the_recording() {
     let Some(f) = fixture() else { return };
     let Ok(all) = display::monitors() else { return };

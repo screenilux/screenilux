@@ -433,6 +433,29 @@ impl Session {
         failures
     }
 
+    /// The scratch folder the recording is written into until it is saved.
+    pub fn scratch(&self) -> &Path {
+        self.workspace.path()
+    }
+
+    /// Stop recording and keep nothing. The encoders let go of their
+    /// part-written files and the scratch folder goes with the session, so a
+    /// cancelled recording leaves no trace on disk.
+    pub fn cancel(mut self) {
+        let failures = self.halt();
+        if !failures.is_empty() {
+            tracing::warn!(
+                failures = failures.join("; "),
+                "a cancelled recording had errors"
+            );
+        }
+        if let Some(f) = self.focus.take() {
+            let _ = f.collect();
+        }
+        // Dropping `self` drops the sinks before the workspace, in field
+        // order, so the files are closed before their folder is removed.
+    }
+
     /// Stop recording and write the result into `outdir`.
     ///
     /// One screen yields a single MP4, which plays anywhere. Several yield a
