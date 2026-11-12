@@ -3931,6 +3931,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.21",
  "tracing",
+ "tracing-subscriber",
  "ureq",
  "url",
  "zip",
