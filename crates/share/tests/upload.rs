@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use screenilux_core::session::{MANIFEST_NAME, Manifest, Role, Screen};
+use screenilux_core::session::{BubbleMove, CameraVideo, MANIFEST_NAME, Manifest, Role, Screen};
 use screenilux_share::{
     Bucket, Contents, Destination, Progress, ShareKey, State, Upload, open, sealed_len,
 };
@@ -19,11 +19,14 @@ use screenilux_share::{
 /// The second screen is big enough to go up in parts.
 const SIZES: [usize; 2] = [1000, 70 * 1024 * 1024 + 123];
 
+/// The camera's own video, recorded beside the screens.
+const CAMERA: usize = 2000;
+
 fn byte(i: usize) -> u8 {
     (i % 251) as u8
 }
 
-/// A two-screen package in a folder of its own.
+/// A two-screen package with a camera video, in a folder of its own.
 fn package(tag: &str) -> (PathBuf, PathBuf) {
     let dir = std::env::temp_dir().join(format!("screenilux-{tag}-{}", std::process::id()));
     let folder = dir.join("session");
@@ -50,6 +53,18 @@ fn package(tag: &str) -> (PathBuf, PathBuf) {
         let body: Vec<u8> = (0..*size).map(byte).collect();
         std::fs::write(folder.join(format!("screen{n}.mp4")), body).unwrap();
     }
+    manifest.camera_video = Some(CameraVideo {
+        file: "camera.mp4".into(),
+        width: 320,
+        height: 320,
+        moves: vec![BubbleMove {
+            t: 0.0,
+            left: 100,
+            top: 100,
+        }],
+    });
+    let body: Vec<u8> = (0..CAMERA).map(byte).collect();
+    std::fs::write(folder.join("camera.mp4"), body).unwrap();
     std::fs::write(folder.join(MANIFEST_NAME), manifest.to_json().unwrap()).unwrap();
     let package = dir.join("r.screenilux");
     screenilux_core::package::pack(&folder, &package).unwrap();
@@ -108,7 +123,13 @@ fn check_files(files: &str, link: &str, progress: &Progress) {
     assert_eq!(plain.len(), SIZES[1]);
     assert!(plain.iter().enumerate().all(|(i, &b)| b == byte(i)));
 
-    let expected = sealed_len(SIZES[0] as u64) + sealed.len() as u64 + manifest_sealed.len() as u64;
+    let camera = open(&key, &get(&format!("{files}camera.mp4"))).unwrap();
+    assert_eq!(camera.len(), CAMERA);
+
+    let expected = sealed_len(SIZES[0] as u64)
+        + sealed.len() as u64
+        + sealed_len(CAMERA as u64)
+        + manifest_sealed.len() as u64;
     assert_eq!(progress.total, expected);
 }
 

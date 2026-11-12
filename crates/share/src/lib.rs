@@ -29,7 +29,7 @@ pub use contents::{Contents, Item};
 use seal::Sealer;
 pub use seal::{ShareKey, open, sealed_len};
 pub use store::Rights;
-use store::{Hosted, Own, Store};
+use store::{Hosted, Own, Sent, Store};
 
 /// Where the web player lives. Links point here.
 pub const PLAYER: &str = "https://screenilux.hassen-ben-mbarek.workers.dev";
@@ -231,12 +231,11 @@ fn run(
             )?;
             sent.push(item.name.clone());
         }
-        store.put(MANIFEST_NAME, &manifest, &mut |n| {
-            uploaded += n as u64;
-            lock(progress).uploaded = uploaded;
+        sending(&mut uploaded, progress, |counted| {
+            store.put(MANIFEST_NAME, &manifest, counted)
         })?;
         sent.push(MANIFEST_NAME.to_string());
-        store.complete()
+        retrying(|| store.complete())
     })();
 
     match result {
@@ -284,13 +283,11 @@ fn upload(
         reader
             .read_to_end(&mut body)
             .map_err(|e| ShareError::Read(e.to_string()))?;
-        store.put(name, &body, &mut |n| {
-            *uploaded += n as u64;
-            lock(progress).uploaded = *uploaded;
-        })?;
-        return Ok(());
+        return sending(uploaded, progress, |counted| {
+            store.put(name, &body, counted)
+        });
     }
-    let upload_id = store.start_parts(name)?;
+    let upload_id = retrying(|| store.start_parts(name))?;
     let mut etags = Vec::new();
     let mut buf = vec![0u8; PART];
     let parts = (|| {
@@ -300,19 +297,76 @@ fn upload(
                 break;
             }
             let number = etags.len() as u16 + 1;
-            etags.push(
-                store.put_part(name, &upload_id, number, &buf[..n], &mut |k| {
-                    *uploaded += k as u64;
-                    lock(progress).uploaded = *uploaded;
-                })?,
-            );
+            etags.push(sending(uploaded, progress, |counted| {
+                store.put_part(name, &upload_id, number, &buf[..n], counted)
+            })?);
         }
-        store.finish_parts(name, &upload_id, &etags)
+        retrying(|| store.finish_parts(name, &upload_id, &etags))
     })();
     if parts.is_err() {
         let _ = store.abort_parts(name, &upload_id);
     }
     parts
+}
+
+/// How many times one request is tried before the upload gives up. A long
+/// upload over a shaky connection will see the odd dropped connection, and
+/// losing the whole recording to one of them is not worth it.
+const TRIES: u32 = 5;
+
+/// The wait before trying again, doubled each time: 1, 2, 4 and 8 seconds.
+const BACKOFF: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(1)
+};
+
+impl ShareError {
+    /// Whether trying the same request again could go better: the connection
+    /// failed, or the storage had trouble of its own.
+    fn is_passing(&self) -> bool {
+        match self {
+            ShareError::Network(_) => true,
+            ShareError::Refused(code) => *code == 408 || *code >= 500,
+            _ => false,
+        }
+    }
+}
+
+/// Run `request`, trying again after a passing failure. Every request an
+/// upload makes can be repeated: a file or part sent again replaces the one
+/// before.
+fn retrying<T>(mut request: impl FnMut() -> Result<T, ShareError>) -> Result<T, ShareError> {
+    let mut tries = 1;
+    loop {
+        match request() {
+            Err(e) if tries < TRIES && e.is_passing() => {
+                tracing::info!(error = %e, tries, "an upload request failed; trying again");
+                std::thread::sleep(BACKOFF * (1 << (tries - 1)));
+                tries += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Run `request`, which sends a body and reports the bytes it hands out to
+/// the callback it is given, trying again as [`retrying`] does. Progress
+/// goes back to where it was before each try, so bytes are counted once.
+fn sending<T>(
+    uploaded: &mut u64,
+    progress: &Mutex<Progress>,
+    mut request: impl FnMut(Sent<'_>) -> Result<T, ShareError>,
+) -> Result<T, ShareError> {
+    let before = *uploaded;
+    retrying(|| {
+        *uploaded = before;
+        lock(progress).uploaded = before;
+        request(&mut |n| {
+            *uploaded += n as u64;
+            lock(progress).uploaded = *uploaded;
+        })
+    })
 }
 
 /// Read until `buf` is full or the file ends.
@@ -358,7 +412,7 @@ pub fn add_text(
             Box::new(Own::resume(agent, bucket, prefix)?)
         }
     };
-    store.put(screenilux_core::text::TEXT_INDEX_NAME, &sealed, &mut |_| {})
+    retrying(|| store.put(screenilux_core::text::TEXT_INDEX_NAME, &sealed, &mut |_| {}))
 }
 
 /// A new id for this computer on the Screenilux storage, made once and kept.
@@ -399,6 +453,142 @@ mod tests {
         assert_eq!(fill(&mut reader, &mut buf).unwrap(), 64);
         assert_eq!(&buf[..], &data[..64]);
         assert_eq!(fill(&mut reader, &mut buf).unwrap(), 36);
+    }
+
+    /// A store whose requests fail, the way `fail` says, before they work.
+    struct Flaky {
+        fail: Mutex<Vec<ShareError>>,
+        tries: Mutex<u32>,
+        parts: Mutex<Vec<u16>>,
+    }
+
+    impl Flaky {
+        fn new(fail: Vec<ShareError>) -> Self {
+            Self {
+                fail: Mutex::new(fail),
+                tries: Mutex::new(0),
+                parts: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Send half of `body`, then fail if a failure is due.
+        fn send(&self, body: &[u8], sent: Sent<'_>) -> Result<(), ShareError> {
+            *self.tries.lock().unwrap() += 1;
+            let mut fail = self.fail.lock().unwrap();
+            if fail.is_empty() {
+                sent(body.len());
+                Ok(())
+            } else {
+                sent(body.len() / 2);
+                Err(fail.remove(0))
+            }
+        }
+    }
+
+    impl Store for Flaky {
+        fn rights(&self) -> Rights {
+            Rights::Bucket {
+                prefix: String::new(),
+            }
+        }
+        fn put(&self, _: &str, body: &[u8], sent: Sent<'_>) -> Result<(), ShareError> {
+            self.send(body, sent)
+        }
+        fn start_parts(&self, _: &str) -> Result<String, ShareError> {
+            Ok("up".into())
+        }
+        fn put_part(
+            &self,
+            _: &str,
+            _: &str,
+            number: u16,
+            body: &[u8],
+            sent: Sent<'_>,
+        ) -> Result<String, ShareError> {
+            self.send(body, sent)?;
+            self.parts.lock().unwrap().push(number);
+            Ok(format!("e{number}"))
+        }
+        fn finish_parts(&self, _: &str, _: &str, etags: &[String]) -> Result<(), ShareError> {
+            assert_eq!(etags.len(), self.parts.lock().unwrap().len());
+            Ok(())
+        }
+        fn abort_parts(&self, _: &str, _: &str) -> Result<(), ShareError> {
+            Ok(())
+        }
+        fn complete(&self) -> Result<(), ShareError> {
+            Ok(())
+        }
+        fn discard(&self, _: &[String]) -> Result<(), ShareError> {
+            Ok(())
+        }
+    }
+
+    fn progress() -> Mutex<Progress> {
+        Mutex::new(Progress {
+            link: None,
+            uploaded: 0,
+            total: 0,
+            state: State::Uploading,
+            expires: None,
+            rights: None,
+        })
+    }
+
+    fn reset() -> ShareError {
+        ShareError::Network("io: An existing connection was forcibly closed".into())
+    }
+
+    #[test]
+    fn a_dropped_part_is_sent_again_and_counted_once() {
+        let store = Flaky::new(vec![reset(), ShareError::Refused(502)]);
+        let data = vec![7u8; PART + 1000];
+        let (mut uploaded, p) = (0, progress());
+        upload(
+            &store,
+            "screen1.mp4",
+            &data[..],
+            data.len() as u64,
+            &mut uploaded,
+            &p,
+        )
+        .unwrap();
+        assert_eq!(*store.tries.lock().unwrap(), 4);
+        assert_eq!(*store.parts.lock().unwrap(), vec![1, 2]);
+        assert_eq!(uploaded, data.len() as u64);
+        assert_eq!(p.lock().unwrap().uploaded, data.len() as u64);
+    }
+
+    #[test]
+    fn an_upload_gives_up_after_a_few_tries() {
+        let store = Flaky::new((0..TRIES).map(|_| reset()).collect());
+        let (mut uploaded, p) = (0, progress());
+        let e = upload(
+            &store,
+            "recording.json",
+            &[1u8; 10][..],
+            10,
+            &mut uploaded,
+            &p,
+        );
+        assert!(matches!(e, Err(ShareError::Network(_))));
+        assert_eq!(*store.tries.lock().unwrap(), TRIES);
+    }
+
+    #[test]
+    fn a_refusal_is_not_tried_again() {
+        let store = Flaky::new(vec![ShareError::Refused(413)]);
+        let (mut uploaded, p) = (0, progress());
+        let e = upload(
+            &store,
+            "recording.json",
+            &[1u8; 10][..],
+            10,
+            &mut uploaded,
+            &p,
+        );
+        assert!(matches!(e, Err(ShareError::Refused(413))));
+        assert_eq!(*store.tries.lock().unwrap(), 1);
     }
 
     #[test]

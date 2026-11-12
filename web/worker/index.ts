@@ -7,6 +7,7 @@
 //
 //   recording.json  the manifest
 //   screen1.mp4 ... one video per screen
+//   camera.mp4      the camera, if it was recorded
 //   text.json       the text index, if the recording was made searchable
 //   _state          the upload session, kept by this server; never served
 //
@@ -23,7 +24,7 @@
 //   only: it cannot read, list or change any other. The token is a signature
 //   of the recording's id, so the server keeps nothing to check it against.
 // - A recording can hold at most the bytes it asked for, counted as they
-//   arrive.
+//   arrive. A file or part sent again replaces what was counted for it.
 // - The upload's progress is what this server counted, and it is ready when
 //   the app says it has finished. Anyone with the id can ask how it is going.
 // - Reading needs only the id, which is random and long enough that links
@@ -36,7 +37,7 @@ const ID = /^[A-Za-z0-9_-]{22}$/;
 // Any plain file name can be read, but only the files a recording is made of
 // can be written.
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
-const WRITABLE = /^(recording|text)\.json$|^screen[1-9][0-9]?\.mp4$/;
+const WRITABLE = /^(recording|text)\.json$|^screen[1-9][0-9]?\.mp4$|^camera\.mp4$/;
 const PART = /^[1-9][0-9]{0,4}$/;
 
 /** What one computer can have shared at a time, over the week links last. */
@@ -62,6 +63,12 @@ interface UploadState {
   /** Bytes the app said it would send, and bytes received so far. */
   total: number;
   received: number;
+  /**
+   * The bytes counted for each file, or each part of one ("screen1.mp4/3"),
+   * so one sent again after a dropped connection replaces its count instead
+   * of adding to it. Missing in uploads started before this was kept.
+   */
+  written?: Record<string, number>;
   /** When the upload started, and when bytes last arrived, in ms. */
   started: number;
   updated: number;
@@ -303,13 +310,17 @@ async function api(request: Request, env: Env, path: string[]): Promise<Response
     if (bytes > MAX_REQUEST) return problem(413, "That upload is too big for one request.");
     const late = name === "text.json";
     if (late && bytes > MAX_TEXT) return problem(413, "The text index is too big.");
-    const counted = await updateState(env, id, (s) =>
-      late
-        ? { ...s, total: s.total + bytes, received: s.received + bytes, updated: Date.now() }
-        : s.received + bytes > s.total
-          ? "full"
-          : { ...s, received: s.received + bytes, updated: Date.now() },
-    );
+    // The app tries a request again when its connection drops, and the bytes
+    // of the try that failed were already counted: count each file or part
+    // once, at the size it was last sent.
+    const slot = part ? `${name}/${part}` : name;
+    const counted = await updateState(env, id, (s) => {
+      const before = s.written?.[slot] ?? 0;
+      const written = { ...s.written, [slot]: bytes };
+      const received = s.received - before + bytes;
+      if (late) return { ...s, total: s.total - before + bytes, received, written, updated: Date.now() };
+      return received > s.total ? "full" : { ...s, received, written, updated: Date.now() };
+    });
     if (counted === "full") return problem(413, "The recording is bigger than it said it would be.");
     return counted === "ok" ? undefined : gone;
   };
