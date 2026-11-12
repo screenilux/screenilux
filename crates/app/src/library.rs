@@ -246,10 +246,8 @@ impl Library {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for row in shown.chunks(columns) {
-                        let (band, _) = ui.allocate_exact_size(
-                            egui::vec2(width, card_h),
-                            egui::Sense::hover(),
-                        );
+                        let (band, _) =
+                            ui.allocate_exact_size(egui::vec2(width, card_h), egui::Sense::hover());
                         for (i, e) in row.iter().enumerate() {
                             let rect = egui::Rect::from_min_size(
                                 band.min + egui::vec2(i as f32 * (card_w + GAP), 0.0),
@@ -402,16 +400,18 @@ fn card(
     link: &Link,
 ) -> egui::Response {
     let response = ui
-        .interact(rect, ui.scope_id().with(("card", &e.path)), egui::Sense::click())
+        .interact(
+            rect,
+            ui.scope_id().with(("card", &e.path)),
+            egui::Sense::click(),
+        )
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &e.name));
     let painter = ui.painter_at(rect.expand(4.0));
     let lit = response.hovered() || response.has_focus();
 
-    let picture = egui::Rect::from_min_size(
-        rect.min,
-        egui::vec2(rect.width(), rect.height() - CAPTION),
-    );
+    let picture =
+        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), rect.height() - CAPTION));
     painter.rect_filled(picture, 14.0, p.stage);
     match details {
         Some(Details::Ready {
@@ -494,7 +494,12 @@ fn card(
     }
 
     let name_at = egui::pos2(rect.left() + 2.0, picture.bottom() + 10.0);
-    let name = one_line(ui, &e.name, rect.width() - 4.0, if lit { p.signal } else { p.text });
+    let name = one_line(
+        ui,
+        &e.name,
+        rect.width() - 4.0,
+        if lit { p.signal } else { p.text },
+    );
     painter.galley(name_at, name, p.text);
 
     let mut parts = Vec::new();
@@ -587,7 +592,12 @@ fn pager(ui: &mut egui::Ui, p: &Palette, page: usize, pages: usize) -> Option<us
         .on_hover_text(hint)
         .clicked()
     };
-    if arrow(ui, icon::CHEVRON_RIGHT, page + 1 < pages, "Next page (Page Down)") {
+    if arrow(
+        ui,
+        icon::CHEVRON_RIGHT,
+        page + 1 < pages,
+        "Next page (Page Down)",
+    ) {
         picked = Some(page + 1);
     }
     ui.add_space(4.0);
@@ -690,9 +700,12 @@ fn empty_state(ui: &mut egui::Ui, p: &Palette, dragging: bool, out_dir: &Path) -
         egui::RichText::new("No recordings yet").font(egui::FontId::new(16.0, theme::strong())),
     );
     inner.label(
-        egui::RichText::new(format!("Recordings you make are saved in {}.", out_dir.display()))
-            .size(13.0)
-            .color(p.weak),
+        egui::RichText::new(format!(
+            "Recordings you make are saved in {}.",
+            out_dir.display()
+        ))
+        .size(13.0)
+        .color(p.weak),
     );
     inner.add_space(10.0);
     if inner
@@ -725,7 +738,11 @@ fn drop_overlay(ui: &egui::Ui, p: &Palette, area: egui::Rect) {
         egui::Order::Foreground,
         egui::Id::unique("library drop"),
     ));
-    painter.rect_filled(area, 20.0, theme::blend(p.base, p.signal, 0.10).gamma_multiply(0.94));
+    painter.rect_filled(
+        area,
+        20.0,
+        theme::blend(p.base, p.signal, 0.10).gamma_multiply(0.94),
+    );
     dashed_on(&painter, area.shrink(1.0), p.signal);
     painter.text(
         area.center() - egui::vec2(0.0, 18.0),
@@ -894,7 +911,11 @@ mod tests {
         assert_eq!(page_span(0, 38, 12), 0..12);
         assert_eq!(page_span(3, 38, 12), 36..38);
         assert_eq!(page_span(0, 0, 12), 0..0);
-        assert_eq!(page_span(1, 5, 12), 0..5, "a page past the end shows the last");
+        assert_eq!(
+            page_span(1, 5, 12),
+            0..5,
+            "a page past the end shows the last"
+        );
     }
 
     #[test]

@@ -208,7 +208,7 @@ pub fn shrink(rgba: &[u8], w: usize, h: usize, fit: (u32, u32)) -> Option<(usize
             let mut sum = [0u64; 4];
             for y in y0..y1 {
                 let row = &rgba[(y * w + x0) * 4..(y * w + x1) * 4];
-                for px in row.chunks_exact(4) {
+                for px in row.as_chunks::<4>().0 {
                     for (s, v) in sum.iter_mut().zip(px) {
                         *s += *v as u64;
                     }
@@ -235,7 +235,12 @@ mod tests {
         let (w, h, out) = shrink(&picture, 1920, 1080, PICTURE).unwrap();
         assert_eq!((w, h), (480, 270));
         assert_eq!(out.len(), 480 * 270 * 4);
-        assert!(out.chunks_exact(4).all(|p| p == [10, 20, 30, 255]));
+        assert!(
+            out.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [10, 20, 30, 255])
+        );
 
         // A tall screen fits by its height.
         let (w, h, _) = shrink(&solid(1080, 1920, [0; 4]), 1080, 1920, PICTURE).unwrap();
