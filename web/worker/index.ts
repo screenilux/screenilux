@@ -7,6 +7,7 @@
 //
 //   recording.json  the manifest
 //   screen1.mp4 ... one video per screen
+//   camera.mp4      the camera, if it was recorded
 //   text.json       the text index, if the recording was made searchable
 //   _state          the upload session, kept by this server; never served
 //
@@ -36,7 +37,7 @@ const ID = /^[A-Za-z0-9_-]{22}$/;
 // Any plain file name can be read, but only the files a recording is made of
 // can be written.
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
-const WRITABLE = /^(recording|text)\.json$|^screen[1-9][0-9]?\.mp4$/;
+const WRITABLE = /^(recording|text)\.json$|^screen[1-9][0-9]?\.mp4$|^camera\.mp4$/;
 const PART = /^[1-9][0-9]{0,4}$/;
 
 /** What one computer can have shared at a time, over the week links last. */
