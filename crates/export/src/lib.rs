@@ -728,6 +728,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A part removed at two cuts is gone from every screen at once: the
+    /// footage after it follows straight on, and the second screen, shown
+    /// after the gap, is at the same moment the first would have been.
+    #[test]
+    fn a_part_removed_between_cuts_leaves_both_screens_in_step() {
+        use screenilux_core::edit::Tool;
+        let dir = std::env::temp_dir().join(format!("screenilux-cut-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a working directory");
+        let (w, h, fps) = (320u32, 240u32, 30u32);
+
+        // Three seconds each. The shade says which frame it is: the first
+        // screen gets lighter as it goes, the second darker.
+        let clip = |name: &str, shade: fn(u32) -> u8| -> Option<std::path::PathBuf> {
+            let path = dir.join(name);
+            let mut sink =
+                NativeSink::new(w, h, fps, false, dir.join(format!("{name}-scratch.mp4"))).ok()?;
+            sink.open_segment().ok()?;
+            for n in 0..3 * fps {
+                sink.write(&flat(w, h, shade(n))).ok()?;
+            }
+            sink.close_segment(0).ok()?;
+            sink.finish(&path).ok()?;
+            Some(path)
+        };
+        let (Some(one), Some(two)) = (
+            clip("screen1.mp4", |n| (n * 2) as u8),
+            clip("screen2.mp4", |n| (250 - n * 2) as u8),
+        ) else {
+            // No H.264 encoder on this machine.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let screen = |name: &str, path| Screen {
+            name: name.into(),
+            path,
+            desk: screenilux_core::Rect::new(0, 0, w, h),
+        };
+        let recording = Recording {
+            screens: vec![screen("screen1.mp4", one), screen("screen2.mp4", two)],
+            ..Recording::default()
+        };
+
+        // Cut at one second and at two, take the middle out, and show the
+        // second screen for the last second.
+        let mut edits = EditList::default();
+        assert!(edits.cut_at(1.0, 3.0) && edits.cut_at(2.0, 3.0));
+        edits.remove_part(1.0, 2.0);
+        edits.add(
+            2.0,
+            3.0,
+            Tool::Screen {
+                file: "screen2.mp4".into(),
+            },
+        );
+
+        let out = dir.join("export.mp4");
+        let done = mp4(
+            &recording,
+            &out,
+            &edits,
+            Mp4 {
+                fps,
+                ..Mp4::default()
+            },
+            |_| true,
+        )
+        .expect("the export runs");
+        assert!(
+            (55..=62).contains(&done.frames),
+            "two seconds left of three, got {} frames",
+            done.frames
+        );
+
+        let mut back = screenilux_platform::decoder::VideoDecoder::open(&out).expect("it reads");
+        let mut shades = Vec::new();
+        while let Ok(Some((t, frame))) =
+            back.next_frame_if(|t| (t - 0.5).abs() < 0.02 || (t - 1.5).abs() < 0.02)
+        {
+            if let Some(f) = frame {
+                let i = ((f.height / 2 * f.width + f.width / 2) * 4) as usize;
+                shades.push((t, f.rgba[i]));
+            }
+        }
+        let near = |want: f64| {
+            shades
+                .iter()
+                .find(|(t, _)| (t - want).abs() < 0.02)
+                .map(|(_, s)| i32::from(*s))
+                .unwrap_or_else(|| panic!("no frame near {want}s in {shades:?}"))
+        };
+        // Half a second in: the first screen, frame 15.
+        assert!((near(0.5) - 30).abs() <= 14, "{shades:?}");
+        // A second and a half in: past the gap, so two and a half seconds
+        // into the recording, on the second screen: frame 75.
+        assert!((near(1.5) - 100).abs() <= 14, "{shades:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The sound goes through the edits with the picture: muted where it is
     /// muted, gone where it is cut, and quicker but not higher where it is
     /// sped up.

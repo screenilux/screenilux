@@ -12,6 +12,13 @@
 //! shows an edit to the user speaks output time; everything that reads a frame
 //! speaks source time. [`EditList::to_output`] and [`EditList::to_source`]
 //! convert, and are the reason this module is tested as carefully as it is.
+//!
+//! A *cut* is the other way to take footage out. It is a moment rather than
+//! a stretch: it splits the recording there, every screen and the camera at
+//! once since they share one clock, and on its own changes nothing. What it
+//! gives is parts, one either side, and removing a part lays an ordinary
+//! [`Tool::Cut`] over it, so the gap closes up wherever the time mapping is
+//! read: playing, exporting and sharing.
 
 use serde::{Deserialize, Serialize};
 
@@ -238,7 +245,7 @@ impl Tool {
             Tool::Spotlight { .. } => "Spotlight".into(),
             Tool::Callout { .. } => "Callout".into(),
             Tool::MarkClicks => "Mark every click".into(),
-            Tool::Cut => "Cut".into(),
+            Tool::Cut => "Cut out".into(),
             Tool::Trim => "Trim".into(),
             Tool::Speed { rate } => format!("Speed up {}×", trim_zero(*rate)),
             Tool::Mute => "Mute".into(),
@@ -252,6 +259,11 @@ impl Tool {
     /// Does this change how long the recording runs?
     pub fn alters_time(&self) -> bool {
         matches!(self, Tool::Cut | Tool::Trim | Tool::Speed { .. })
+    }
+
+    /// Does this take its stretch out of the finished video?
+    pub fn removes(&self) -> bool {
+        matches!(self, Tool::Cut | Tool::Trim)
     }
 
     /// The region it applies to, if it has one.
@@ -350,10 +362,36 @@ pub struct EditList {
     /// the camera as a video of its own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hide_camera: bool,
+    /// Where the recording is cut, in seconds of the original and in order.
+    /// Written only when there is one, so a list from before cuts existed
+    /// reads back, and is written back, unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cuts: Vec<f64>,
     /// Highest id handed out, so ids stay unique across sessions.
     #[serde(default)]
     next_id: u32,
 }
+
+/// The stretch between two cuts, or between a cut and an end of the
+/// recording.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Part {
+    pub start: f64,
+    pub end: f64,
+    /// Taken out of the finished video altogether.
+    pub removed: bool,
+}
+
+impl Part {
+    pub fn covers(&self, t: f64) -> bool {
+        t >= self.start && t < self.end
+    }
+}
+
+/// Two times this close are the same moment. Cuts and the edges of the
+/// parts removed at them are copies of one number, so this only has to
+/// absorb arithmetic, not judgement.
+const SAME: f64 = 1e-9;
 
 impl EditList {
     pub fn new() -> Self {
@@ -361,7 +399,7 @@ impl EditList {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.effects.is_empty()
+        self.effects.is_empty() && self.cuts.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -536,6 +574,163 @@ impl EditList {
             Tool::Screen { file } if m.covers(t) => Some(file.as_str()),
             _ => None,
         })
+    }
+
+    /// Cut the recording at `t`. Every screen and the camera are cut there
+    /// together, since they play to one clock.
+    ///
+    /// Refused, returning `false`, where a cut would make a part too short
+    /// to see or grab (at either end, or beside another cut) and where the
+    /// footage is already removed, since there is nothing there to split.
+    pub fn cut_at(&mut self, t: f64, duration: f64) -> bool {
+        if !self.can_cut(t, duration) {
+            return false;
+        }
+        self.cuts.push(t);
+        self.cuts.sort_by(f64::total_cmp);
+        true
+    }
+
+    /// Would [`cut_at`](Self::cut_at) take a cut here?
+    pub fn can_cut(&self, t: f64, duration: f64) -> bool {
+        let fits = t >= MIN_SPAN && t <= duration - MIN_SPAN;
+        let crowded = self.cuts.iter().any(|c| (c - t).abs() < MIN_SPAN);
+        fits && !crowded && !self.is_removed(t)
+    }
+
+    /// Take the cut at `at` away, joining the parts either side. A part
+    /// removed beside it stays removed: that is an edit of its own, listed
+    /// and undone on its own.
+    pub fn join(&mut self, at: f64) {
+        self.cuts.retain(|c| (c - at).abs() > SAME);
+    }
+
+    /// Move the cut at `from` towards `to`, and return where it landed. It
+    /// stays between its neighbours, and the edge of a part removed at it
+    /// moves with it, so dragging a cut moves where the gap begins or ends
+    /// rather than leaving a sliver of removed footage behind.
+    pub fn move_cut(&mut self, from: f64, to: f64, duration: f64) -> f64 {
+        let Some(i) = self.cuts.iter().position(|c| (c - from).abs() <= SAME) else {
+            return from;
+        };
+        let mut lo = if i == 0 { 0.0 } else { self.cuts[i - 1] } + MIN_SPAN;
+        let mut hi = self.cuts.get(i + 1).copied().unwrap_or(duration) - MIN_SPAN;
+        for e in self.effects.iter().filter(|e| e.tool.removes()) {
+            if (e.start - from).abs() <= SAME {
+                hi = hi.min(e.end - MIN_SPAN);
+            }
+            if (e.end - from).abs() <= SAME {
+                lo = lo.max(e.start + MIN_SPAN);
+            }
+        }
+        if lo > hi {
+            return from;
+        }
+        let to = to.clamp(lo, hi);
+        self.cuts[i] = to;
+        for e in self.effects.iter_mut().filter(|e| e.tool.removes()) {
+            if (e.start - from).abs() <= SAME {
+                e.start = to;
+            }
+            if (e.end - from).abs() <= SAME {
+                e.end = to;
+            }
+        }
+        self.sort();
+        to
+    }
+
+    /// The recording split at its cuts, in order. With no cuts it is one
+    /// part, the whole of it.
+    pub fn parts(&self, duration: f64) -> Vec<Part> {
+        let mut edges = vec![0.0];
+        edges.extend(
+            self.cuts
+                .iter()
+                .copied()
+                .filter(|c| *c > 0.0 && *c < duration),
+        );
+        edges.push(duration);
+        edges
+            .windows(2)
+            .filter(|w| w[1] > w[0])
+            .map(|w| Part {
+                start: w[0],
+                end: w[1],
+                removed: self.resume_after(w[0]).is_some_and(|r| r >= w[1] - SAME),
+            })
+            .collect()
+    }
+
+    /// The part a source time falls in.
+    pub fn part_at(&self, t: f64, duration: f64) -> Option<Part> {
+        let parts = self.parts(duration);
+        parts
+            .iter()
+            .find(|p| p.covers(t))
+            .or(parts.last().filter(|p| t >= p.end))
+            .copied()
+    }
+
+    /// Take a stretch out of the finished video, so the gap closes up, and
+    /// return the id of the [`Tool::Cut`] that does it.
+    ///
+    /// Anything else that changed time inside the stretch goes with it — its
+    /// footage is gone, and two edits over one stretch of time is a problem
+    /// — and one that ran across an edge keeps the part outside.
+    pub fn remove_part(&mut self, start: f64, end: f64) -> u32 {
+        self.clear_time(start, end, Tool::alters_time);
+        self.add(start, end, Tool::Cut)
+    }
+
+    /// Put a removed stretch back.
+    pub fn restore_part(&mut self, start: f64, end: f64) {
+        self.clear_time(start, end, Tool::removes);
+    }
+
+    /// Clear the effects `which` picks out of `start..end`: those inside it
+    /// go, and those across an edge are trimmed back to it, in two if they
+    /// ran across both.
+    fn clear_time(&mut self, start: f64, end: f64, which: fn(&Tool) -> bool) {
+        let mut tails = Vec::new();
+        self.effects.retain_mut(|e| {
+            if !which(&e.tool) || e.end <= start + SAME || e.start >= end - SAME {
+                return true;
+            }
+            if e.end > end + MIN_SPAN && e.start < start - MIN_SPAN {
+                tails.push((end, e.end, e.tool.clone(), e.screen.clone()));
+            }
+            if e.start < start - MIN_SPAN {
+                e.end = start;
+                true
+            } else if e.end > end + MIN_SPAN {
+                e.start = end;
+                true
+            } else {
+                false
+            }
+        });
+        for (a, b, tool, screen) in tails {
+            self.add_on(a, b, tool, screen);
+        }
+        self.sort();
+    }
+
+    /// Where playback picks up from a source time that has been removed:
+    /// the far end of the removed run it is in, through any removed
+    /// stretches that touch. `None` when the time is kept.
+    pub fn resume_after(&self, t: f64) -> Option<f64> {
+        let mut at = t;
+        while let Some(end) = self
+            .effects
+            .iter()
+            .filter(|e| e.tool.removes() && at >= e.start - SAME && at < e.end - SAME)
+            .map(|e| e.end)
+            .reduce(f64::max)
+        {
+            at = end;
+        }
+        (at > t).then_some(at)
     }
 
     /// Everything wrong with the list, worst first. An empty result means it
@@ -840,6 +1035,181 @@ mod tests {
         assert!(text.contains("\"tool\":\"hide\""));
         let back: EditList = serde_json::from_str(&text).unwrap();
         assert_eq!(back, l);
+    }
+
+    #[test]
+    fn a_cut_splits_the_recording_in_two_and_changes_nothing_alone() {
+        let mut l = EditList::new();
+        assert_eq!(
+            l.parts(30.0),
+            vec![Part {
+                start: 0.0,
+                end: 30.0,
+                removed: false
+            }],
+            "uncut, the recording is one part"
+        );
+        assert!(l.cut_at(12.0, 30.0));
+        let parts = l.parts(30.0);
+        assert_eq!(parts.len(), 2);
+        assert_eq!((parts[0].start, parts[0].end), (0.0, 12.0));
+        assert_eq!((parts[1].start, parts[1].end), (12.0, 30.0));
+        assert!(parts.iter().all(|p| !p.removed));
+        assert_eq!(l.output_duration(30.0), 30.0, "a cut alone removes nothing");
+        assert_eq!(l.to_output(20.0), Some(20.0));
+        assert!(l.problems(30.0).is_empty());
+        assert!(!l.is_empty(), "a cut is an edit worth saving");
+    }
+
+    #[test]
+    fn removing_the_part_after_a_cut_closes_the_gap() {
+        let mut l = EditList::new();
+        l.cut_at(10.0, 30.0);
+        l.cut_at(18.0, 30.0);
+        let middle = l.part_at(12.0, 30.0).unwrap();
+        assert_eq!((middle.start, middle.end), (10.0, 18.0));
+        l.remove_part(middle.start, middle.end);
+
+        assert!(l.parts(30.0)[1].removed);
+        assert!(!l.parts(30.0)[0].removed && !l.parts(30.0)[2].removed);
+        assert_eq!(l.output_duration(30.0), 22.0);
+        assert_eq!(l.to_output(9.0), Some(9.0));
+        assert_eq!(l.to_output(12.0), None);
+        assert_eq!(l.to_output(18.0), Some(10.0), "the far side follows on");
+        assert_eq!(l.resume_after(12.0), Some(18.0), "playing skips the gap");
+        assert_eq!(l.resume_after(9.0), None);
+        assert!(l.problems(30.0).is_empty());
+
+        // Either side can go too, and the first part going is the opening
+        // being trimmed off.
+        l.remove_part(0.0, 10.0);
+        assert_eq!(l.output_duration(30.0), 12.0);
+        assert_eq!(l.resume_after(0.0), Some(18.0), "through touching gaps");
+        assert!((l.to_source(0.0) - 18.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_cut_is_refused_where_it_would_split_nothing() {
+        let mut l = EditList::new();
+        assert!(!l.cut_at(0.0, 30.0), "at the very start");
+        assert!(!l.cut_at(30.0, 30.0), "at the very end");
+        assert!(l.cut_at(10.0, 30.0));
+        assert!(!l.cut_at(10.05, 30.0), "on top of another");
+        l.add(20.0, 25.0, Tool::Cut);
+        assert!(!l.cut_at(22.0, 30.0), "inside footage already removed");
+        assert_eq!(l.cuts, vec![10.0]);
+    }
+
+    #[test]
+    fn a_removed_part_can_be_put_back_and_a_cut_joined() {
+        let mut l = EditList::new();
+        l.cut_at(10.0, 30.0);
+        l.remove_part(10.0, 30.0);
+        assert_eq!(l.output_duration(30.0), 10.0);
+        l.restore_part(10.0, 30.0);
+        assert_eq!(l.output_duration(30.0), 30.0);
+        assert!(l.effects.is_empty());
+
+        // Joining only takes the cut away: what was removed beside it is an
+        // edit of its own, still listed and still removed.
+        l.remove_part(10.0, 30.0);
+        l.join(10.0);
+        assert!(l.cuts.is_empty());
+        assert_eq!(l.output_duration(30.0), 10.0);
+    }
+
+    #[test]
+    fn removing_a_part_takes_the_time_edits_inside_it_along() {
+        let mut l = list(&[
+            (11.0, 13.0, Tool::Speed { rate: 2.0 }),
+            (5.0, 25.0, Tool::Mute),
+            (14.0, 28.0, Tool::Speed { rate: 4.0 }),
+        ]);
+        l.cut_at(10.0, 30.0);
+        l.cut_at(20.0, 30.0);
+        l.remove_part(10.0, 20.0);
+
+        assert!(l.problems(30.0).is_empty(), "{:?}", l.problems(30.0));
+        assert!(
+            !l.effects
+                .iter()
+                .any(|e| matches!(e.tool, Tool::Speed { rate } if rate == 2.0)),
+            "the speed-up inside the part went with it"
+        );
+        let speed = l
+            .effects
+            .iter()
+            .find(|e| matches!(e.tool, Tool::Speed { rate } if rate == 4.0))
+            .unwrap();
+        assert_eq!(
+            (speed.start, speed.end),
+            (20.0, 28.0),
+            "trimmed to the edge"
+        );
+        assert!(
+            l.effects
+                .iter()
+                .any(|e| e.tool == Tool::Mute && e.span() == 20.0),
+            "an edit that changes no time is left alone"
+        );
+    }
+
+    #[test]
+    fn an_edit_across_a_removed_part_keeps_both_sides() {
+        let mut l = list(&[(2.0, 28.0, Tool::Speed { rate: 2.0 })]);
+        l.remove_part(10.0, 20.0);
+        let mut spans: Vec<(f64, f64)> = l
+            .effects
+            .iter()
+            .filter(|e| matches!(e.tool, Tool::Speed { .. }))
+            .map(|e| (e.start, e.end))
+            .collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(spans, vec![(2.0, 10.0), (20.0, 28.0)]);
+        assert!(l.problems(30.0).is_empty());
+    }
+
+    #[test]
+    fn moving_a_cut_moves_the_edge_of_the_gap_with_it() {
+        let mut l = EditList::new();
+        l.cut_at(10.0, 30.0);
+        l.cut_at(20.0, 30.0);
+        l.remove_part(10.0, 20.0);
+        assert_eq!(l.move_cut(10.0, 8.0, 30.0), 8.0);
+        assert_eq!(l.cuts, vec![8.0, 20.0]);
+        let gap = l.effects.iter().find(|e| e.tool == Tool::Cut).unwrap();
+        assert_eq!((gap.start, gap.end), (8.0, 20.0));
+        // It stops short of its neighbour rather than crossing it.
+        let landed = l.move_cut(8.0, 25.0, 30.0);
+        assert!(landed < 20.0, "landed at {landed}");
+        assert!(
+            l.parts(30.0)
+                .iter()
+                .all(|p| p.end - p.start >= MIN_SPAN - 1e-9)
+        );
+    }
+
+    #[test]
+    fn cuts_round_trip_and_an_old_list_without_them_still_loads() {
+        let mut l = EditList::new();
+        l.cut_at(4.5, 30.0);
+        let text = serde_json::to_string(&l).unwrap();
+        assert!(text.contains("\"cuts\":[4.5]"), "{text}");
+        let back: EditList = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, l);
+
+        let uncut = serde_json::to_string(&EditList::new()).unwrap();
+        assert!(
+            !uncut.contains("cuts"),
+            "nothing written when uncut: {uncut}"
+        );
+        let old: EditList = serde_json::from_str(
+            r#"{"effects":[{"id":1,"start":1.0,"end":2.0,"tool":"cut"}],"next_id":1}"#,
+        )
+        .unwrap();
+        assert!(old.cuts.is_empty());
+        assert_eq!(old.parts(10.0).len(), 1);
+        assert_eq!(old.output_duration(10.0), 9.0);
     }
 
     #[test]

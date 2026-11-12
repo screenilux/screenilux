@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { byOrder, clock, focusAt, type Hit, type Manifest, pageAt, type Screen, search, type TextIndex } from "./share";
+import { byOrder, clock, focusAt, type Hit, type Manifest, pageAt, removedSpans, resumeAfter, type Screen, search, type TextIndex } from "./share";
 
 type Layout = "follow" | "side" | "stack";
 
@@ -25,6 +25,9 @@ export function Player({ base, manifest, text }: Props) {
   const screens = useMemo(() => byOrder(manifest), [manifest]);
   const lead = screens.find((s) => s.audio) ?? screens[0]!;
   const many = screens.length > 1;
+  // The parts cut out in the app. Playing runs straight over them, on every
+  // screen at once, so the gap closes up as it does in an exported video.
+  const gaps = useMemo(() => removedSpans(manifest), [manifest]);
 
   const videos = useRef(new Map<string, HTMLVideoElement>());
   const shell = useRef<HTMLDivElement>(null);
@@ -54,7 +57,15 @@ export function Player({ base, manifest, text }: Props) {
       const master = videos.current.get(lead.file);
       if (master) {
         setTime((t) => (Math.abs(t - master.currentTime) > 0.04 ? master.currentTime : t));
-        if (!master.paused) {
+        const to = master.paused ? undefined : resumeAfter(gaps, master.currentTime);
+        if (to !== undefined) {
+          const end = to >= master.duration - 0.05;
+          for (const v of videos.current.values()) {
+            if (end) v.pause();
+            v.currentTime = end ? master.duration : to;
+          }
+          if (end) setPlaying(false);
+        } else if (!master.paused) {
           for (const [file, v] of videos.current) {
             if (file !== lead.file && Math.abs(v.currentTime - master.currentTime) > DRIFT) {
               v.currentTime = master.currentTime;
@@ -66,7 +77,7 @@ export function Player({ base, manifest, text }: Props) {
     };
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
-  }, [lead.file]);
+  }, [lead.file, gaps]);
 
   const all = () => [...videos.current.values()];
 
