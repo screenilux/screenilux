@@ -6,11 +6,12 @@
 //! Sharing to Screenilux needs no key at all.
 //!
 //! The links themselves are kept too ([`Shares`]), so a recording's link is
-//! there in the Play tab, next time as well, until it expires.
+//! there in the Play tab, next time as well, until the share is deleted.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use screenilux_core::package;
@@ -182,9 +183,8 @@ fn recording(path: &Path) -> Result<Contents, String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Kept {
     link: String,
-    /// When it stops working, in seconds since 1970, if it does.
-    expires: Option<u64>,
-    /// The right to add to the share, such as its text later.
+    /// The right to add to the share, such as its text later, and to
+    /// delete it.
     #[serde(default)]
     rights: Option<Rights>,
 }
@@ -203,8 +203,14 @@ pub enum Link {
     },
     Ready {
         link: String,
-        expires: Option<SystemTime>,
+        /// Whether it can be deleted from here: links kept before shares
+        /// could be deleted cannot.
+        deletable: bool,
+        /// Why deleting it did not work, the last time it was tried.
+        trouble: Option<String>,
     },
+    /// Deleting the share.
+    Deleting,
     Failed(String),
 }
 
@@ -215,12 +221,19 @@ enum Live {
     Refused(String),
 }
 
+/// How a delete running on its own thread went, once it has.
+type Outcome = Arc<Mutex<Option<Result<(), String>>>>;
+
 /// Every recording shared from this computer and its link.
 pub struct Shares {
     kept: HashMap<PathBuf, Kept>,
     live: HashMap<PathBuf, Live>,
     /// Links put on the clipboard already, so each is copied once.
     copied: Vec<String>,
+    /// Shares being deleted, and how it went once it has.
+    deleting: HashMap<PathBuf, Outcome>,
+    /// Why deleting a share did not work.
+    trouble: HashMap<PathBuf, String>,
 }
 
 /// The same file, however it was reached.
@@ -228,22 +241,50 @@ fn key(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn seconds(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-}
-
 impl Shares {
     pub fn load() -> Self {
-        let now = seconds(SystemTime::now());
         let kept: HashMap<PathBuf, Kept> = read_json::<HashMap<PathBuf, Kept>>(LINKS)
             .unwrap_or_default()
             .into_iter()
-            .filter(|(path, k)| k.expires.is_none_or(|e| e > now) && path.exists())
+            .filter(|(path, _)| path.exists())
             .collect();
         Self {
             kept,
             live: HashMap::new(),
             copied: Vec::new(),
+            deleting: HashMap::new(),
+            trouble: HashMap::new(),
+        }
+    }
+
+    /// Delete `path`'s share wherever it went, on a thread of its own, so
+    /// its link stops working; the recording here stays. `bucket` is the
+    /// bucket settings as they are now, for a share in the user's own.
+    pub fn delete(&mut self, path: &Path, bucket: &Bucket) {
+        let key = key(path);
+        let Some(rights) = self.kept.get(&key).and_then(|k| k.rights.clone()) else {
+            return;
+        };
+        if self.deleting.contains_key(&key) {
+            return;
+        }
+        self.trouble.remove(&key);
+        let result = Arc::new(Mutex::new(None));
+        let shared = Arc::clone(&result);
+        let bucket = bucket.clone();
+        let spawned = std::thread::Builder::new()
+            .name("unshare".into())
+            .spawn(move || {
+                let r = screenilux_share::delete(&rights, Some(&bucket)).map_err(|e| e.to_string());
+                *shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+            });
+        match spawned {
+            Ok(_) => {
+                self.deleting.insert(key, result);
+            }
+            Err(e) => {
+                self.trouble.insert(key, e.to_string());
+            }
         }
     }
 
@@ -266,6 +307,9 @@ impl Shares {
 
     pub fn of(&self, path: &Path) -> Link {
         let key = key(path);
+        if self.deleting.contains_key(&key) {
+            return Link::Deleting;
+        }
         match self.live.get(&key) {
             Some(Live::Refused(e)) => return Link::Failed(e.clone()),
             Some(Live::Uploading(upload, _)) => {
@@ -274,7 +318,8 @@ impl Shares {
                     (State::Failed(e), _) => Link::Failed(e),
                     (State::Ready, Some(link)) => Link::Ready {
                         link,
-                        expires: p.expires,
+                        deletable: p.rights.is_some(),
+                        trouble: None,
                     },
                     (_, Some(link)) => Link::Uploading {
                         link,
@@ -292,15 +337,39 @@ impl Shares {
         match self.kept.get(&key) {
             Some(k) => Link::Ready {
                 link: k.link.clone(),
-                expires: k.expires.map(|s| UNIX_EPOCH + Duration::from_secs(s)),
+                deletable: k.rights.is_some(),
+                trouble: self.trouble.get(&key).cloned(),
             },
             None => Link::None,
         }
     }
 
-    /// Keep links whose upload has finished, and return a link that has
-    /// just come to exist, to put on the clipboard once.
+    /// Keep links whose upload has finished, forget those whose share has
+    /// been deleted, and return a link that has just come to exist, to put
+    /// on the clipboard once.
     pub fn poll(&mut self) -> Option<String> {
+        let mut changed = false;
+        let deleted: Vec<_> = self
+            .deleting
+            .iter()
+            .filter_map(|(path, r)| {
+                let r = r.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+                Some((path.clone(), r))
+            })
+            .collect();
+        for (path, result) in deleted {
+            self.deleting.remove(&path);
+            match result {
+                Ok(()) => {
+                    self.kept.remove(&path);
+                    changed = true;
+                }
+                Err(e) => {
+                    self.trouble.insert(path, e);
+                }
+            }
+        }
+
         let mut fresh = None;
         let mut finished = Vec::new();
         for (path, live) in &self.live {
@@ -316,24 +385,18 @@ impl Shares {
                 fresh = Some(link.clone());
             }
             if let (State::Ready, Some(link)) = (&p.state, &p.link) {
-                finished.push((path.clone(), link.clone(), p.expires, p.rights.clone()));
+                finished.push((path.clone(), link.clone(), p.rights.clone()));
                 if *remove_after && let Err(e) = std::fs::remove_file(path) {
                     tracing::warn!(path = %path.display(), error = %e, "could not remove the uploaded recording");
                 }
             }
         }
-        if !finished.is_empty() {
-            for (path, link, expires, rights) in finished {
-                self.live.remove(&path);
-                self.kept.insert(
-                    path,
-                    Kept {
-                        link,
-                        expires: expires.map(seconds),
-                        rights,
-                    },
-                );
-            }
+        for (path, link, rights) in finished {
+            self.live.remove(&path);
+            self.kept.insert(path, Kept { link, rights });
+            changed = true;
+        }
+        if changed {
             write_json(LINKS, &self.kept);
         }
         fresh
@@ -348,6 +411,8 @@ pub enum Asked {
     Export(screenilux_export::Format, screenilux_export::Shape),
     /// Put the recording away and go back to the list.
     Back,
+    /// Delete the recording's share, so its link stops working.
+    Delete,
 }
 
 /// How long "Copied" shows after copying.
@@ -362,17 +427,44 @@ fn readable(link: &str) -> String {
         .to_string()
 }
 
-fn when(expires: SystemTime) -> String {
-    let left = expires
-        .duration_since(SystemTime::now())
-        .unwrap_or_default()
-        .as_secs();
-    match left / 86_400 {
-        0 if left < 3600 => "expires within the hour".into(),
-        0 => "expires today".into(),
-        1 => "expires tomorrow".into(),
-        days => format!("expires in {days} days"),
+/// How long Delete waits for its second click before standing down.
+const DELETE_WINDOW: Duration = Duration::from_secs(3);
+
+/// Delete, which asks for a second click within a few seconds, so one slip
+/// beside Copy cannot break a link that was sent. True on the second click.
+fn delete_button(ui: &mut egui::Ui, link: &str) -> bool {
+    let p = theme::palette(ui);
+    let id = egui::Id::NULL.with(("delete", link));
+    let armed = ui
+        .data(|d| d.get_temp::<Instant>(id))
+        .is_some_and(|t| t.elapsed() < DELETE_WINDOW);
+    let (label, text) = if armed {
+        (format!("{}  Click again to delete", icon::DELETE), p.signal)
+    } else {
+        (icon::DELETE.to_string(), p.text)
+    };
+    let button = egui::Button::new(egui::RichText::new(label).color(text))
+        .fill(p.base)
+        .stroke(egui::Stroke::new(1.0, p.stroke))
+        .corner_radius(egui::CornerRadius::same(10))
+        .min_size(egui::vec2(34.0, 34.0));
+    let clicked = ui
+        .add(button)
+        .on_hover_text(
+            "Delete the shared copy, so the link stops working. The recording here stays.",
+        )
+        .clicked();
+    if armed {
+        ui.ctx().request_repaint_after(DELETE_WINDOW);
     }
+    if clicked && armed {
+        ui.data_mut(|d| d.remove::<Instant>(id));
+        return true;
+    }
+    if clicked {
+        ui.data_mut(|d| d.insert_temp(id, Instant::now()));
+    }
+    false
 }
 
 /// A copy button that says "Copied" for a moment after it is used.
@@ -466,20 +558,29 @@ pub fn link_panel(ui: &mut egui::Ui, link: &Link) -> Option<Asked> {
                 );
             });
             ui.add_space(6.0);
-            link_row(ui, link, false);
+            link_row(ui, link, false, false);
         }
-        Link::Ready { link, expires } => {
-            let mut text = "Ready to watch. Only people with the link can.".to_string();
-            if let Some(e) = expires {
-                text = format!(
-                    "Ready to watch, {}. Only people with the link can.",
-                    when(*e)
-                );
-            }
-            status(ui, icon::CHECK, p.signal, text);
+        Link::Ready {
+            link,
+            deletable,
+            trouble,
+        } => {
+            status(
+                ui,
+                icon::CHECK,
+                p.signal,
+                "Ready to watch. Only people with the link can.".into(),
+            );
             ui.add_space(6.0);
-            link_row(ui, link, true);
+            if link_row(ui, link, true, *deletable) {
+                asked = Some(Asked::Delete);
+            }
+            if let Some(e) = trouble {
+                ui.add_space(6.0);
+                theme::notice(ui, format!("Could not delete it: {e}"));
+            }
         }
+        Link::Deleting => deleting(ui),
         Link::Failed(e) => {
             theme::notice(ui, format!("Could not share it: {e}"));
             if ui.add(theme::outline("Try again")).clicked() {
@@ -490,8 +591,21 @@ pub fn link_panel(ui: &mut egui::Ui, link: &Link) -> Option<Asked> {
     asked
 }
 
-/// The link across the whole width, then copy and open under it.
-fn link_row(ui: &mut egui::Ui, link: &str, ready: bool) {
+fn deleting(ui: &mut egui::Ui) {
+    let p = theme::palette(ui);
+    ui.horizontal(|ui| {
+        ui.spinner();
+        ui.label(
+            egui::RichText::new("Deleting the share…")
+                .size(13.0)
+                .color(p.weak),
+        );
+    });
+}
+
+/// The link across the whole width, then copy, open and maybe delete under
+/// it. True when Delete has been confirmed.
+fn link_row(ui: &mut egui::Ui, link: &str, ready: bool, deletable: bool) -> bool {
     let p = theme::palette(ui);
     egui::Frame::new()
         .fill(p.base)
@@ -510,7 +624,9 @@ fn link_row(ui: &mut egui::Ui, link: &str, ready: bool) {
     ui.horizontal(|ui| {
         copy_button(ui, link, ready);
         open_button(ui, link);
-    });
+        deletable && delete_button(ui, link)
+    })
+    .inner
 }
 
 /// The link in brief, for the Play tab's title row.
@@ -540,16 +656,23 @@ pub fn link_chip(ui: &mut egui::Ui, link: &Link, can_share: bool) -> Option<Aske
                     .color(p.weak),
             );
         }
-        Link::Ready { link, expires } => {
+        Link::Ready {
+            link,
+            deletable,
+            trouble,
+        } => {
             open_button(ui, link);
             copy_button(ui, link, true);
-            if let Some(e) = expires {
-                ui.label(
-                    egui::RichText::new(format!("Link {}", when(*e)))
-                        .size(13.0)
-                        .color(p.weak),
-                );
+            if *deletable && delete_button(ui, link) {
+                asked = Some(Asked::Delete);
             }
+            if let Some(e) = trouble {
+                ui.label(egui::RichText::new(icon::WARNING).color(p.signal))
+                    .on_hover_text(format!("Could not delete it: {e}"));
+            }
+        }
+        Link::Deleting => {
+            ui.spinner();
         }
         Link::Failed(e) => {
             if ui
@@ -613,19 +736,10 @@ mod tests {
     }
 
     #[test]
-    fn expiry_reads_in_days() {
-        let now = SystemTime::now();
-        assert_eq!(
-            when(now + Duration::from_secs(7 * 86_400 + 60)),
-            "expires in 7 days"
-        );
-        assert_eq!(
-            when(now + Duration::from_secs(86_400 + 60)),
-            "expires tomorrow"
-        );
-        assert_eq!(
-            when(now + Duration::from_secs(600)),
-            "expires within the hour"
-        );
+    fn links_kept_with_an_expiry_still_load() {
+        let kept: Kept =
+            serde_json::from_str(r#"{"link":"https://x/v/a#k=b","expires":1794484127}"#).unwrap();
+        assert_eq!(kept.link, "https://x/v/a#k=b");
+        assert!(kept.rights.is_none());
     }
 }

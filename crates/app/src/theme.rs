@@ -62,6 +62,7 @@ icons! {
     OPEN => "\u{E8A7}", "\u{2197}";
     SETTINGS => "\u{E713}", "\u{2699}";
     DISCARD => "\u{E711}", "\u{2715}";
+    DELETE => "\u{E74D}", "\u{1F5D1}";
 }
 
 /// The named colours. Two sets, picked by the system theme.

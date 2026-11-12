@@ -106,6 +106,9 @@ pub(crate) trait Store: Send {
     fn complete(&self) -> Result<(), ShareError>;
     /// Remove what an upload that failed had sent.
     fn discard(&self, names: &[String]) -> Result<(), ShareError>;
+    /// Remove the whole share, every file of it. A share that is gone
+    /// already is no trouble.
+    fn delete(&self) -> Result<(), ShareError>;
 }
 
 /// The Screenilux storage.
@@ -283,13 +286,19 @@ impl Store for Hosted {
     }
 
     fn discard(&self, _names: &[String]) -> Result<(), ShareError> {
-        answer(
+        self.delete()
+    }
+
+    fn delete(&self) -> Result<(), ShareError> {
+        match answer(
             self.agent
                 .delete(&self.recording)
                 .header("Authorization", &self.auth)
                 .call(),
-        )?;
-        Ok(())
+        ) {
+            Ok(_) | Err(ShareError::Refused(404, _)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -468,10 +477,41 @@ impl Store for Own {
 
     fn discard(&self, names: &[String]) -> Result<(), ShareError> {
         for name in names {
-            let key = self.key(name);
-            let action = self.bucket.delete_object(Some(&self.credentials), &key);
-            answer(self.agent.delete(action.sign(SIGNED_FOR).as_str()).call())?;
+            self.delete_key(&self.key(name))?;
         }
+        Ok(())
+    }
+
+    /// Everything under the share's folder, a page of the listing at a time.
+    fn delete(&self) -> Result<(), ShareError> {
+        let mut token: Option<String> = None;
+        loop {
+            let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
+            action.with_prefix(self.prefix.as_str());
+            if let Some(t) = &token {
+                action.with_continuation_token(t.as_str());
+            }
+            let xml = answer(self.agent.get(action.sign(SIGNED_FOR).as_str()).call())?
+                .body_mut()
+                .read_to_string()?;
+            let page = rusty_s3::actions::ListObjectsV2::parse_response(&xml).map_err(|e| {
+                ShareError::Bucket(format!("an unexpected answer from the bucket: {e}"))
+            })?;
+            for object in &page.contents {
+                self.delete_key(&object.key)?;
+            }
+            match page.next_continuation_token {
+                Some(t) => token = Some(t),
+                None => return Ok(()),
+            }
+        }
+    }
+}
+
+impl Own {
+    fn delete_key(&self, key: &str) -> Result<(), ShareError> {
+        let action = self.bucket.delete_object(Some(&self.credentials), key);
+        answer(self.agent.delete(action.sign(SIGNED_FOR).as_str()).call())?;
         Ok(())
     }
 }

@@ -183,7 +183,7 @@ function Shared({ link }: { link: Exclude<Link, { kind: "incomplete" }> }) {
     case "missing":
       return (
         <Notice title="This recording isn't here">
-          The link may be mistyped, or the recording has expired. Recordings shared on Screenilux last 7 days.
+          The link may be mistyped, or the recording has been deleted.
         </Notice>
       );
     case "locked":
@@ -242,7 +242,7 @@ function Shared({ link }: { link: Exclude<Link, { kind: "incomplete" }> }) {
     case "ready":
       return (
         <>
-          <Title title={title!} manifest={state.manifest} expires={state.status?.expires} />
+          <Title title={title!} manifest={state.manifest} />
           <Player base={state.base} manifest={state.manifest} text={state.text} />
         </>
       );
@@ -258,7 +258,7 @@ function titleOf(manifest: Manifest): string {
   return manifest.title?.trim() || `Recording, ${when(manifest.created)}`;
 }
 
-function Title({ title, manifest, expires }: { title: string; manifest: Manifest; expires?: string }) {
+function Title({ title, manifest }: { title: string; manifest: Manifest }) {
   const screens = manifest.screens.length;
   return (
     <header className="mb-4 flex flex-wrap items-center gap-x-4 gap-y-1">
@@ -269,7 +269,6 @@ function Title({ title, manifest, expires }: { title: string; manifest: Manifest
         <h1 className="truncate text-lg font-semibold">{title}</h1>
         <p className="text-sm text-weak">
           {screens > 1 ? `${screens} screens` : "1 screen"} · Recorded {when(manifest.created)}
-          {expires && ` · Available until ${when(expires)}`}
         </p>
       </div>
     </header>
