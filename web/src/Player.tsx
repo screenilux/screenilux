@@ -207,53 +207,54 @@ export function Player({ base, manifest, text }: Props) {
   );
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4 lg:flex-row">
+    <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
       <div
         ref={shell}
         className={
           full
             ? "relative flex h-full w-full flex-col bg-black"
-            : "flex min-h-[320px] flex-1 flex-col overflow-hidden rounded-[20px] border border-mist bg-surface"
+            : "flex min-h-[60vh] min-w-0 flex-1 flex-col lg:min-h-0"
         }
         style={full && idle ? { cursor: "none" } : undefined}
       >
         <div
-          ref={stage}
-          className={`relative min-h-0 flex-1 ${full ? "" : "m-3 mb-0 rounded-[12px] bg-stage"}`}
+          className={`relative flex min-h-0 flex-1 ${full ? "" : "bg-stage p-4"}`}
           onClick={onStageClick}
           onDoubleClick={(e) => {
             if (!(e.target as HTMLElement).closest(".word")) toggleFull();
           }}
         >
-          <div
-            className={`absolute inset-0 flex items-center justify-center ${arranged === "stack" ? "flex-col" : "flex-row"}`}
-            style={{ gap: GAP }}
-          >
-            {screens.map((s) => {
-              const on = visible.includes(s);
-              // Laid out as the screens stood on the desk, left to right or
-              // top to bottom.
-              const place = arranged === "stack" ? s.top : s.left;
-              return (
-                <ScreenView
-                  key={s.file}
-                  screen={s}
-                  place={place}
-                  src={`${base}${s.file}`}
-                  width={on ? s.width * scale : 1}
-                  height={on ? s.height * scale : 1}
-                  hidden={!on}
-                  label={many ? s.label : undefined}
-                  text={!playing && on && text ? pageAt(text, s.file, time) : undefined}
-                  register={(v) => {
-                    if (v) videos.current.set(s.file, v);
-                    else videos.current.delete(s.file);
-                  }}
-                  onDuration={s.file === lead.file ? setDuration : undefined}
-                  onEnded={s.file === lead.file ? () => setPlaying(false) : undefined}
-                />
-              );
-            })}
+          <div ref={stage} className="relative min-h-0 flex-1">
+            <div
+              className={`absolute inset-0 flex items-center justify-center ${arranged === "stack" ? "flex-col" : "flex-row"}`}
+              style={{ gap: GAP }}
+            >
+              {screens.map((s) => {
+                const on = visible.includes(s);
+                // Laid out as the screens stood on the desk, left to right or
+                // top to bottom.
+                const place = arranged === "stack" ? s.top : s.left;
+                return (
+                  <ScreenView
+                    key={s.file}
+                    screen={s}
+                    place={place}
+                    src={`${base}${s.file}`}
+                    width={on ? s.width * scale : 1}
+                    height={on ? s.height * scale : 1}
+                    hidden={!on}
+                    label={many ? s.label : undefined}
+                    text={!playing && on && text ? pageAt(text, s.file, time) : undefined}
+                    register={(v) => {
+                      if (v) videos.current.set(s.file, v);
+                      else videos.current.delete(s.file);
+                    }}
+                    onDuration={s.file === lead.file ? setDuration : undefined}
+                    onEnded={s.file === lead.file ? () => setPlaying(false) : undefined}
+                  />
+                );
+              })}
+            </div>
           </div>
         </div>
         {full ? (
@@ -263,12 +264,12 @@ export function Player({ base, manifest, text }: Props) {
             <div className="mx-auto max-w-4xl rounded-[16px] border border-mist bg-ground/95">{controls}</div>
           </div>
         ) : (
-          controls
+          <div className="shrink-0 border-t border-mist">{controls}</div>
         )}
       </div>
 
       {text && !full && (
-        <aside className="flex max-h-[60vh] w-full flex-col rounded-[20px] border border-mist bg-surface p-3 lg:max-h-none lg:w-80">
+        <aside className="flex max-h-[60vh] w-full shrink-0 flex-col border-t border-mist p-3 lg:max-h-none lg:w-80 lg:border-t-0 lg:border-l">
           <label className="mb-2 px-1 text-sm font-semibold" htmlFor="search">
             Search the recording
           </label>

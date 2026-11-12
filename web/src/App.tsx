@@ -47,22 +47,16 @@ export function App() {
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
-  return (
-    <div className="flex min-h-dvh flex-col">
-      <main className="mx-auto flex w-full max-w-[1600px] flex-1 flex-col px-4 pt-4 pb-6 sm:px-6">
-        {!link ? (
-          <Home />
-        ) : link.kind === "incomplete" ? (
-          <Notice title="This link is incomplete">
-            Part of the link is missing. Ask whoever sent it to send it again, and copy all of it, including everything
-            after the #.
-          </Notice>
-        ) : (
-          <Shared key={JSON.stringify(link)} link={link} />
-        )}
-      </main>
-    </div>
-  );
+  if (!link) return <Home />;
+  if (link.kind === "incomplete") {
+    return (
+      <Notice title="This link is incomplete">
+        Part of the link is missing. Ask whoever sent it to send it again, and copy all of it, including everything
+        after the #.
+      </Notice>
+    );
+  }
+  return <Shared key={JSON.stringify(link)} link={link} />;
 }
 
 class Unsupported extends Error {}
@@ -241,10 +235,11 @@ function Shared({ link }: { link: Exclude<Link, { kind: "incomplete" }> }) {
     }
     case "ready":
       return (
-        <>
+        // The player is the page: a slim bar on top, the screens edge to edge.
+        <div className="flex min-h-dvh flex-col lg:h-dvh">
           <Title title={title!} manifest={state.manifest} />
           <Player base={state.base} manifest={state.manifest} text={state.text} />
-        </>
+        </div>
       );
   }
 }
@@ -261,13 +256,13 @@ function titleOf(manifest: Manifest): string {
 function Title({ title, manifest }: { title: string; manifest: Manifest }) {
   const screens = manifest.screens.length;
   return (
-    <header className="mb-4 flex flex-wrap items-center gap-x-4 gap-y-1">
+    <header className="flex shrink-0 items-center gap-3 border-b border-mist px-4 py-2 sm:px-5">
       <a href="https://github.com/screenilux/screenilux" aria-label="Screenilux" className="shrink-0">
-        <Logo size={32} />
+        <Logo size={24} />
       </a>
-      <div className="min-w-0 flex-1">
-        <h1 className="truncate text-lg font-semibold">{title}</h1>
-        <p className="text-sm text-weak">
+      <div className="flex min-w-0 flex-1 flex-wrap items-baseline gap-x-3">
+        <h1 className="truncate font-semibold">{title}</h1>
+        <p className="truncate text-sm text-weak">
           {screens > 1 ? `${screens} screens` : "1 screen"} · Recorded {when(manifest.created)}
         </p>
       </div>
@@ -277,7 +272,7 @@ function Title({ title, manifest }: { title: string; manifest: Manifest }) {
 
 function Notice({ title, children }: { title: string; children?: React.ReactNode }) {
   return (
-    <div className="grid flex-1 place-items-center">
+    <main className="grid min-h-dvh place-items-center px-4 py-6">
       <div className="w-full max-w-md rounded-[20px] border border-mist bg-surface p-8 text-center">
         <div className="mb-5 flex justify-center">
           <Logo size={48} />
@@ -285,7 +280,7 @@ function Notice({ title, children }: { title: string; children?: React.ReactNode
         <h1 className="text-xl font-semibold">{title}</h1>
         {children && <div className="mt-2 text-weak">{children}</div>}
       </div>
-    </div>
+    </main>
   );
 }
 
