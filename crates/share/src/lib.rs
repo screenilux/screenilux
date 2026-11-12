@@ -20,7 +20,7 @@ mod store;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use screenilux_core::session::MANIFEST_NAME;
 use serde::{Deserialize, Serialize};
@@ -41,12 +41,19 @@ pub const KEPT_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// takes at most 100MB in one request; buckets need parts of at least 5MB.
 const PART: usize = 32 * 1024 * 1024;
 
+/// The tracing target of everything an upload logs: when a share starts,
+/// each request and how long it took, every try again, and how it ended.
+/// The app keeps these in a file, to look into a share that went wrong.
+/// Keys and signed addresses are never logged.
+pub const LOG: &str = "upload";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ShareError {
     #[error("could not reach the storage: {0}")]
     Network(String),
-    #[error("the storage refused the upload ({0})")]
-    Refused(u16),
+    /// The status, and what the storage said about it, if anything.
+    #[error("the storage refused the upload ({code}){why}", code = .0, why = because(.1))]
+    Refused(u16, String),
     #[error("the storage did not accept the upload")]
     NotAllowed,
     #[error("too many recordings were shared from this network just now; try again in a minute")]
@@ -66,9 +73,47 @@ impl From<ureq::Error> for ShareError {
         match e {
             ureq::Error::StatusCode(401 | 403) => ShareError::NotAllowed,
             ureq::Error::StatusCode(429) => ShareError::TooMany,
-            ureq::Error::StatusCode(code) => ShareError::Refused(code),
+            ureq::Error::StatusCode(code) => ShareError::Refused(code, String::new()),
             other => ShareError::Network(other.to_string()),
         }
+    }
+}
+
+impl ShareError {
+    /// A refusal with status `code`, and `body` as the storage sent it: the
+    /// Screenilux storage says why in JSON, a bucket in S3's XML.
+    pub(crate) fn refused(code: u16, body: &str) -> Self {
+        match code {
+            401 | 403 => ShareError::NotAllowed,
+            429 => ShareError::TooMany,
+            _ => ShareError::Refused(code, reason(body)),
+        }
+    }
+}
+
+/// The reason in a refusal's body, short enough to show.
+fn reason(body: &str) -> String {
+    #[derive(Deserialize)]
+    struct Problem {
+        error: String,
+    }
+    let said = if let Ok(p) = serde_json::from_str::<Problem>(body) {
+        p.error
+    } else if let Some((_, rest)) = body.split_once("<Message>")
+        && let Some((message, _)) = rest.split_once("</Message>")
+    {
+        message.to_string()
+    } else {
+        body.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    said.chars().take(200).collect()
+}
+
+fn because(reason: &str) -> String {
+    if reason.is_empty() {
+        String::new()
+    } else {
+        format!(": {reason}")
     }
 }
 
@@ -161,9 +206,23 @@ impl Upload {
         let thread = std::thread::Builder::new()
             .name("share".into())
             .spawn(move || {
-                if let Err(e) = run(&destination, &contents, &shared) {
-                    tracing::warn!(error = %e, "sharing failed");
-                    lock(&shared).state = State::Failed(e.to_string());
+                let started = Instant::now();
+                match run(&destination, &contents, &shared) {
+                    Ok(()) => tracing::info!(
+                        target: LOG,
+                        seconds = started.elapsed().as_secs(),
+                        "share ready"
+                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: LOG,
+                            error = %e,
+                            seconds = started.elapsed().as_secs(),
+                            uploaded = lock(&shared).uploaded,
+                            "share failed"
+                        );
+                        lock(&shared).state = State::Failed(e.to_string());
+                    }
                 }
             })
             .expect("spawning the upload thread");
@@ -187,7 +246,7 @@ fn run(
     contents: &Contents,
     progress: &Mutex<Progress>,
 ) -> Result<(), ShareError> {
-    let agent = ureq::Agent::new_with_defaults();
+    let agent = store::agent();
     let key = ShareKey::generate()?;
     let manifest = seal::seal(&key, &titled_manifest(contents)?)?;
     let files: Vec<&Item> = contents
@@ -197,6 +256,21 @@ fn run(
         .collect();
     let total = files.iter().map(|i| sealed_len(i.len)).sum::<u64>() + manifest.len() as u64;
     lock(progress).total = total;
+    tracing::info!(
+        target: LOG,
+        to = match destination {
+            Destination::Screenilux { server, .. } => server.as_str(),
+            Destination::Bucket(b) => b.endpoint.as_str(),
+        },
+        title = %contents.title,
+        files = %files
+            .iter()
+            .map(|i| format!("{} {}", i.name, i.len))
+            .collect::<Vec<_>>()
+            .join(", "),
+        total,
+        "share started"
+    );
 
     let (store, link): (Box<dyn Store>, String) = match destination {
         Destination::Screenilux { server, device } => {
@@ -209,6 +283,9 @@ fn run(
             (Box::new(own), link)
         }
     };
+    // The key, after the #, stays out of the log: the page alone opens
+    // nothing.
+    tracing::info!(target: LOG, page = link.split('#').next().unwrap_or_default(), "link made");
     {
         let mut p = lock(progress);
         p.link = Some(link);
@@ -231,11 +308,11 @@ fn run(
             )?;
             sent.push(item.name.clone());
         }
-        sending(&mut uploaded, progress, |counted| {
+        sending(MANIFEST_NAME, &mut uploaded, progress, |counted| {
             store.put(MANIFEST_NAME, &manifest, counted)
         })?;
         sent.push(MANIFEST_NAME.to_string());
-        retrying(|| store.complete())
+        retrying("complete", || store.complete())
     })();
 
     match result {
@@ -283,11 +360,11 @@ fn upload(
         reader
             .read_to_end(&mut body)
             .map_err(|e| ShareError::Read(e.to_string()))?;
-        return sending(uploaded, progress, |counted| {
+        return sending(name, uploaded, progress, |counted| {
             store.put(name, &body, counted)
         });
     }
-    let upload_id = retrying(|| store.start_parts(name))?;
+    let upload_id = retrying(&format!("{name}: start parts"), || store.start_parts(name))?;
     let mut etags = Vec::new();
     let mut buf = vec![0u8; PART];
     let parts = (|| {
@@ -297,11 +374,16 @@ fn upload(
                 break;
             }
             let number = etags.len() as u16 + 1;
-            etags.push(sending(uploaded, progress, |counted| {
-                store.put_part(name, &upload_id, number, &buf[..n], counted)
-            })?);
+            etags.push(sending(
+                &format!("{name}: part {number}"),
+                uploaded,
+                progress,
+                |counted| store.put_part(name, &upload_id, number, &buf[..n], counted),
+            )?);
         }
-        retrying(|| store.finish_parts(name, &upload_id, &etags))
+        retrying(&format!("{name}: finish parts"), || {
+            store.finish_parts(name, &upload_id, &etags)
+        })
     })();
     if parts.is_err() {
         let _ = store.abort_parts(name, &upload_id);
@@ -327,7 +409,7 @@ impl ShareError {
     fn is_passing(&self) -> bool {
         match self {
             ShareError::Network(_) => true,
-            ShareError::Refused(code) => *code == 408 || *code >= 500,
+            ShareError::Refused(code, _) => *code == 408 || *code >= 500,
             _ => false,
         }
     }
@@ -335,17 +417,30 @@ impl ShareError {
 
 /// Run `request`, trying again after a passing failure. Every request an
 /// upload makes can be repeated: a file or part sent again replaces the one
-/// before.
-fn retrying<T>(mut request: impl FnMut() -> Result<T, ShareError>) -> Result<T, ShareError> {
+/// before. `what` names the request in the log.
+fn retrying<T>(
+    what: &str,
+    mut request: impl FnMut() -> Result<T, ShareError>,
+) -> Result<T, ShareError> {
     let mut tries = 1;
     loop {
-        match request() {
+        let started = Instant::now();
+        let result = request();
+        let ms = started.elapsed().as_millis() as u64;
+        match result {
             Err(e) if tries < TRIES && e.is_passing() => {
-                tracing::info!(error = %e, tries, "an upload request failed; trying again");
+                tracing::warn!(target: LOG, what, tries, ms, error = %e, "failed; trying again");
                 std::thread::sleep(BACKOFF * (1 << (tries - 1)));
                 tries += 1;
             }
-            result => return result,
+            Err(e) => {
+                tracing::warn!(target: LOG, what, tries, ms, error = %e, "failed");
+                return Err(e);
+            }
+            Ok(v) => {
+                tracing::info!(target: LOG, what, tries, ms, "done");
+                return Ok(v);
+            }
         }
     }
 }
@@ -354,12 +449,13 @@ fn retrying<T>(mut request: impl FnMut() -> Result<T, ShareError>) -> Result<T, 
 /// the callback it is given, trying again as [`retrying`] does. Progress
 /// goes back to where it was before each try, so bytes are counted once.
 fn sending<T>(
+    what: &str,
     uploaded: &mut u64,
     progress: &Mutex<Progress>,
     mut request: impl FnMut(Sent<'_>) -> Result<T, ShareError>,
 ) -> Result<T, ShareError> {
     let before = *uploaded;
-    retrying(|| {
+    retrying(what, || {
         *uploaded = before;
         lock(progress).uploaded = before;
         request(&mut |n| {
@@ -400,7 +496,7 @@ pub fn add_text(
         .and_then(|(_, v)| ShareKey::from_link(&v))
         .ok_or_else(|| ShareError::Read("the link has no key".into()))?;
     let sealed = seal::seal(&key, index_json)?;
-    let agent = ureq::Agent::new_with_defaults();
+    let agent = store::agent();
     let store: Box<dyn Store> = match rights {
         Rights::Screenilux { recording, token } => {
             Box::new(Hosted::resume(agent, recording, token))
@@ -412,7 +508,9 @@ pub fn add_text(
             Box::new(Own::resume(agent, bucket, prefix)?)
         }
     };
-    retrying(|| store.put(screenilux_core::text::TEXT_INDEX_NAME, &sealed, &mut |_| {}))
+    retrying("text.json", || {
+        store.put(screenilux_core::text::TEXT_INDEX_NAME, &sealed, &mut |_| {})
+    })
 }
 
 /// A new id for this computer on the Screenilux storage, made once and kept.
@@ -443,6 +541,30 @@ mod tests {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         );
         assert_ne!(a, new_id().unwrap());
+    }
+
+    #[test]
+    fn a_refusal_keeps_the_reason_the_storage_gave() {
+        let e = ShareError::refused(400, r#"{"error":"That file is not part of a recording."}"#);
+        assert_eq!(
+            e.to_string(),
+            "the storage refused the upload (400): That file is not part of a recording."
+        );
+        let s3 = "<?xml version=\"1.0\"?><Error><Code>NoSuchBucket</Code>\
+                  <Message>The specified bucket does not exist.</Message></Error>";
+        assert_eq!(
+            ShareError::refused(404, s3).to_string(),
+            "the storage refused the upload (404): The specified bucket does not exist."
+        );
+        assert_eq!(
+            ShareError::refused(502, "").to_string(),
+            "the storage refused the upload (502)"
+        );
+        assert!(matches!(
+            ShareError::refused(403, ""),
+            ShareError::NotAllowed
+        ));
+        assert!(matches!(ShareError::refused(429, ""), ShareError::TooMany));
     }
 
     #[test]
@@ -541,7 +663,7 @@ mod tests {
 
     #[test]
     fn a_dropped_part_is_sent_again_and_counted_once() {
-        let store = Flaky::new(vec![reset(), ShareError::Refused(502)]);
+        let store = Flaky::new(vec![reset(), ShareError::Refused(502, String::new())]);
         let data = vec![7u8; PART + 1000];
         let (mut uploaded, p) = (0, progress());
         upload(
@@ -577,7 +699,7 @@ mod tests {
 
     #[test]
     fn a_refusal_is_not_tried_again() {
-        let store = Flaky::new(vec![ShareError::Refused(413)]);
+        let store = Flaky::new(vec![ShareError::Refused(413, String::new())]);
         let (mut uploaded, p) = (0, progress());
         let e = upload(
             &store,
@@ -587,7 +709,7 @@ mod tests {
             &mut uploaded,
             &p,
         );
-        assert!(matches!(e, Err(ShareError::Refused(413))));
+        assert!(matches!(e, Err(ShareError::Refused(413, _))));
         assert_eq!(*store.tries.lock().unwrap(), 1);
     }
 

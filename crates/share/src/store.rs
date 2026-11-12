@@ -21,6 +21,34 @@ const KIND: &str = "application/octet-stream";
 /// long request instead of jumping when it ends.
 pub(crate) type Sent<'a> = &'a mut dyn FnMut(usize);
 
+/// The agent every request goes through. A refusal is read like any other
+/// answer, so the reason the storage gives can be kept (see [`answer`]).
+pub(crate) fn agent() -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    )
+}
+
+/// The response, if the storage took the request; otherwise what it said
+/// about why not.
+pub(crate) fn answer(
+    response: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<ureq::http::Response<ureq::Body>, ShareError> {
+    let mut response = response?;
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let text = response
+        .body_mut()
+        .with_config()
+        .limit(16 * 1024)
+        .read_to_string()
+        .unwrap_or_default();
+    Err(ShareError::refused(response.status().as_u16(), &text))
+}
+
 /// Send `body` as the request's body, reporting each piece as it goes out.
 fn send_counted(
     request: ureq::RequestBuilder<ureq::typestate::WithBody>,
@@ -138,9 +166,10 @@ impl Hosted {
         if !response.status().is_success() {
             // The storage explains a refusal, such as no room left, in words
             // to show as they are.
-            return Err(match response.body_mut().read_json::<Problem>() {
+            let text = response.body_mut().read_to_string().unwrap_or_default();
+            return Err(match serde_json::from_str::<Problem>(&text) {
                 Ok(p) if status == 413 => ShareError::Declined(p.error),
-                _ => ShareError::Refused(status),
+                _ => ShareError::refused(status, &text),
             });
         }
         let created: Created = response.body_mut().read_json()?;
@@ -181,18 +210,19 @@ impl Store for Hosted {
             .put(format!("{}/{name}", self.recording))
             .header("Authorization", &self.auth)
             .header("Content-Type", KIND);
-        send_counted(request, body, sent)?;
+        answer(send_counted(request, body, sent))?;
         Ok(())
     }
 
     fn start_parts(&self, name: &str) -> Result<String, ShareError> {
-        let started: Started = self
-            .agent
-            .post(format!("{}/{name}/uploads", self.recording))
-            .header("Authorization", &self.auth)
-            .send_empty()?
-            .body_mut()
-            .read_json()?;
+        let started: Started = answer(
+            self.agent
+                .post(format!("{}/{name}/uploads", self.recording))
+                .header("Authorization", &self.auth)
+                .send_empty(),
+        )?
+        .body_mut()
+        .read_json()?;
         Ok(started.upload_id)
     }
 
@@ -211,7 +241,9 @@ impl Store for Hosted {
                 self.recording
             ))
             .header("Authorization", &self.auth);
-        let part: Part = send_counted(request, body, sent)?.body_mut().read_json()?;
+        let part: Part = answer(send_counted(request, body, sent))?
+            .body_mut()
+            .read_json()?;
         Ok(part.etag)
     }
 
@@ -221,34 +253,42 @@ impl Store for Hosted {
             .enumerate()
             .map(|(i, etag)| serde_json::json!({ "partNumber": i + 1, "etag": etag }))
             .collect();
-        self.agent
-            .post(format!("{}/{name}/uploads/{upload}", self.recording))
-            .header("Authorization", &self.auth)
-            .send_json(serde_json::json!({ "parts": parts }))?;
+        answer(
+            self.agent
+                .post(format!("{}/{name}/uploads/{upload}", self.recording))
+                .header("Authorization", &self.auth)
+                .send_json(serde_json::json!({ "parts": parts })),
+        )?;
         Ok(())
     }
 
     fn abort_parts(&self, name: &str, upload: &str) -> Result<(), ShareError> {
-        self.agent
-            .delete(format!("{}/{name}/uploads/{upload}", self.recording))
-            .header("Authorization", &self.auth)
-            .call()?;
+        answer(
+            self.agent
+                .delete(format!("{}/{name}/uploads/{upload}", self.recording))
+                .header("Authorization", &self.auth)
+                .call(),
+        )?;
         Ok(())
     }
 
     fn complete(&self) -> Result<(), ShareError> {
-        self.agent
-            .post(format!("{}/complete", self.recording))
-            .header("Authorization", &self.auth)
-            .send_empty()?;
+        answer(
+            self.agent
+                .post(format!("{}/complete", self.recording))
+                .header("Authorization", &self.auth)
+                .send_empty(),
+        )?;
         Ok(())
     }
 
     fn discard(&self, _names: &[String]) -> Result<(), ShareError> {
-        self.agent
-            .delete(&self.recording)
-            .header("Authorization", &self.auth)
-            .call()?;
+        answer(
+            self.agent
+                .delete(&self.recording)
+                .header("Authorization", &self.auth)
+                .call(),
+        )?;
         Ok(())
     }
 }
@@ -344,7 +384,7 @@ impl Store for Own {
             .agent
             .put(action.sign(SIGNED_FOR).as_str())
             .header("Content-Type", KIND);
-        send_counted(request, body, sent)?;
+        answer(send_counted(request, body, sent))?;
         Ok(())
     }
 
@@ -354,13 +394,14 @@ impl Store for Own {
             .bucket
             .create_multipart_upload(Some(&self.credentials), &key);
         action.headers_mut().insert("content-type", KIND);
-        let xml = self
-            .agent
-            .post(action.sign(SIGNED_FOR).as_str())
-            .header("Content-Type", KIND)
-            .send_empty()?
-            .body_mut()
-            .read_to_string()?;
+        let xml = answer(
+            self.agent
+                .post(action.sign(SIGNED_FOR).as_str())
+                .header("Content-Type", KIND)
+                .send_empty(),
+        )?
+        .body_mut()
+        .read_to_string()?;
         let created =
             rusty_s3::actions::CreateMultipartUpload::parse_response(&xml).map_err(|e| {
                 ShareError::Bucket(format!("an unexpected answer from the bucket: {e}"))
@@ -380,7 +421,11 @@ impl Store for Own {
         let action = self
             .bucket
             .upload_part(Some(&self.credentials), &key, number, upload);
-        let response = send_counted(self.agent.put(action.sign(SIGNED_FOR).as_str()), body, sent)?;
+        let response = answer(send_counted(
+            self.agent.put(action.sign(SIGNED_FOR).as_str()),
+            body,
+            sent,
+        ))?;
         let etag = response
             .headers()
             .get("etag")
@@ -402,7 +447,7 @@ impl Store for Own {
             etags.iter().map(String::as_str),
         );
         let url = action.sign(SIGNED_FOR);
-        self.agent.post(url.as_str()).send(action.body())?;
+        answer(self.agent.post(url.as_str()).send(action.body()))?;
         Ok(())
     }
 
@@ -411,7 +456,7 @@ impl Store for Own {
         let action = self
             .bucket
             .abort_multipart_upload(Some(&self.credentials), &key, upload);
-        self.agent.delete(action.sign(SIGNED_FOR).as_str()).call()?;
+        answer(self.agent.delete(action.sign(SIGNED_FOR).as_str()).call())?;
         Ok(())
     }
 
@@ -425,7 +470,7 @@ impl Store for Own {
         for name in names {
             let key = self.key(name);
             let action = self.bucket.delete_object(Some(&self.credentials), &key);
-            self.agent.delete(action.sign(SIGNED_FOR).as_str()).call()?;
+            answer(self.agent.delete(action.sign(SIGNED_FOR).as_str()).call())?;
         }
         Ok(())
     }

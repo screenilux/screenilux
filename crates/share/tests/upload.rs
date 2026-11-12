@@ -28,6 +28,8 @@ fn byte(i: usize) -> u8 {
 
 /// A two-screen package with a camera video, in a folder of its own.
 fn package(tag: &str) -> (PathBuf, PathBuf) {
+    // What the upload logs shows with --nocapture, as the app's log has it.
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let dir = std::env::temp_dir().join(format!("screenilux-{tag}-{}", std::process::id()));
     let folder = dir.join("session");
     std::fs::create_dir_all(&folder).unwrap();

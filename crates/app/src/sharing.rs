@@ -94,6 +94,26 @@ fn config_dir() -> Option<PathBuf> {
     })
 }
 
+/// A log past this size starts over, the old one kept beside it.
+const LOG_KEEP: u64 = 5 * 1024 * 1024;
+
+/// The file uploads are logged to, opened to add to: `logs\uploads.log` in
+/// the config folder. Once it has grown past [`LOG_KEEP`], it is moved to
+/// `uploads.old.log` and a new one starts, so at most two are kept.
+pub fn upload_log() -> Option<std::fs::File> {
+    let dir = config_dir()?.join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("uploads.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_KEEP) {
+        let _ = std::fs::rename(&path, dir.join("uploads.old.log"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
 pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(name: &str) -> Option<T> {
     let path = config_dir()?.join(name);
     let json = std::fs::read_to_string(&path).ok()?;
