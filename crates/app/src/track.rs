@@ -90,6 +90,8 @@ enum Grab {
     Moving { id: u32, offset: f64 },
     /// Dragging one end of an effect.
     Edge { id: u32, start_side: bool },
+    /// Moving a cut, which is where it is now.
+    Cut { at: f64 },
 }
 
 /// What the track keeps between frames.
@@ -108,6 +110,9 @@ pub struct State {
     /// Which effect is lit, which is also the one open in the list:
     /// selecting in one place selects in the other.
     pub opened: Option<u32>,
+    /// Which cut is lit, by where it is. At most one of this and `opened`
+    /// is set.
+    pub cut: Option<f64>,
 }
 
 impl State {
@@ -208,6 +213,16 @@ pub fn show(
         }
     }
 
+    // What is removed reads as a gap under everything: a hatched band, so
+    // the blocks over it still show what was there.
+    for part in edits.parts(dur).iter().filter(|q| q.removed) {
+        let band = egui::Rect::from_min_max(
+            egui::pos2(x_of(part.start), lanes_top - 2.0),
+            egui::pos2(x_of(part.end), lanes_bottom + 2.0),
+        );
+        gap(&painter, p, band);
+    }
+
     // Lay the blocks out before painting any, so hit testing and painting
     // agree about where they are.
     let blocks: Vec<Block> = edits
@@ -253,11 +268,32 @@ pub fn show(
     // are read off.
     let pointer = response.hover_pos().or(response.interact_pointer_pos());
     let hit = pointer.and_then(hit_at);
+    // A cut is grabbed anywhere down its line in the lanes, and wins over
+    // the block whose edge it shares: moving the cut moves that edge too.
+    let cuts = edits.cuts.clone();
+    let cut_at = |pos: egui::Pos2| {
+        (pos.y >= lanes_top - 4.0)
+            .then(|| {
+                cuts.iter()
+                    .copied()
+                    .map(|c| (c, (x_of(c) - pos.x).abs()))
+                    .filter(|(_, away)| *away <= GRIP)
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(c, _)| c)
+            })
+            .flatten()
+    };
+    let on_cut = pointer.and_then(cut_at);
 
     for b in &blocks {
         let on = st.opened == Some(b.id);
         let over = hit.map(|(id, ..)| id) == Some(b.id);
         block(&painter, p, b, on, over);
+    }
+
+    for &c in &cuts {
+        let lit = st.cut == Some(c) || on_cut == Some(c);
+        cut_line(&painter, p, x_of(c), lanes_top, lanes_bottom, lit);
     }
 
     // The playhead last, over everything: where you are reading from
@@ -285,9 +321,13 @@ pub fn show(
 
     let cursor = match (&st.grab, hit) {
         (Grab::Moving { .. }, _) => Some(egui::CursorIcon::Grabbing),
-        (Grab::Edge { .. } | Grab::Scrub { .. }, _) => Some(egui::CursorIcon::ResizeHorizontal),
+        (Grab::Edge { .. } | Grab::Scrub { .. } | Grab::Cut { .. }, _) => {
+            Some(egui::CursorIcon::ResizeHorizontal)
+        }
         (Grab::Selecting { .. }, _) => None,
-        (Grab::None, _) if on_head || in_ruler => Some(egui::CursorIcon::ResizeHorizontal),
+        (Grab::None, _) if on_head || in_ruler || on_cut.is_some() => {
+            Some(egui::CursorIcon::ResizeHorizontal)
+        }
         (Grab::None, Some((_, true, _) | (_, _, true))) => Some(egui::CursorIcon::ResizeHorizontal),
         (Grab::None, Some(_)) => Some(egui::CursorIcon::Grab),
         (Grab::None, None) => None,
@@ -318,7 +358,12 @@ pub fn show(
             st.asked = t;
             clock.seek(t);
             Grab::Scrub { was_playing }
+        } else if let Some(c) = cut_at(pos) {
+            st.cut = Some(c);
+            st.opened = None;
+            Grab::Cut { at: c }
         } else {
+            st.cut = None;
             match hit {
                 Some((id, true, _)) => {
                     st.opened = Some(id);
@@ -366,6 +411,21 @@ pub fn show(
                 }
             }
             Grab::Selecting { from } => st.selection = Some((from, t)),
+            Grab::Cut { at } => {
+                // A cut pulls onto the playhead only: the edges near it
+                // are its own gap's, which move with it.
+                let t = if (t - now).abs() <= SNAP as f64 * per_px {
+                    now
+                } else {
+                    t
+                };
+                let to = edits.move_cut(at, t, dur);
+                if to != at {
+                    st.grab = Grab::Cut { at: to };
+                    st.cut = Some(to);
+                    out.changed = true;
+                }
+            }
             Grab::Moving { id, offset } => {
                 let span = edits.get(id).map_or(MIN_SPAN, |m| m.span());
                 let want = (t - offset).clamp(0.0, (dur - span).max(0.0));
@@ -430,8 +490,16 @@ pub fn show(
         && matches!(st.grab, Grab::None)
         && let Some(pos) = response.interact_pointer_pos()
     {
-        match hit {
-            Some((id, ..)) if !ruler_band.contains(pos) => st.opened = Some(id),
+        let cut = cut_at(pos).filter(|_| !ruler_band.contains(pos));
+        match (cut, hit) {
+            (Some(c), _) => {
+                st.cut = Some(c);
+                st.opened = None;
+            }
+            (None, Some((id, ..))) if !ruler_band.contains(pos) => {
+                st.opened = Some(id);
+                st.cut = None;
+            }
             _ => {
                 st.selection = None;
                 clock.seek(t_of(pos.x));
@@ -512,6 +580,45 @@ fn block(painter: &egui::Painter, p: &theme::Palette, b: &Block, on: bool, over:
             );
         }
     }
+}
+
+/// A removed stretch: the groove darkened and struck through, so it reads
+/// as footage that is not there rather than as one more block.
+fn gap(painter: &egui::Painter, p: &theme::Palette, band: egui::Rect) {
+    painter.rect_filled(
+        band,
+        egui::CornerRadius::same(5),
+        theme::blend(p.stage, p.text, 0.16),
+    );
+    let hatch = painter.with_clip_rect(band.intersect(painter.clip_rect()));
+    let stroke = egui::Stroke::new(1.0, theme::blend(p.weak, p.stage, 0.55));
+    let mut x = band.left() - band.height();
+    while x < band.right() {
+        hatch.line_segment(
+            [
+                egui::pos2(x, band.bottom()),
+                egui::pos2(x + band.height(), band.top()),
+            ],
+            stroke,
+        );
+        x += 7.0;
+    }
+}
+
+/// A cut: a line down through the lanes with a tab at its head to grab.
+fn cut_line(painter: &egui::Painter, p: &theme::Palette, x: f32, top: f32, bottom: f32, lit: bool) {
+    let colour = if lit {
+        p.action
+    } else {
+        theme::blend(p.action, p.text, 0.25)
+    };
+    painter.vline(
+        x,
+        top - 3.0..=bottom + 3.0,
+        egui::Stroke::new(if lit { 2.5 } else { 1.8 }, colour),
+    );
+    let tab = egui::Rect::from_center_size(egui::pos2(x, top + 1.0), egui::vec2(9.0, 9.0));
+    painter.rect_filled(tab, egui::CornerRadius::same(2), colour);
 }
 
 /// The ruler: labels along the top of its band, marks standing on the line

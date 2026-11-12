@@ -150,6 +150,13 @@ fn shared_text(path: &Path, mut index: TextIndex) -> Option<Vec<u8>> {
 /// been made searchable, so the link can search and copy it too.
 pub fn contents(path: &Path) -> Result<Contents, String> {
     let mut contents = recording(path)?;
+    // The link plays the recording as it was edited: cut where it was cut,
+    // on every screen. A video nobody has edited has no details to add.
+    if let Some(details) = crate::edit_view::read_manifest(path) {
+        contents
+            .set_edits(details.edits.as_ref())
+            .map_err(|e| e.to_string())?;
+    }
     if !package::is_package(path)
         && let Some(json) =
             screenilux_player::open::stored_text(path).and_then(|i| shared_text(path, i))

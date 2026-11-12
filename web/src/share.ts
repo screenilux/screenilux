@@ -37,6 +37,42 @@ export interface Manifest {
   fps: number;
   screens: Screen[];
   focus?: { timeline: { t: number; screen: string }[] };
+  /** What was edited in the app before it was shared. Only what changes
+   * time is read here: the stretches cut out are skipped while playing. */
+  edits?: Edits;
+}
+
+export interface Edits {
+  effects?: { start: number; end: number; tool: string }[];
+  /** Where the recording was cut, in seconds; the parts between can be removed. */
+  cuts?: number[];
+}
+
+/** A stretch of the recording, in seconds. */
+export type Span = [start: number, end: number];
+
+/** The stretches taken out of a recording, cut out or trimmed off, in order. */
+export function removedSpans(manifest: Manifest): Span[] {
+  return (manifest.edits?.effects ?? [])
+    .filter((e) => e.tool === "cut" || e.tool === "trim")
+    .map((e): Span => [e.start, e.end])
+    .sort((a, b) => a[0] - b[0]);
+}
+
+/** Where playing picks up from `t` when `t` has been removed: the far end of
+ * the removed run it is in, through any that touch. `undefined` when `t` is
+ * kept. The same rule as the app's EditList::resume_after. */
+export function resumeAfter(spans: Span[], t: number): number | undefined {
+  let at = t;
+  for (;;) {
+    let end: number | undefined;
+    for (const [a, b] of spans) {
+      if (at >= a - 1e-9 && at < b - 1e-9) end = Math.max(end ?? b, b);
+    }
+    if (end === undefined) break;
+    at = end;
+  }
+  return at > t ? at : undefined;
 }
 
 export interface Word {

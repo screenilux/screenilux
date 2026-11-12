@@ -10,6 +10,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use screenilux_core::edit::EditList;
 use screenilux_core::session::{MANIFEST_NAME, Manifest, Role, Screen};
 use screenilux_core::text::TEXT_INDEX_NAME;
 use zip::{CompressionMethod, ZipArchive};
@@ -68,6 +69,27 @@ impl Contents {
             len: index_json.len() as u64,
             source: Source::Bytes(index_json),
         });
+    }
+
+    /// Put `edits` into the manifest that goes up, in place of whatever it
+    /// carried, so the link plays the recording as it was edited: cut where
+    /// it was cut. The editor keeps a package's edits beside it rather than
+    /// inside it, so the package's own manifest can be out of date.
+    pub fn set_edits(&mut self, edits: Option<&EditList>) -> Result<(), ShareError> {
+        let read = |e: &dyn std::fmt::Display| ShareError::Read(e.to_string());
+        let Some(item) = self.items.iter_mut().find(|i| i.name == MANIFEST_NAME) else {
+            return Ok(());
+        };
+        let mut json = String::new();
+        item.open()?
+            .read_to_string(&mut json)
+            .map_err(|e| read(&e))?;
+        let mut manifest = Manifest::from_json(&json).map_err(|e| read(&e))?;
+        manifest.edits = edits.filter(|e| !e.is_empty()).cloned();
+        let bytes = manifest.to_json().map_err(|e| read(&e))?.into_bytes();
+        item.len = bytes.len() as u64;
+        item.source = Source::Bytes(bytes);
+        Ok(())
     }
 
     pub fn total(&self) -> u64 {
@@ -217,7 +239,28 @@ mod tests {
         let manifest_back: Manifest =
             serde_json::from_slice(&read_all(&contents.items[0])).unwrap();
         assert_eq!(manifest_back.screens.len(), 2);
+        assert!(manifest_back.edits.is_none());
         assert_eq!(contents.created, "2026-11-01T10:00:00Z");
+
+        // The edits kept beside the package go up in its manifest, so the
+        // link is cut where the recording was: both screens, one cut.
+        let mut contents = contents;
+        let mut edits = EditList::new();
+        edits.cut_at(1.0, 3.0);
+        edits.remove_part(1.0, 3.0);
+        contents.set_edits(Some(&edits)).unwrap();
+        let sent: Manifest = serde_json::from_slice(&read_all(&contents.items[0])).unwrap();
+        assert_eq!(sent.edits.as_ref(), Some(&edits));
+        assert_eq!(sent.screens.len(), 2, "the rest of the manifest is kept");
+        assert_eq!(
+            contents.items[0].len,
+            read_all(&contents.items[0]).len() as u64
+        );
+        assert_eq!(read_all(&contents.items[2]), vec![2u8; 2000]);
+        // And edits taken away are taken away from the link too.
+        contents.set_edits(None).unwrap();
+        let sent: Manifest = serde_json::from_slice(&read_all(&contents.items[0])).unwrap();
+        assert!(sent.edits.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

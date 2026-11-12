@@ -1359,7 +1359,10 @@ impl App {
             editor.timeline(&mut band_ui, ctx, player);
         }
         match (player.take_asked(), open) {
-            (Some(Asked::Share), Some(path)) => self.share(&path),
+            (Some(Asked::Share), Some(path)) => {
+                self.editor.save_if_changed();
+                self.share(&path);
+            }
             (Some(Asked::Delete), Some(path)) => self.shares.delete(&path, &self.sharing.bucket),
             (Some(Asked::Export(format, shape)), _) => {
                 self.editor.start_export(format, shape, &mut self.player);

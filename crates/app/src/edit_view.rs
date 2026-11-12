@@ -14,6 +14,12 @@
 //! then live on one track and in a list that opens where it sits, so an edit
 //! is changed in the same place it is read.
 //!
+//! A cut needs only a *when*, and the playhead is one, so it is a button, a
+//! key (C) and the first entry of the menu the paused picture opens. It
+//! splits every screen and the camera at once; the parts either side are
+//! then removed or put back from the cut's row in the list, and dragging the
+//! cut on the track moves it.
+//!
 //! An edit's length comes from the recording wherever it can: a zoom holds
 //! until the pointer leaves the area it was placed on. Nothing here renders
 //! anything permanently; the edit list is saved beside the recording and the
@@ -30,7 +36,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 use screenilux_core::edit::{
-    Area, Backdrop, EditList, Effect, MIN_SPAN, Place, Problem, Tool, trim_zero,
+    Area, Backdrop, EditList, Effect, MIN_SPAN, Part, Place, Problem, Tool, trim_zero,
 };
 use screenilux_core::redact;
 use screenilux_core::session::{MANIFEST_NAME, Manifest};
@@ -130,6 +136,16 @@ impl EditView {
     /// Hand the player whatever is live at the clock's position, so the
     /// picture shows the effects instead of just listing them.
     pub fn show_live(&self, player: &mut PlayerView) {
+        // Playing runs straight over a removed part, so the gap closes up
+        // here as it does in an export. Every screen, the camera and the
+        // sound follow the one clock, so one seek moves them all together.
+        // Paused, the removed footage can still be scrubbed to and looked at.
+        if let (Some(l), Some(clock)) = (self.loaded.as_ref(), player.clock())
+            && clock.is_playing()
+            && let Some(to) = l.edits.resume_after(clock.position())
+        {
+            clock.seek(to.min(clock.duration()));
+        }
         let at = player.clock().map_or(0.0, |c| c.position());
         let live = self
             .loaded
@@ -219,6 +235,14 @@ impl EditView {
         self.saved = true;
     }
 
+    /// Save, if anything changed since the last save. Sharing reads the
+    /// edits from disk, so a link made now has the cuts made just now.
+    pub fn save_if_changed(&mut self) {
+        if !self.saved {
+            self.save();
+        }
+    }
+
     /// Write the edit list back beside the recording.
     pub fn save(&mut self) {
         let Some(l) = self.loaded.as_mut() else {
@@ -294,10 +318,47 @@ impl EditView {
 
         self.save_row(ui, p);
         self.redact_row(ui, p, player);
-        ui.add_space(14.0);
         let Some(clock) = player.clock() else { return };
+        self.cut_row(ui, clock);
+        ui.add_space(14.0);
         let rest = ui.available_height().max(LIST_MIN);
         self.list(ui, p, clock, rest);
+    }
+
+    /// Cut at the playhead. A cut needs only a *when*, and the playhead is
+    /// already pointing at one, so it is a button rather than a menu away.
+    fn cut_row(&mut self, ui: &mut egui::Ui, clock: &SharedClock) {
+        let Some(l) = self.loaded.as_ref() else {
+            return;
+        };
+        let at = clock.position();
+        let can = l.edits.can_cut(at, l.duration);
+        let button = theme::outline(format!("{}  Cut at {}", icon::CUT, stamp(at)));
+        if ui
+            .add_enabled(can, button)
+            .on_hover_text(
+                "Split every screen and the camera here (C). Either side can then be removed.",
+            )
+            .on_disabled_hover_text(
+                "Nothing to split here: too near an end or another cut, or already removed",
+            )
+            .clicked()
+        {
+            self.cut_here(at);
+        }
+    }
+
+    /// Cut every screen at `at`, and light the cut so what it made is in
+    /// view.
+    fn cut_here(&mut self, at: f64) {
+        let Some(l) = self.loaded.as_mut() else {
+            return;
+        };
+        if l.edits.cut_at(at, l.duration) {
+            self.track.cut = Some(at);
+            self.track.opened = None;
+            self.saved = false;
+        }
     }
 
     /// Finding what should not be shown and blurring it: the button, the
@@ -632,6 +693,14 @@ impl EditView {
             return;
         };
         self.track(ui, &p, clock);
+        // C cuts at the playhead, unless something is being typed or a menu
+        // is waiting to be answered.
+        if self.asking.is_none()
+            && !ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| i.key_pressed(egui::Key::C) && !i.modifiers.command)
+        {
+            self.cut_here(clock.position());
+        }
         // Drawn after both panels, so a stretch marked here is answered on
         // the same frame it was marked.
         self.menu(ctx, &p);
@@ -658,10 +727,20 @@ impl EditView {
         let problems: Vec<Problem> = l.edits.problems(l.duration);
 
         let n = l.edits.effects.len();
-        let count = match n {
-            0 => "Nothing yet".to_string(),
-            1 => "1 effect".to_string(),
-            n => format!("{n} effects"),
+        let effects = match n {
+            0 => None,
+            1 => Some("1 effect".to_string()),
+            n => Some(format!("{n} effects")),
+        };
+        let cuts = match l.edits.cuts.len() {
+            0 => None,
+            1 => Some("1 cut".to_string()),
+            n => Some(format!("{n} cuts")),
+        };
+        let count = match (effects, cuts) {
+            (None, None) => "Nothing yet".to_string(),
+            (Some(one), None) | (None, Some(one)) => one,
+            (Some(e), Some(c)) => format!("{e} · {c}"),
         };
 
         ui.horizontal(|ui| {
@@ -731,16 +810,27 @@ impl EditView {
     fn list(&mut self, ui: &mut egui::Ui, p: &theme::Palette, clock: &SharedClock, tall: f32) {
         // Read what the list needs, then let go: the scroll closure needs the
         // whole view, so nothing may still be borrowed out of it.
-        let (at, duration, effects) = {
+        let (at, duration, rows) = {
             let Some(l) = self.loaded.as_ref() else {
                 return;
             };
-            (clock.position(), l.duration, l.edits.effects.clone())
+            // Cuts sit among the effects in time order, so the list reads
+            // the way the track does.
+            let mut rows: Vec<Row> = l
+                .edits
+                .effects
+                .iter()
+                .cloned()
+                .map(Row::Effect)
+                .chain(l.edits.cuts.iter().copied().map(Row::Cut))
+                .collect();
+            rows.sort_by(|a, b| a.at().total_cmp(&b.at()));
+            (clock.position(), l.duration, rows)
         };
-        if effects.is_empty() {
+        if rows.is_empty() {
             theme::hint(
                 ui,
-                "Click the picture to zoom, hide or point at something. Drag the track to cut or speed up a stretch.",
+                "Click the picture to zoom, hide or point at something. Press C to cut at the playhead, or drag the track to speed up a stretch.",
             );
             return;
         }
@@ -751,7 +841,15 @@ impl EditView {
         egui::ScrollArea::vertical()
             .max_height(tall)
             .show(ui, |ui| {
-                for m in &effects {
+                for row in &rows {
+                    let m = match row {
+                        Row::Effect(m) => m,
+                        Row::Cut(cut) => {
+                            self.cut_card(ui, p, *cut, &mut seek);
+                            ui.add_space(5.0);
+                            continue;
+                        }
+                    };
                     let id = m.id;
                     let live = m.covers(at);
                     let open = self.track.opened == Some(id);
@@ -802,6 +900,7 @@ impl EditView {
                             });
                             if head.response.interact(egui::Sense::click()).clicked() {
                                 self.track.opened = if open { None } else { Some(id) };
+                                self.track.cut = None;
                                 seek = Some(m.start);
                             }
                             if open {
@@ -826,6 +925,133 @@ impl EditView {
             }
             self.saved = false;
         }
+    }
+
+    /// One cut in the list: where it is, and, opened, the parts either side
+    /// of it, each of which can be removed or put back.
+    fn cut_card(&mut self, ui: &mut egui::Ui, p: &theme::Palette, at: f64, seek: &mut Option<f64>) {
+        let open = self.track.cut == Some(at);
+        let tint = p.action;
+        egui::Frame::NONE
+            .fill(if open { p.base } else { p.surface })
+            .stroke(if open {
+                egui::Stroke::new(1.5, tint)
+            } else {
+                egui::Stroke::NONE
+            })
+            .corner_radius(12)
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                let head = ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(icon::CUT).size(12.0).color(tint));
+                    ui.label(
+                        egui::RichText::new("Cut")
+                            .family(theme::strong())
+                            .color(p.text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("at {}", stamp(at)))
+                                .monospace()
+                                .size(11.0)
+                                .color(p.weak),
+                        );
+                    });
+                });
+                if head.response.interact(egui::Sense::click()).clicked() {
+                    self.track.cut = if open { None } else { Some(at) };
+                    self.track.opened = None;
+                    *seek = Some(at);
+                }
+                if open {
+                    ui.add_space(6.0);
+                    self.parts_of(ui, p, at, seek);
+                }
+            });
+    }
+
+    /// The two parts a cut made, and what can be done to each.
+    fn parts_of(&mut self, ui: &mut egui::Ui, p: &theme::Palette, at: f64, seek: &mut Option<f64>) {
+        enum Change {
+            Remove(Part),
+            Restore(Part),
+            Join,
+        }
+        let Some(l) = self.loaded.as_mut() else {
+            return;
+        };
+        let parts = l.edits.parts(l.duration);
+        let near = |t: f64| (t - at).abs() < 1e-9;
+        let sides = [
+            ("Before", parts.iter().find(|q| near(q.end)).copied()),
+            ("After", parts.iter().find(|q| near(q.start)).copied()),
+        ];
+        let mut change = None;
+        for (name, part) in sides {
+            let Some(part) = part else { continue };
+            // Removing the last of what is kept would leave nothing to
+            // export, so that one is not offered.
+            let leaves_some = {
+                let mut tried = l.edits.clone();
+                tried.remove_part(part.start, part.end);
+                tried.output_duration(l.duration) >= MIN_SPAN
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(name).size(11.0).color(p.weak));
+                let mut span =
+                    egui::RichText::new(format!("{} → {}", stamp(part.start), stamp(part.end)))
+                        .monospace()
+                        .size(11.0)
+                        .color(if part.removed { p.weak } else { p.text });
+                if part.removed {
+                    span = span.strikethrough();
+                }
+                ui.label(span);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if part.removed {
+                        if ui
+                            .add(theme::outline("Put back"))
+                            .on_hover_text("Bring this part back into the video")
+                            .clicked()
+                        {
+                            change = Some(Change::Restore(part));
+                        }
+                    } else if ui
+                        .add_enabled(leaves_some, theme::outline("Remove"))
+                        .on_hover_text("Take this part out, on every screen; the gap closes up")
+                        .on_disabled_hover_text("This is all that is left of the video")
+                        .clicked()
+                    {
+                        change = Some(Change::Remove(part));
+                    }
+                });
+            });
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.add(theme::outline("Jump here")).clicked() {
+                *seek = Some(at);
+            }
+            if ui
+                .add(theme::outline("Join back up"))
+                .on_hover_text("Take the cut away. A part already removed stays removed.")
+                .clicked()
+            {
+                change = Some(Change::Join);
+            }
+        });
+        match change {
+            Some(Change::Remove(part)) => {
+                l.edits.remove_part(part.start, part.end);
+            }
+            Some(Change::Restore(part)) => l.edits.restore_part(part.start, part.end),
+            Some(Change::Join) => {
+                l.edits.join(at);
+                self.track.cut = None;
+            }
+            None => return,
+        }
+        self.saved = false;
     }
 
     /// The fields for one effect, by what that tool actually has.
@@ -1050,7 +1276,13 @@ impl EditView {
             if ui.add(theme::outline("Jump here")).clicked() {
                 *seek = Some(m.start);
             }
-            if ui.add(theme::outline("Remove")).clicked() {
+            // Taking away a stretch that was cut out puts it back, so say so.
+            let label = if m.tool.removes() {
+                "Put back"
+            } else {
+                "Remove"
+            };
+            if ui.add(theme::outline(label)).clicked() {
                 *remove = Some(id);
             }
         });
@@ -1072,11 +1304,11 @@ impl EditView {
         let (title, choices) = match asking {
             Asking::Spot { at, area, screen } => (
                 format!("Here, at {}", stamp(*at)),
-                spot_choices(*at, *area, screen.clone(), l.duration),
+                spot_choices(*at, *area, screen.clone(), l.duration, &l.edits),
             ),
             Asking::Span { from, to } => (
                 format!("{} → {}", stamp(*from), stamp(*to)),
-                span_choices(*from, *to, l.duration, &l.screens),
+                span_choices(*from, *to, l.duration, &l.screens, &l.edits),
             ),
         };
 
@@ -1153,8 +1385,25 @@ impl EditView {
         if let Some(c) = picked
             && let Some(l) = self.loaded.as_mut()
         {
-            let id = l.edits.add_on(c.start, c.end, c.tool, c.screen);
-            self.track.opened = Some(id);
+            match c.act {
+                Act::Add {
+                    start,
+                    end,
+                    tool,
+                    screen,
+                } => {
+                    let id = l.edits.add_on(start, end, tool, screen);
+                    self.track.opened = Some(id);
+                    self.track.cut = None;
+                }
+                Act::Cut(at) => {
+                    for t in &at {
+                        l.edits.cut_at(*t, l.duration);
+                    }
+                    self.track.opened = None;
+                    self.track.cut = at.first().copied();
+                }
+            }
             self.saved = false;
             self.track.selection = None;
             close = true;
@@ -1171,16 +1420,41 @@ impl EditView {
     }
 }
 
-/// One thing the menu offers: what it is called, what it does, and the
-/// effect it would add.
+/// One row of the effects list.
+enum Row {
+    Effect(Effect),
+    Cut(f64),
+}
+
+impl Row {
+    fn at(&self) -> f64 {
+        match self {
+            Row::Effect(m) => m.start,
+            Row::Cut(at) => *at,
+        }
+    }
+}
+
+/// One thing the menu offers: what it is called, what it does, and what
+/// picking it does.
 #[derive(Clone)]
 struct Choice {
     name: String,
     hint: String,
-    start: f64,
-    end: f64,
-    tool: Tool,
-    screen: Option<String>,
+    act: Act,
+}
+
+#[derive(Clone)]
+enum Act {
+    /// Lay an effect over a stretch.
+    Add {
+        start: f64,
+        end: f64,
+        tool: Tool,
+        screen: Option<String>,
+    },
+    /// Cut every screen at these moments.
+    Cut(Vec<f64>),
 }
 
 impl Choice {
@@ -1188,19 +1462,43 @@ impl Choice {
         Self {
             name: name.to_string(),
             hint,
-            start,
-            end,
-            tool,
-            screen: None,
+            act: Act::Add {
+                start,
+                end,
+                tool,
+                screen: None,
+            },
+        }
+    }
+
+    fn cut(name: &str, hint: String, at: Vec<f64>) -> Self {
+        Self {
+            name: name.to_string(),
+            hint,
+            act: Act::Cut(at),
         }
     }
 }
 
 /// What can be put at a point on the picture: everything that needs a
-/// *where*.
-fn spot_choices(at: f64, area: Area, screen: Option<String>, duration: f64) -> Vec<Choice> {
+/// *where*, and a cut, which needs only the *when* the picture is paused at.
+fn spot_choices(
+    at: f64,
+    area: Area,
+    screen: Option<String>,
+    duration: f64,
+    edits: &EditList,
+) -> Vec<Choice> {
     let till = |secs: f64| (at + secs).min(duration);
-    let mut out = vec![
+    let mut out = Vec::new();
+    if edits.can_cut(at, duration) {
+        out.push(Choice::cut(
+            "Cut here",
+            format!("Splits every screen at {}", stamp(at)),
+            vec![at],
+        ));
+    }
+    out.extend([
         Choice::new(
             "Zoom & follow the pointer",
             "Holds until the pointer leaves this area".into(),
@@ -1257,15 +1555,23 @@ fn spot_choices(at: f64, area: Area, screen: Option<String>, duration: f64) -> V
                 text: "Look here".into(),
             },
         ),
-    ];
+    ]);
     for c in &mut out {
-        c.screen = screen.clone();
+        if let Act::Add { screen: on, .. } = &mut c.act {
+            on.clone_from(&screen);
+        }
     }
     out
 }
 
 /// What can be done to a stretch of time: everything that needs a *when*.
-fn span_choices(from: f64, to: f64, duration: f64, screens: &[String]) -> Vec<Choice> {
+fn span_choices(
+    from: f64,
+    to: f64,
+    duration: f64,
+    screens: &[String],
+    edits: &EditList,
+) -> Vec<Choice> {
     let span = to - from;
     let at_end = from < 1.2 || to > duration - 1.2;
     let mut out = Vec::new();
@@ -1285,6 +1591,23 @@ fn span_choices(from: f64, to: f64, duration: f64, screens: &[String]) -> Vec<Ch
         to,
         Tool::Cut,
     ));
+    let ends: Vec<f64> = [from, to]
+        .into_iter()
+        .filter(|t| edits.can_cut(*t, duration))
+        .collect();
+    match ends.as_slice() {
+        [] => {}
+        [one] => out.push(Choice::cut(
+            "Cut here",
+            format!("Splits every screen at {}", stamp(*one)),
+            ends,
+        )),
+        _ => out.push(Choice::cut(
+            "Cut at both ends",
+            "Splits every screen, so this part can be removed on its own".into(),
+            ends,
+        )),
+    }
     for rate in [2.0_f32, 4.0, 8.0] {
         out.push(Choice::new(
             &format!("Speed up {}×", trim_zero(rate)),
@@ -1463,7 +1786,7 @@ fn details_file(path: &Path) -> PathBuf {
 
 /// The recording's details: its own file if it has one, else what a package
 /// carries inside it. A video with neither has none.
-fn read_manifest(path: &Path) -> Option<Manifest> {
+pub(crate) fn read_manifest(path: &Path) -> Option<Manifest> {
     if let Some(m) = std::fs::read_to_string(details_file(path))
         .ok()
         .and_then(|json| Manifest::from_json(&json).ok())
@@ -1500,6 +1823,48 @@ mod tests {
         assert_eq!(stamp(75.5), "1:15.5");
         assert_eq!(stamp_short(0.0), "0:00");
         assert_eq!(stamp_short(90.0), "1:30");
+    }
+
+    #[test]
+    fn the_picture_offers_a_cut_where_there_is_something_to_split() {
+        let area = Area::new(0.4, 0.4, 0.2, 0.2);
+        let mut edits = EditList::new();
+        let menu = spot_choices(12.0, area, Some("screen2.mp4".into()), 30.0, &edits);
+        let first = &menu[0];
+        assert_eq!(first.name, "Cut here");
+        assert!(
+            matches!(&first.act, Act::Cut(at) if at == &[12.0]),
+            "a cut belongs to every screen, not the one clicked"
+        );
+        assert!(
+            menu.iter()
+                .skip(1)
+                .all(|c| matches!(&c.act, Act::Add { screen: Some(s), .. } if s == "screen2.mp4")),
+            "everything else is placed on the screen clicked"
+        );
+
+        // Inside a stretch already removed there is nothing to cut.
+        edits.add(10.0, 14.0, Tool::Cut);
+        let menu = spot_choices(12.0, area, None, 30.0, &edits);
+        assert!(menu.iter().all(|c| !matches!(c.act, Act::Cut(_))));
+    }
+
+    #[test]
+    fn a_marked_stretch_can_be_cut_at_both_ends() {
+        let menu = span_choices(5.0, 9.0, 30.0, &[], &EditList::new());
+        let cut = menu
+            .iter()
+            .find(|c| matches!(c.act, Act::Cut(_)))
+            .expect("a cut is offered");
+        assert_eq!(cut.name, "Cut at both ends");
+        assert!(matches!(&cut.act, Act::Cut(at) if at == &[5.0, 9.0]));
+
+        // From the very start only the far end can be cut.
+        let menu = span_choices(0.0, 9.0, 30.0, &[], &EditList::new());
+        assert!(
+            menu.iter()
+                .any(|c| c.name == "Cut here" && matches!(&c.act, Act::Cut(at) if at == &[9.0]))
+        );
     }
 
     #[test]
