@@ -230,6 +230,101 @@ pub fn package_path(dir: &Path, stem: &str) -> PathBuf {
     dir.join(format!("{stem}.{PACKAGE_EXT}"))
 }
 
+/// Write a short stand-in for one of the package's videos into `out`: the
+/// same file, but with only the first `head` bytes of its picture data. It
+/// opens like the real video and plays its opening moments, which is all a
+/// thumbnail needs, without copying a track that can run to gigabytes.
+pub fn video_opening(
+    path: &Path,
+    name: &str,
+    head: u64,
+    out: &mut impl Write,
+) -> Result<(), PackageError> {
+    check_name(name)?;
+    let mut zip = open(path)?;
+    let mut entry = match zip.by_name_seek(name) {
+        Ok(e) => e,
+        Err(zip::result::ZipError::FileNotFound) => {
+            return Err(PackageError::Missing(name.to_string()));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let len = entry.seek(std::io::SeekFrom::End(0))?;
+    mp4_opening(&mut entry, len, head, out)?;
+    Ok(())
+}
+
+/// The MP4 part of [`video_opening`], for any readable video of `len` bytes.
+///
+/// Boxes are copied in order. The picture data (`mdat`) is cut to `head`
+/// bytes, keeping its header the same length, so everything before the cut
+/// stays at the offset the index (`moov`) gives for it; the index itself
+/// may move, which nothing points at. Frames past the cut are simply
+/// missing, so a reader stops there.
+pub fn mp4_opening<R: Read + Seek>(
+    src: &mut R,
+    len: u64,
+    head: u64,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, SeekFrom};
+    // Anything but picture data is small; a box claiming more is damage.
+    const MOST: u64 = 64 << 20;
+    let bad = |what: &str| Error::new(ErrorKind::InvalidData, what.to_string());
+
+    let mut at = 0;
+    let mut cut = false;
+    while at + 8 <= len {
+        src.seek(SeekFrom::Start(at))?;
+        let mut header = [0u8; 16];
+        src.read_exact(&mut header[..8])?;
+        let mut size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+        let kind = [header[4], header[5], header[6], header[7]];
+        let mut header_len = 8;
+        if size == 1 {
+            src.read_exact(&mut header[8..16])?;
+            let mut large = [0u8; 8];
+            large.copy_from_slice(&header[8..16]);
+            size = u64::from_be_bytes(large);
+            header_len = 16;
+        } else if size == 0 {
+            size = len - at;
+        }
+        if size < header_len as u64 || at + size > len {
+            return Err(bad("an MP4 box runs past the end of the file"));
+        }
+        let body = size - header_len as u64;
+        if &kind == b"mdat" {
+            if !cut {
+                // Only the first: a later one would no longer sit where the
+                // index says, and the opening is all that is wanted.
+                let keep = body.min(head);
+                let new_size = keep + header_len as u64;
+                if header_len == 16 {
+                    header[8..16].copy_from_slice(&new_size.to_be_bytes());
+                } else {
+                    header[..4].copy_from_slice(&(new_size as u32).to_be_bytes());
+                }
+                out.write_all(&header[..header_len])?;
+                std::io::copy(&mut src.by_ref().take(keep), out)?;
+                cut = true;
+            }
+        } else {
+            if body > MOST {
+                return Err(bad("an MP4 box is too large to be an index"));
+            }
+            out.write_all(&header[..header_len])?;
+            std::io::copy(&mut src.by_ref().take(body), out)?;
+        }
+        at += size;
+    }
+    if cut {
+        Ok(())
+    } else {
+        Err(bad("no picture data in the video"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,6 +499,97 @@ mod tests {
             assert!(check_name(bad).is_err(), "{bad:?} should be refused");
         }
         assert!(check_name("screen1.mp4").is_ok());
+    }
+
+    fn mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+        b.extend_from_slice(kind);
+        b.extend_from_slice(body);
+        b
+    }
+
+    /// An MP4 laid out the way the recorder writes one: the index last.
+    fn fake_mp4(picture: usize) -> Vec<u8> {
+        let mut v = mp4_box(b"ftyp", b"isom0000");
+        v.extend(mp4_box(b"mdat", &vec![7u8; picture]));
+        v.extend(mp4_box(b"moov", b"the index"));
+        v
+    }
+
+    #[test]
+    fn an_opening_keeps_the_picture_data_where_it_was() {
+        let full = fake_mp4(10_000);
+        let mut out = Vec::new();
+        mp4_opening(
+            &mut std::io::Cursor::new(&full),
+            full.len() as u64,
+            100,
+            &mut out,
+        )
+        .unwrap();
+        // ftyp, then a 100-byte mdat starting at the same offset, then moov.
+        let ftyp = 16;
+        assert_eq!(out[..ftyp], full[..ftyp]);
+        assert_eq!(&out[ftyp..ftyp + 4], &108u32.to_be_bytes());
+        assert_eq!(&out[ftyp + 4..ftyp + 8], b"mdat");
+        assert_eq!(out[ftyp + 8..ftyp + 108], full[ftyp + 8..ftyp + 108]);
+        assert_eq!(&out[ftyp + 108..], &mp4_box(b"moov", b"the index")[..]);
+    }
+
+    #[test]
+    fn a_short_video_comes_through_whole() {
+        let full = fake_mp4(50);
+        let mut out = Vec::new();
+        let len = full.len() as u64;
+        mp4_opening(&mut std::io::Cursor::new(&full), len, 1 << 20, &mut out).unwrap();
+        assert_eq!(out, full);
+    }
+
+    #[test]
+    fn a_large_picture_box_keeps_its_long_header() {
+        let mut full = mp4_box(b"ftyp", b"isom");
+        let body = vec![1u8; 64];
+        full.extend_from_slice(&1u32.to_be_bytes());
+        full.extend_from_slice(b"mdat");
+        full.extend_from_slice(&(16 + body.len() as u64).to_be_bytes());
+        full.extend_from_slice(&body);
+        full.extend(mp4_box(b"moov", b"i"));
+        let mut out = Vec::new();
+        let len = full.len() as u64;
+        mp4_opening(&mut std::io::Cursor::new(&full), len, 10, &mut out).unwrap();
+        assert_eq!(&out[12..16], &1u32.to_be_bytes());
+        assert_eq!(&out[20..28], &26u64.to_be_bytes());
+        assert_eq!(out.len(), 12 + 26 + 9);
+    }
+
+    #[test]
+    fn damaged_videos_are_errors() {
+        let mut out = Vec::new();
+        let mut cut_short = fake_mp4(100);
+        cut_short.truncate(60);
+        let len = cut_short.len() as u64;
+        assert!(mp4_opening(&mut std::io::Cursor::new(&cut_short), len, 10, &mut out).is_err());
+        let no_picture = mp4_box(b"moov", b"i");
+        let len = no_picture.len() as u64;
+        assert!(mp4_opening(&mut std::io::Cursor::new(&no_picture), len, 10, &mut out).is_err());
+    }
+
+    #[test]
+    fn an_opening_comes_out_of_a_package() {
+        let s = Scratch::new("opening");
+        let dir = s.0.join("session");
+        std::fs::create_dir_all(&dir).unwrap();
+        session(&dir);
+        std::fs::write(dir.join("screen1.mp4"), fake_mp4(5000)).unwrap();
+        let pkg = s.0.join("x.screenilux");
+        pack(&dir, &pkg).unwrap();
+        let mut out = Vec::new();
+        video_opening(&pkg, "screen1.mp4", 200, &mut out).unwrap();
+        assert_eq!(out.len(), 16 + 208 + 17);
+        assert!(matches!(
+            video_opening(&pkg, "screen9.mp4", 200, &mut Vec::new()),
+            Err(PackageError::Missing(_))
+        ));
     }
 
     #[test]
