@@ -1,9 +1,16 @@
 // Share links: the desktop app uploads a recording here, and the web player
 // reads it back.
 //
-// A shared recording is a folder of files under rec/<id>/ in R2, every one
-// encrypted by the app with a key that only the link carries (after the #,
-// which browsers never send). This server cannot read any of them:
+// A shared recording is a folder of files in R2, every one encrypted by the
+// app with a key that only the link carries (after the #, which browsers
+// never send). Each computer that shares has a folder of its own, and each
+// recording's folder in it starts with when it was shared (UTC), so they
+// line up by date and never clash:
+//
+//   rec/<device>/2026-11-12_11-48-47_<id>/
+//
+// The link carries only the recording's id; D1 says where its folder is.
+// This server cannot read any of the files:
 //
 //   recording.json  the manifest
 //   screen1.mp4 ... one video per screen
@@ -16,10 +23,10 @@
 // - Starting a recording needs nothing, but each address can start only a few
 //   a minute.
 // - Storage costs money past Cloudflare's free allowance, so each computer
-//   can keep SHARE_PER_DEVICE bytes shared at a time, counted over the week
-//   a link lasts. There are no accounts: the app makes a random device id
-//   once. Since a new id is easy to make, each network (address) is also held
-//   to SHARE_PER_NETWORK. The counts are in D1 (migrations/).
+//   can share SHARE_PER_DEVICE bytes a week. There are no accounts: the app
+//   makes a random device id once. Since a new id is easy to make, each
+//   network (address) is also held to SHARE_PER_NETWORK a week. The counts
+//   are in D1 (migrations/).
 // - Starting one hands back an upload token that works for that recording
 //   only: it cannot read, list or change any other. The token is a signature
 //   of the recording's id, so the server keeps nothing to check it against.
@@ -28,9 +35,10 @@
 // - The upload's progress is what this server counted, and it is ready when
 //   the app says it has finished. Anyone with the id can ask how it is going.
 // - Reading needs only the id, which is random and long enough that links
-//   cannot be guessed. R2 deletes everything a week after it was uploaded (a
-//   lifecycle rule on the bucket).
-// - The admin key (UPLOAD_KEY) can delete any recording, to take one down.
+//   cannot be guessed.
+// - Recordings are kept until they are deleted: by the upload token of the
+//   recording, or the admin key (UPLOAD_KEY), which can delete any, to take
+//   one down.
 
 // Recording and device ids: 128 random bits, base64url.
 const ID = /^[A-Za-z0-9_-]{22}$/;
@@ -40,10 +48,12 @@ const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 const WRITABLE = /^(recording|text)\.json$|^screen[1-9][0-9]?\.mp4$|^camera\.mp4$/;
 const PART = /^[1-9][0-9]{0,4}$/;
 
-/** What one computer can have shared at a time, over the week links last. */
+/** What one computer can share in a week. */
 const SHARE_PER_DEVICE = 1024 ** 3;
-/** What one network can have shared at a time, however many computers. */
+/** What one network can share in a week, however many computers. */
 const SHARE_PER_NETWORK = 5 * 1024 ** 3;
+/** The span the allowances are counted over. */
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 /** The most one upload request can carry. The app sends 32MB parts. */
 const MAX_REQUEST = 50 * 1024 ** 2;
 /**
@@ -52,8 +62,6 @@ const MAX_REQUEST = 50 * 1024 ** 2;
  * for, up to this.
  */
 const MAX_TEXT = 16 * 1024 ** 2;
-/** How long a recording is kept; the bucket's lifecycle rule does the deleting. */
-const KEPT_FOR_MS = 7 * 24 * 60 * 60 * 1000;
 /** An upload that has sent nothing for this long has stopped. */
 const STALLED_AFTER_MS = 10 * 60 * 1000;
 
@@ -156,10 +164,10 @@ async function mayChange(request: Request, env: Env, id: string): Promise<boolea
  */
 async function updateState(
   env: Env,
-  id: string,
+  folder: string,
   change: (state: UploadState) => UploadState | "full",
 ): Promise<"ok" | "gone" | "full"> {
-  const key = `rec/${id}/_state`;
+  const key = `${folder}_state`;
   for (let attempt = 0; attempt < 8; attempt++) {
     const current = await env.RECORDINGS.get(key);
     if (!current) return "gone";
@@ -169,6 +177,30 @@ async function updateState(
     if (stored) return "ok";
   }
   throw new Error("the upload state kept changing");
+}
+
+/** A new recording's folder: its computer's folder, then when it was shared. */
+function newFolder(device: string, id: string, now: number): string {
+  // 2026-11-12T11:48:47.123Z -> 2026-11-12_11-48-47
+  const stamp = new Date(now).toISOString().slice(0, 19).replace("T", "_").replaceAll(":", "-");
+  return `rec/${device}/${stamp}_${id}/`;
+}
+
+/**
+ * Where recording `id`'s files are, ending in "/", if it exists. A folder
+ * never moves, so this isolate remembers the ones it has looked up.
+ */
+const folders = new Map<string, string>();
+async function folderOf(env: Env, id: string): Promise<string | undefined> {
+  const known = folders.get(id);
+  if (known) return known;
+  const row = await env.SHARES.prepare("SELECT folder FROM shares WHERE id = ?1")
+    .bind(id)
+    .first<{ folder: string | null }>();
+  if (!row?.folder) return undefined;
+  if (folders.size >= 1000) folders.clear();
+  folders.set(id, row.folder);
+  return row.folder;
 }
 
 /** A keyed hash of the address a request came from, so no address is stored. */
@@ -187,17 +219,25 @@ function size(bytes: number): string {
  * have room. One statement checks and records, so two shares at once cannot
  * both squeeze into the same space. Returns why not, if not.
  */
-async function claim(env: Env, id: string, device: string, network: string, total: number): Promise<string | undefined> {
-  const now = Date.now();
-  const since = now - KEPT_FOR_MS;
-  await env.SHARES.prepare("DELETE FROM shares WHERE started <= ?1").bind(since).run();
+async function claim(
+  env: Env,
+  id: string,
+  device: string,
+  network: string,
+  total: number,
+  now: number,
+  folder: string,
+): Promise<string | undefined> {
+  // Rows are kept as long as their recordings, since they say where each
+  // one's folder is; only the last week's count against the allowances.
+  const since = now - WEEK_MS;
   const claimed = await env.SHARES.prepare(
-    `INSERT INTO shares (id, device, network, bytes, started)
-     SELECT ?1, ?2, ?3, ?4, ?5
+    `INSERT INTO shares (id, device, network, bytes, started, folder)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?9
      WHERE (SELECT COALESCE(SUM(bytes), 0) FROM shares WHERE device = ?2 AND started > ?6) + ?4 <= ?7
        AND (SELECT COALESCE(SUM(bytes), 0) FROM shares WHERE network = ?3 AND started > ?6) + ?4 <= ?8`,
   )
-    .bind(id, device, network, total, now, since, SHARE_PER_DEVICE, SHARE_PER_NETWORK)
+    .bind(id, device, network, total, now, since, SHARE_PER_DEVICE, SHARE_PER_NETWORK, folder)
     .run();
   if (claimed.meta.changes === 1) return undefined;
 
@@ -211,9 +251,9 @@ async function claim(env: Env, id: string, device: string, network: string, tota
   if (mine + total > SHARE_PER_DEVICE) {
     return total > SHARE_PER_DEVICE
       ? `This recording is ${size(total)}, more than the ${size(SHARE_PER_DEVICE)} Screenilux can share for you. Share it to your own storage instead.`
-      : `You have ${size(SHARE_PER_DEVICE - mine)} of your ${size(SHARE_PER_DEVICE)} left this week, and this recording is ${size(total)}. Space frees up as your links expire, 7 days after you shared them.`;
+      : `You have ${size(SHARE_PER_DEVICE - mine)} of your ${size(SHARE_PER_DEVICE)} left this week, and this recording is ${size(total)}. Each share counts for 7 days after it was made.`;
   }
-  return `Recordings shared from your network have used its ${size(SHARE_PER_NETWORK)} for this week. Space frees up as those links expire, 7 days after they were shared.`;
+  return `Recordings shared from your network have used its ${size(SHARE_PER_NETWORK)} for this week. Each share counts for 7 days after it was made.`;
 }
 
 function length(request: Request): number | undefined {
@@ -241,13 +281,15 @@ async function api(request: Request, env: Env, path: string[]): Promise<Response
     if (!Number.isSafeInteger(total) || total <= 0) return problem(400, "Say how big the recording is.");
     if (typeof asked.device !== "string" || !ID.test(asked.device)) return problem(400, "Say which device is sharing.");
     const id = base64url(crypto.getRandomValues(new Uint8Array(16)));
-    const refused = await claim(env, id, asked.device, await networkOf(request, env), total);
-    if (refused) return problem(413, refused);
     const now = Date.now();
+    const folder = newFolder(asked.device, id, now);
+    const refused = await claim(env, id, asked.device, await networkOf(request, env), total, now, folder);
+    if (refused) return problem(413, refused);
     const state: UploadState = { status: "uploading", total, received: 0, started: now, updated: now };
-    await env.RECORDINGS.put(`rec/${id}/_state`, JSON.stringify(state));
+    await env.RECORDINGS.put(`${folder}_state`, JSON.stringify(state));
+    folders.set(id, folder);
     const origin = new URL(request.url).origin;
-    console.log(JSON.stringify({ message: "recording started", id, total }));
+    console.log(JSON.stringify({ message: "recording started", id, folder, total }));
     return Response.json(
       { id, link: `${origin}/v/${id}`, token: await tokenFor(env, id), limit: total },
       { status: 201 },
@@ -255,12 +297,14 @@ async function api(request: Request, env: Env, path: string[]): Promise<Response
   }
 
   if (!id || !ID.test(id)) return problem(404, "No such recording.");
+  const folder = await folderOf(env, id);
+  if (!folder) return problem(404, "This recording does not exist, or it has been deleted.");
 
   // GET /api/recordings/:id: how the upload is going. Anyone with the id may
   // ask; it says nothing about what was recorded.
   if (path.length === 2 && method === "GET") {
-    const stored = await env.RECORDINGS.get(`rec/${id}/_state`);
-    if (!stored) return problem(404, "This recording does not exist, or it has expired.");
+    const stored = await env.RECORDINGS.get(`${folder}_state`);
+    if (!stored) return problem(404, "This recording does not exist, or it has been deleted.");
     const state = await stored.json<UploadState>();
     const stalled = state.status === "uploading" && Date.now() - state.updated > STALLED_AFTER_MS;
     return Response.json(
@@ -269,36 +313,36 @@ async function api(request: Request, env: Env, path: string[]): Promise<Response
         received: state.received,
         total: state.total,
         started: new Date(state.started).toISOString(),
-        expires: new Date(state.started + KEPT_FOR_MS).toISOString(),
       },
       { headers: { "Cache-Control": "no-store" } },
     );
   }
 
   if (!(await mayChange(request, env, id))) return problem(401, "This upload token is not for this recording.");
-  const gone = problem(404, "This recording has been deleted, or it has expired.");
+  const gone = problem(404, "This recording has been deleted.");
 
   // DELETE /api/recordings/:id: the whole recording.
   if (path.length === 2 && method === "DELETE") {
     let cursor: string | undefined;
     do {
-      const list = await env.RECORDINGS.list({ prefix: `rec/${id}/`, cursor });
+      const list = await env.RECORDINGS.list({ prefix: folder, cursor });
       if (list.objects.length) await env.RECORDINGS.delete(list.objects.map((o) => o.key));
       cursor = list.truncated ? list.cursor : undefined;
     } while (cursor);
     // Its space is free again.
     await env.SHARES.prepare("DELETE FROM shares WHERE id = ?1").bind(id).run();
+    folders.delete(id);
     return new Response(null, { status: 204 });
   }
 
   // POST /api/recordings/:id/complete: every file is up.
   if (path.length === 3 && name === "complete" && method === "POST") {
-    const done = await updateState(env, id, (s) => ({ ...s, status: "ready", updated: Date.now() }));
+    const done = await updateState(env, folder, (s) => ({ ...s, status: "ready", updated: Date.now() }));
     return done === "ok" ? new Response(null, { status: 204 }) : gone;
   }
 
   if (!name || !WRITABLE.test(name)) return problem(400, "That file is not part of a recording.");
-  const key = `rec/${id}/${name}`;
+  const key = `${folder}${name}`;
   // Every file is encrypted; its type says nothing more.
   const httpMetadata = { contentType: "application/octet-stream" };
   const bytes = length(request);
@@ -314,7 +358,7 @@ async function api(request: Request, env: Env, path: string[]): Promise<Response
     // of the try that failed were already counted: count each file or part
     // once, at the size it was last sent.
     const slot = part ? `${name}/${part}` : name;
-    const counted = await updateState(env, id, (s) => {
+    const counted = await updateState(env, folder, (s) => {
       const before = s.written?.[slot] ?? 0;
       const written = { ...s.written, [slot]: bytes };
       const received = s.received - before + bytes;
@@ -376,14 +420,16 @@ async function read(request: Request, env: Env, path: string[]): Promise<Respons
   const [id, name] = path;
   if (path.length !== 2 || !id || !ID.test(id) || !name || !NAME.test(name)) return problem(404, "Not found.");
   if (request.method !== "GET" && request.method !== "HEAD") return problem(405, "That method is not allowed here.");
-  const key = `rec/${id}/${name}`;
+  const folder = await folderOf(env, id);
+  if (!folder) return problem(404, "This recording does not exist, or it has been deleted.");
+  const key = `${folder}${name}`;
 
   // Files never change once written, so they can be cached for long, and
   // conditional requests from a browser's cache are simply answered in
   // full: only the range matters.
   const headers = new Headers({ "Accept-Ranges": "bytes", "Cache-Control": "public, max-age=86400, immutable" });
   const head = await env.RECORDINGS.head(key);
-  if (!head) return problem(404, "This recording does not exist, or it has expired.");
+  if (!head) return problem(404, "This recording does not exist, or it has been deleted.");
   head.writeHttpMetadata(headers);
   headers.set("ETag", head.httpEtag);
   if (request.method === "HEAD") {
@@ -399,13 +445,13 @@ async function read(request: Request, env: Env, path: string[]): Promise<Respons
       return new Response(null, { status: 416, headers });
     }
     const object = await env.RECORDINGS.get(key, { range: { offset: range.start, length: range.end - range.start + 1 } });
-    if (!object) return problem(404, "This recording does not exist, or it has expired.");
+    if (!object) return problem(404, "This recording does not exist, or it has been deleted.");
     headers.set("Content-Range", `bytes ${range.start}-${range.end}/${head.size}`);
     headers.set("Content-Length", String(range.end - range.start + 1));
     return new Response(object.body, { status: 206, headers });
   }
   const object = await env.RECORDINGS.get(key);
-  if (!object) return problem(404, "This recording does not exist, or it has expired.");
+  if (!object) return problem(404, "This recording does not exist, or it has been deleted.");
   headers.set("Content-Length", String(object.size));
   return new Response(object.body, { headers });
 }

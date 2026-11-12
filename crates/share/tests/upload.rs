@@ -28,6 +28,8 @@ fn byte(i: usize) -> u8 {
 
 /// A two-screen package with a camera video, in a folder of its own.
 fn package(tag: &str) -> (PathBuf, PathBuf) {
+    // What the upload logs shows with --nocapture, as the app's log has it.
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let dir = std::env::temp_dir().join(format!("screenilux-{tag}-{}", std::process::id()));
     let folder = dir.join("session");
     std::fs::create_dir_all(&folder).unwrap();
@@ -165,6 +167,19 @@ fn a_package_uploads_to_the_screenilux_storage() {
     assert_eq!(status["status"], "ready");
     assert_eq!(status["received"], progress.total);
     check_files(&format!("{server}/r/{id}/"), &link, &progress);
+
+    // Deleting it takes every file away, and the link with them. Deleting
+    // it again is no trouble.
+    let rights = progress.rights.clone().unwrap();
+    screenilux_share::delete(&rights, None).unwrap();
+    for name in [MANIFEST_NAME, "screen2.mp4", "camera.mp4"] {
+        let gone = ureq::get(format!("{server}/r/{id}/{name}")).call();
+        assert!(
+            matches!(gone, Err(ureq::Error::StatusCode(404))),
+            "{name}: {gone:?}"
+        );
+    }
+    screenilux_share::delete(&rights, None).unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
 

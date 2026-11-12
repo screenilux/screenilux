@@ -24,10 +24,7 @@ mod track;
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(false)
-        .init();
+    logging();
 
     // Before any window exists, so captures are in physical pixels.
     screenilux_platform::set_dpi_awareness();
@@ -90,4 +87,28 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     )
+}
+
+/// Everything at INFO and up to the console, which release builds on
+/// Windows do not have, and what uploads log to a file as well, so a share
+/// that went wrong can be looked into afterwards (see
+/// [`sharing::upload_log`]).
+fn logging() {
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::prelude::*;
+
+    let console = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_filter(LevelFilter::INFO);
+    let uploads = sharing::upload_log().map(|file| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_filter(Targets::new().with_target(screenilux_share::LOG, tracing::Level::INFO))
+    });
+    tracing_subscriber::registry()
+        .with(console)
+        .with(uploads)
+        .init();
 }

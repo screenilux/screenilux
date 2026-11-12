@@ -1065,8 +1065,10 @@ impl App {
         if dismissed {
             self.last_save = None;
         }
-        if let Some(Asked::Share) = asked {
-            self.share(&saved);
+        match asked {
+            Some(Asked::Share) => self.share(&saved),
+            Some(Asked::Delete) => self.shares.delete(&saved, &self.sharing.bucket),
+            _ => {}
         }
     }
 
@@ -1104,8 +1106,8 @@ impl App {
                 ui.add_space(4.0);
                 theme::hint(
                     ui,
-                    "Only people with the link can watch. Links last 7 days, and you can \
-                     have up to 1GB shared at a time.",
+                    "Only people with the link can watch. Links keep working until the \
+                     recording is deleted, and you can share up to 1GB a week.",
                 );
             }
             Mode::Bucket => {
@@ -1358,6 +1360,7 @@ impl App {
         }
         match (player.take_asked(), open) {
             (Some(Asked::Share), Some(path)) => self.share(&path),
+            (Some(Asked::Delete), Some(path)) => self.shares.delete(&path, &self.sharing.bucket),
             (Some(Asked::Export(format, shape)), _) => {
                 self.editor.start_export(format, shape, &mut self.player);
             }
@@ -1523,7 +1526,7 @@ impl App {
                 "Each recording stays here, and is uploaded too."
             } else {
                 "Each recording is removed from this computer once its upload has \
-                 finished. Recordings shared on Screenilux are deleted there after 7 days."
+                 finished."
             },
         );
 
