@@ -34,9 +34,6 @@ use store::{Hosted, Own, Sent, Store};
 /// Where the web player lives. Links point here.
 pub const PLAYER: &str = "https://screenilux.hassen-ben-mbarek.workers.dev";
 
-/// How long the Screenilux storage keeps a shared recording.
-pub const KEPT_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-
 /// Files bigger than this go up in parts of this size. The Screenilux storage
 /// takes at most 100MB in one request; buckets need parts of at least 5MB.
 const PART: usize = 32 * 1024 * 1024;
@@ -179,8 +176,6 @@ pub struct Progress {
     pub uploaded: u64,
     pub total: u64,
     pub state: State,
-    /// When the link stops working, if it does.
-    pub expires: Option<SystemTime>,
     /// The right to add files to the share later, such as its text once it
     /// has been read: keep it with the link.
     pub rights: Option<Rights>,
@@ -199,7 +194,6 @@ impl Upload {
             uploaded: 0,
             total: contents.total(),
             state: State::Starting,
-            expires: None,
             rights: None,
         }));
         let shared = Arc::clone(&progress);
@@ -275,11 +269,11 @@ fn run(
     let (store, link): (Box<dyn Store>, String) = match destination {
         Destination::Screenilux { server, device } => {
             let (hosted, link) = Hosted::create(agent, server, device, total)?;
-            lock(progress).expires = Some(SystemTime::now() + KEPT_FOR);
             (Box::new(hosted), format!("{link}#k={}", key.to_link()))
         }
         Destination::Bucket(bucket) => {
-            let (own, link) = Own::create(agent, bucket, &new_id()?, &key.to_link())?;
+            let folder = format!("{}_{}", stamp(SystemTime::now()), new_id()?);
+            let (own, link) = Own::create(agent, bucket, &folder, &key.to_link())?;
             (Box::new(own), link)
         }
     };
@@ -496,8 +490,23 @@ pub fn add_text(
         .and_then(|(_, v)| ShareKey::from_link(&v))
         .ok_or_else(|| ShareError::Read("the link has no key".into()))?;
     let sealed = seal::seal(&key, index_json)?;
+    let store = resume(rights, bucket)?;
+    retrying("text.json", || {
+        store.put(screenilux_core::text::TEXT_INDEX_NAME, &sealed, &mut |_| {})
+    })
+}
+
+/// Delete a share, every file of it, so its link stops working. `bucket` is
+/// as for [`add_text`].
+pub fn delete(rights: &Rights, bucket: Option<&Bucket>) -> Result<(), ShareError> {
+    let store = resume(rights, bucket)?;
+    retrying("delete", || store.delete())
+}
+
+/// The store a share made earlier is in.
+fn resume(rights: &Rights, bucket: Option<&Bucket>) -> Result<Box<dyn Store>, ShareError> {
     let agent = store::agent();
-    let store: Box<dyn Store> = match rights {
+    Ok(match rights {
         Rights::Screenilux { recording, token } => {
             Box::new(Hosted::resume(agent, recording, token))
         }
@@ -507,9 +516,6 @@ pub fn add_text(
             })?;
             Box::new(Own::resume(agent, bucket, prefix)?)
         }
-    };
-    retrying("text.json", || {
-        store.put(screenilux_core::text::TEXT_INDEX_NAME, &sealed, &mut |_| {})
     })
 }
 
@@ -517,6 +523,17 @@ pub fn add_text(
 /// It is random, so it says nothing about the computer or who uses it.
 pub fn new_device_id() -> String {
     new_id().expect("the system has randomness")
+}
+
+/// `time` in UTC as it starts a share's folder in a bucket, the way the
+/// Screenilux storage names its own: `2026-11-12_11-48-47`. Folders then
+/// line up by date.
+fn stamp(time: SystemTime) -> String {
+    humantime::format_rfc3339_seconds(time)
+        .to_string()
+        .trim_end_matches('Z')
+        .replace('T', "_")
+        .replace(':', "-")
 }
 
 /// A random id that cannot be guessed: 128 bits, as the Screenilux storage
@@ -565,6 +582,12 @@ mod tests {
             ShareError::NotAllowed
         ));
         assert!(matches!(ShareError::refused(429, ""), ShareError::TooMany));
+    }
+
+    #[test]
+    fn a_bucket_folder_starts_with_when_it_was_shared() {
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_794_484_127);
+        assert_eq!(stamp(t), "2026-11-12_11-48-47");
     }
 
     #[test]
@@ -644,6 +667,9 @@ mod tests {
         fn discard(&self, _: &[String]) -> Result<(), ShareError> {
             Ok(())
         }
+        fn delete(&self) -> Result<(), ShareError> {
+            Ok(())
+        }
     }
 
     fn progress() -> Mutex<Progress> {
@@ -652,7 +678,6 @@ mod tests {
             uploaded: 0,
             total: 0,
             state: State::Uploading,
-            expires: None,
             rights: None,
         })
     }

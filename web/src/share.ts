@@ -14,7 +14,6 @@ export interface Status {
   received: number;
   total: number;
   started: string;
-  expires: string;
 }
 
 export interface Screen {
@@ -67,7 +66,7 @@ export interface Hit {
   snippet: string;
 }
 
-/** The file is not there, or the recording has expired. */
+/** The file is not there, or the recording has been deleted. */
 export class Missing extends Error {}
 /** The file is there but does not open with the link's key. */
 export class Locked extends Error {}
