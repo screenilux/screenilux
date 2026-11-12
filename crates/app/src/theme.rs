@@ -51,6 +51,8 @@ icons! {
     MONITOR => "\u{E7F4}", "\u{1F5B5}";
     CHEVRON_DOWN => "\u{E70D}", "\u{23F7}";
     CHEVRON_UP => "\u{E70E}", "\u{23F6}";
+    CHEVRON_LEFT => "\u{E76B}", "\u{23F4}";
+    CHEVRON_RIGHT => "\u{E76C}", "\u{23F5}";
     FULL_SCREEN => "\u{E740}", "\u{26F6}";
     LEAVE_FULL_SCREEN => "\u{E73F}", "\u{1F5D7}";
     CHECK => "\u{E73E}", "\u{2714}";
@@ -773,7 +775,7 @@ pub fn paint_checkbox(ui: &egui::Ui, rect: egui::Rect, on: bool, enabled: bool) 
     }
 }
 
-fn focus_ring(ui: &egui::Ui, response: &egui::Response, rect: egui::Rect, radius: u8) {
+pub fn focus_ring(ui: &egui::Ui, response: &egui::Response, rect: egui::Rect, radius: u8) {
     if response.has_focus() {
         ui.painter().rect_stroke(
             rect.expand(2.0),

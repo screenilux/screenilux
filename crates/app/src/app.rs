@@ -1440,7 +1440,10 @@ impl App {
                 top: 4,
                 bottom: 20,
             }))
-            .show(ui, |ui| self.player.library(ui, ctx, &out_dir));
+            .show(ui, |ui| {
+                let shares = &self.shares;
+                self.player.library(ui, ctx, &out_dir, &|p| shares.of(p));
+            });
     }
 
     /// Settings: only what is set once and left. Recording options stay on

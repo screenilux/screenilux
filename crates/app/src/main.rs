@@ -9,6 +9,7 @@ mod edit_view;
 mod effects;
 mod exporting;
 mod icon;
+mod library;
 mod overlay;
 mod player_view;
 mod previews;
@@ -16,6 +17,7 @@ mod sharing;
 mod sizing;
 mod state;
 mod theme;
+mod thumbs;
 mod tour;
 mod track;
 

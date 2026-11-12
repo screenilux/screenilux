@@ -13,6 +13,7 @@ use screenilux_export::{Format, Shape};
 use screenilux_player::Player;
 use screenilux_player::open::{Opened, Origin};
 
+use crate::library::{Library, Pick};
 use crate::sharing::{self, Asked, Link};
 use crate::theme::{self, ON_DARK, Palette, icon};
 
@@ -30,13 +31,6 @@ const IDLE: f32 = 2.5;
 /// Telling screens apart on the timeline, in labels and in search results.
 fn track_colour(p: &Palette, track: usize) -> egui::Color32 {
     [p.signal, p.soft, p.action, p.stroke][track % 4]
-}
-
-/// A recording found in the save folder, for the empty state.
-struct Recent {
-    path: PathBuf,
-    name: String,
-    detail: String,
 }
 
 /// The export menu: wide enough for a format's name and what it is for,
@@ -74,8 +68,8 @@ pub struct PlayerView {
     /// The picture fills the display and the controls float over it.
     full: bool,
 
-    /// Recordings in the save folder, read when first shown.
-    recents: Option<Vec<Recent>>,
+    /// The recordings in the save folder, and the page of them on show.
+    library: Library,
     /// The open recording's link, and whether it can be shared, as the app
     /// last said; and sharing it, if asked for.
     link: (Link, bool),
@@ -126,7 +120,7 @@ impl PlayerView {
             layout: Layout::Auto,
             pinned: None,
             full: false,
-            recents: None,
+            library: Library::new(),
             link: (Link::None, false),
             asked: None,
             export_shape: Shape::Wide,
@@ -589,120 +583,29 @@ impl PlayerView {
         }
     }
 
-    /// The Recordings tab, in the main window: opening a file, and the
-    /// recordings in the save folder. Playing one opens the player window.
-    pub fn library(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, out_dir: &Path) {
-        let p = theme::palette(ui);
-        let dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
-        let width = ui.available_width();
-
-        ui.vertical_centered(|ui| {
-            ui.set_max_width(width);
-            ui.add_space(4.0);
-
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 170.0), egui::Sense::hover());
-            let colour = if dragging { p.signal } else { p.stroke };
-            let fill = if dragging {
-                theme::blend(p.base, p.signal, 0.10)
-            } else {
-                p.surface
-            };
-            ui.painter().rect_filled(rect, 20.0, fill);
-            let r = rect.shrink(1.0);
-            let corners = [
-                r.left_top(),
-                r.right_top(),
-                r.right_bottom(),
-                r.left_bottom(),
-                r.left_top(),
-            ];
-            ui.painter().extend(egui::Shape::dashed_line(
-                &corners,
-                egui::Stroke::new(1.5, colour),
-                7.0,
-                5.0,
-            ));
-
-            let mut inner = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(rect.shrink(20.0))
-                    .layout(egui::Layout::top_down(egui::Align::Center)),
-            );
-            inner.add_space(6.0);
-            inner.label(
-                egui::RichText::new(icon::MONITOR)
-                    .size(34.0)
-                    .color(if dragging { p.signal } else { p.weak }),
-            );
-            inner.add_space(6.0);
-            if dragging {
-                inner.label(
-                    egui::RichText::new("Drop to open")
-                        .font(egui::FontId::new(16.0, theme::strong())),
-                );
-            } else {
-                if inner
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("Open a recording")
-                                .font(egui::FontId::new(15.0, theme::bold()))
-                                .color(ON_DARK),
-                        )
-                        .fill(p.action)
-                        .corner_radius(22)
-                        .min_size(egui::vec2(200.0, 44.0)),
-                    )
-                    .clicked()
-                {
-                    self.pick_file(ctx);
-                }
-                inner.add_space(2.0);
-                inner.label(
-                    egui::RichText::new("or drop a .screenilux file or an MP4 here")
-                        .size(13.0)
-                        .color(p.weak),
-                );
-            }
-            if let Some((name, _)) = &self.opening {
-                inner.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(format!("Opening {name}…"));
-                });
-            }
-        });
-
-        if let Some(s) = &self.status {
-            ui.add_space(8.0);
-            ui.vertical_centered(|ui| theme::notice(ui, s.clone()));
-        }
-
-        let recents = self.recents.get_or_insert_with(|| scan_recent(out_dir));
-        if recents.is_empty() {
-            return;
-        }
-        ui.add_space(20.0);
-        let mut open = None;
-        ui.vertical_centered(|ui| {
-            ui.set_max_width(width);
-            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                ui.label(
-                    egui::RichText::new("Recent recordings")
-                        .font(egui::FontId::new(14.0, theme::strong())),
-                );
-                // The list scrolls in whatever height the window has left.
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                        for r in recents.iter() {
-                            if recent_row(ui, r).clicked() {
-                                open = Some(r.path.clone());
-                            }
-                        }
-                    });
-            });
-        });
-        if let Some(path) = open {
-            self.open(path, ctx);
+    /// The Recordings tab, in the main window: the recordings in the save
+    /// folder, and opening a file from anywhere. Playing one opens the
+    /// player window.
+    pub fn library(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        out_dir: &Path,
+        link_of: &dyn Fn(&Path) -> Link,
+    ) {
+        let opening = self.opening.as_ref().map(|(name, _)| friendly_name(name));
+        let picked = self.library.ui(
+            ui,
+            ctx,
+            out_dir,
+            link_of,
+            opening.as_deref(),
+            self.status.as_deref(),
+        );
+        match picked {
+            Some(Pick::Open(path)) => self.open(path, ctx),
+            Some(Pick::Browse) => self.pick_file(ctx),
+            None => {}
         }
     }
 
@@ -728,9 +631,9 @@ impl PlayerView {
         self.pinned = None;
     }
 
-    /// Forget the list of recent recordings, so it is read again next time.
+    /// Read the save folder again next time the list is shown.
     pub fn recordings_changed(&mut self) {
-        self.recents = None;
+        self.library.rescan();
     }
 
     /// Which track is shown where, at the current position.
@@ -1383,73 +1286,6 @@ fn chip(painter: &egui::Painter, at: egui::Pos2, text: &str, p: &Palette) {
     painter.galley(rect.min + egui::vec2(8.0, 4.0), galley, ON_DARK);
 }
 
-/// One recording in the empty state's list.
-fn recent_row(ui: &mut egui::Ui, r: &Recent) -> egui::Response {
-    let p = theme::palette(ui);
-    let width = ui.available_width();
-    let inner = egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(10, 7))
-        .show(ui, |ui| {
-            ui.set_width(width - 20.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(icon::PLAY).color(p.signal));
-                ui.label(&r.name);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(&r.detail).small().color(p.weak));
-                });
-            });
-        });
-    let response = ui.interact(
-        inner.response.rect,
-        ui.scope_id().with(("recent", &r.path)),
-        egui::Sense::click(),
-    );
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(inner.response.rect, 6.0, p.text.gamma_multiply(0.06));
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response.on_hover_text(r.path.display().to_string())
-}
-
-/// Recordings in `dir`, newest first.
-fn scan_recent(dir: &Path) -> Vec<Recent> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let now = std::time::SystemTime::now();
-    let mut found: Vec<(std::time::SystemTime, Recent)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            let ext = path.extension()?.to_string_lossy().to_lowercase();
-            if ext != "screenilux" && ext != "mp4" {
-                return None;
-            }
-            let meta = e.metadata().ok()?;
-            let modified = meta.modified().ok()?;
-            let screens = if ext == "screenilux" {
-                screenilux_core::package::read_manifest(&path)
-                    .map(|m| m.screens.len())
-                    .unwrap_or(0)
-            } else {
-                1
-            };
-            let screens = match screens {
-                0 => "unreadable".to_string(),
-                1 => "1 screen".to_string(),
-                n => format!("{n} screens"),
-            };
-            let age = now.duration_since(modified).unwrap_or_default();
-            let detail = format!("{screens}, {}, {}", size_text(meta.len()), age_text(age));
-            let name = friendly_name(&path.file_stem()?.to_string_lossy());
-            Some((modified, Recent { path, name, detail }))
-        })
-        .collect();
-    found.sort_by_key(|f| std::cmp::Reverse(f.0));
-    found.into_iter().take(12).map(|(_, r)| r).collect()
-}
-
 /// "31 Oct 2026, 17:55" for a name Screenilux gave a recording, so a list of
 /// them reads as dates. Any other name is shown as it is, less its extension.
 pub fn friendly_name(name: &str) -> String {
@@ -1483,7 +1319,7 @@ pub fn friendly_name(name: &str) -> String {
     parse().unwrap_or_else(|| stem.to_string())
 }
 
-fn size_text(bytes: u64) -> String {
+pub(crate) fn size_text(bytes: u64) -> String {
     match bytes {
         b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
         b if b >= 1 << 20 => format!("{:.0} MB", b as f64 / (1u64 << 20) as f64),
@@ -1492,7 +1328,7 @@ fn size_text(bytes: u64) -> String {
 }
 
 /// "just now", "5 minutes ago", "3 days ago".
-fn age_text(age: Duration) -> String {
+pub(crate) fn age_text(age: Duration) -> String {
     let s = age.as_secs();
     let plural = |n: u64, unit: &str| {
         if n == 1 {
@@ -1513,7 +1349,7 @@ fn to_rect(a: Area) -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2(a.x, a.y), egui::vec2(a.w, a.h))
 }
 
-fn clock_text(t: f64) -> String {
+pub(crate) fn clock_text(t: f64) -> String {
     let s = t.max(0.0) as u64;
     if s >= 3600 {
         format!("{}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
